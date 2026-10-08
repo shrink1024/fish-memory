@@ -1,6 +1,7 @@
 import { sourceBookChanges } from '../core/source-book.js';
 import { presetSnapshot, PREFERENCE_SCAN, validatePreferenceCandidates, selectedPreferences, applyAuxiliaryPreferences } from '../agents/preset-preferences.js';
 import { MemoryStore } from '../core/store.js';
+import { sha256Fingerprint } from '../core/fingerprint.js';
 import { DEFAULT_SETTINGS, normalizeTimeoutSettings, validTimeout, makeSourceEntry, entryText, normalizeScopeId, entryScope, scopeSummary, scopeInventory, readableScopes, GLOBAL_SCOPE } from '../core/state.js';
 import { playerView, scopeRead, memoryMetrics } from '../core/views.js';
 import { clone, invariant, uid, isPrefix, SerialQueue } from '../core/util.js';
@@ -15,6 +16,10 @@ import { selectionMessages, requestBatches } from '../agents/requests.js';
 import { assemblePromptPlan, previewNarration } from './prompt-plan.js';
 
 export const batches = requestBatches;
+
+async function initializationFingerprint(value) {
+    return sha256Fingerprint(JSON.stringify(value));
+}
 
 export class Controller {
     #listeners = new Set();
@@ -39,8 +44,11 @@ export class Controller {
     #autoInitTask = null;
     #autoInitAttempts = new Set();
     #autoInitialization = null;
+    #initializationSourceFingerprint = '';
+    #initializationContextFingerprint = '';
     constructor(host, { model, traces = createTraceStore(), settings = {}, persistSettings = async () => {}, chooseFallback = async () => 'cancel' } = {}) {
         this.host = host; this.settings = { ...DEFAULT_SETTINGS, ...settings, ...normalizeTimeoutSettings(settings) };
+        if (!Number.isInteger(this.settings.maintenanceEvery) || this.settings.maintenanceEvery < 1 || this.settings.maintenanceEvery > 20) this.settings.maintenanceEvery = DEFAULT_SETTINGS.maintenanceEvery;
         // Player-only, page-lifetime diagnostics. Never include this in view/save/agent data.
         this.traces = traces;
         this.persistSettings = persistSettings; this.chooseFallback = chooseFallback;
@@ -229,7 +237,9 @@ export class Controller {
             const entry = next.entries[id];
             if (!entry) continue;
             const rule = evaluateRules(this.compiledRules, entry);
-            if (rule.maxChars) invariant(entryText(entry).length <= rule.maxChars, `条目 ${entry.title} 超出作者长度约束`);
+            if (rule.maxChars && (!save.data.entries[id] || entryText(entry) !== entryText(save.data.entries[id]))) {
+                invariant(entryText(entry).length <= rule.maxChars, `条目 ${entry.title} 超出作者长度约束`);
+            }
         }
     }
     #yieldBackground() {
@@ -496,13 +506,14 @@ export class Controller {
         return { chatId: snapshot.chatId, status: this.status, error: this.error, progress: clone(this.progress), settings: clone(this.settings),
             activity: activities[0] ?? null, activities, autoPostPaused: this.#autoPostPaused,
             initialization: clone(this.#autoInitialization), sourceChanges: clone(this.sourceChanges),
+            maintenance: this.#maintenanceSchedule(), initializationResume: this.initializationResumeSummary(),
             enabled: this.#enabled(), saveEnabled: this.store?.state.preferences?.enabled !== false,
             activityClaimed: [...this.#activityClaims.values()].some(claim => claim.chatId === snapshot.chatId),
             preset: { name: preset.name, available: Boolean(preset.entries.length),
                 stale: Boolean(this.store?.state.preferences?.preset && this.store.state.preferences.preset.fingerprint !== preset.fingerprint),
                 saved: clone(this.store?.state.preferences?.preset ?? null), draft: clone(this.#presetDraft) },
             readiness: { chat: Boolean(snapshot.chatId), book: Boolean(snapshot.bookName), template: Boolean(snapshot.templateEnabled), single: !snapshot.group },
-            save: this.store?.state ? playerView(this.store.snapshot()) : null,
+            save: this.store?.state ? playerView(this.store.state) : null,
             sourceBook: this.store?.state?.bookName ?? '', connectionMode: this.connectionMode,
             mvu: clone(this.mvu), diagnostics: { ...clone(this.diagnostics), memory: memoryMetrics(this.store?.state),
                 pendingCount: Math.max(0, this.host.snapshot().messages.length - (this.store?.state.processed.length ?? 0)) } };
@@ -543,6 +554,7 @@ export class Controller {
         this.#presetDraft = null;
         this.sourceChanges = { changed: false, added: [], removed: [], updated: [] };
         this.#autoInitialization = null;
+        this.#initializationSourceFingerprint = ''; this.#initializationContextFingerprint = '';
         this.#epoch++; this.store = null; this.#maintenance = null; this.#initializing = false;
         this.#autoPostPaused = false;
         this.#pausedPostKeys.clear();
@@ -557,7 +569,14 @@ export class Controller {
         await untilAborted(store.load(snapshot.chatId, snapshot.bookName), loading.abort.signal);
         this.#assertCurrent(epoch, snapshot.chatId);
         this.store = store;
-        try { await this.#loadRules(epoch, snapshot.chatId); }
+        try {
+            const raw = await this.#loadRules(epoch, snapshot.chatId);
+            if (store.initializationCheckpoint()) {
+                this.#initializationSourceFingerprint = await initializationFingerprint({ raw, rules: this.rules });
+                this.#initializationContextFingerprint = await initializationFingerprint(this.#initializationInputs(store));
+                this.#assertCurrent(epoch, snapshot.chatId);
+            }
+        }
         catch (error) {
             if (store.state.initialized) throw error;
             this.#assertCurrent(epoch, snapshot.chatId);
@@ -620,6 +639,7 @@ export class Controller {
         const next = { ...this.settings, ...patch, timeoutSettingsVersion: 1 };
         if ('mvuFields' in patch) next.mvuBookName = this.host.snapshot().bookName;
         invariant(Number.isInteger(next.recentTurns) && next.recentTurns >= 1 && next.recentTurns <= 1000, '保留轮数应为 1–1000');
+        invariant(Number.isInteger(next.maintenanceEvery) && next.maintenanceEvery >= 1 && next.maintenanceEvery <= 20, '自动维护间隔应为 1–20 轮');
         for (const key of ['timeoutMs', 'initializationTimeoutMs']) {
             invariant(validTimeout(next[key]), '辅助模型等待时间应为 0（关闭插件限时）或 1000–86400000 毫秒的整数');
         }
@@ -669,6 +689,28 @@ export class Controller {
             check();
         });
     }
+    #initializationInputs(store) {
+        return { scopeContext: store.state.data.scopeContext, messageScopes: store.state.data.messageScopes,
+            inventoryEnabled: store.state.data.inventoryEnabled, preferences: store.state.preferences,
+            presetFingerprint: this.#preset().fingerprint, batchChars: this.settings.batchChars };
+    }
+    #initializationRequestSettings(store) {
+        return JSON.stringify({ preferences: store.state.preferences, presetFingerprint: this.#preset().fingerprint, batchChars: this.settings.batchChars });
+    }
+    #initializationIdentity(store) {
+        return { saveId: store.state.id, chatId: store.state.chatId, bookName: store.state.bookName, revision: store.state.revision };
+    }
+    initializationResumeSummary() {
+        const save = this.store?.state, checkpoint = save?.initializationCheckpoint;
+        if (!this.#initializationSourceFingerprint || !this.#initializationContextFingerprint
+            || !checkpoint || checkpoint.version !== 1 || checkpoint.identity?.saveId !== save.id
+            || checkpoint.identity.chatId !== save.chatId || checkpoint.identity.bookName !== save.bookName
+            || checkpoint.identity.revision !== save.revision
+            || checkpoint.sourceFingerprint !== this.#initializationSourceFingerprint
+            || checkpoint.inputFingerprint !== this.#initializationContextFingerprint) return null;
+        return { stage: checkpoint.stage, classifiedBatches: checkpoint.classifiedBatches, totalBatches: checkpoint.totalBatches,
+            processedCount: checkpoint.draft?.processed?.length ?? 0, updatedAt: checkpoint.updatedAt };
+    }
     async initialize({ automatic = false } = {}) {
         invariant(this.store, '请先打开角色聊天');
         invariant(!this.#initializing && !this.#maintenance, '已有处理正在运行');
@@ -683,56 +725,134 @@ export class Controller {
         this.#initializationNotice('running', automatic ? '正在自动建立新档记忆' : '正在建立存档记忆');
         this.#state('初始化中；继续发送将使用原生流程');
         try {
-            if (automatic || targetStore.state.preferences?.autoInitialization) {
-                // Persist before the first model call so a refresh cannot silently
-                // spend another full scan after an interrupted or failed attempt.
+            if (automatic && !targetStore.state.preferences?.autoInitialization) {
+                // Mark the first automatic attempt before spending a model call.
+                // Manual retries retain this marker and the already saved checkpoint.
                 await this.#saveActivity(activity, () => targetStore.updatePreferences({ autoInitialization: { attemptedAt: new Date().toISOString() } }));
             }
             const raw = await this.#loadRules(epoch, context.chatId, signal);
+            const sourceFingerprint = await initializationFingerprint({ raw, rules: this.rules });
+            this.#assertActivity(activity);
+            this.#initializationSourceFingerprint = sourceFingerprint;
+            const requestSettings = this.#initializationRequestSettings(targetStore);
+            const assertSettings = () => invariant(requestSettings === this.#initializationRequestSettings(targetStore), '初始化设置或预设已变化，请手动重试；原资料保留');
+            let inputFingerprint = await initializationFingerprint(this.#initializationInputs(targetStore));
+            this.#assertActivity(activity); assertSettings();
+            this.#initializationContextFingerprint = inputFingerprint;
             const entries = raw.filter(e => !this.rules.configEntryUids.includes(e.uid)).map(e => makeSourceEntry(context.bookName, e));
             const groups = batches(entries, this.settings.batchChars, entryText);
-            let classified = [], strategies = [];
-            for (let i = 0; i < groups.length; i++) {
+            let checkpoint = targetStore.initializationCheckpoint();
+            if (checkpoint?.sourceFingerprint !== sourceFingerprint || checkpoint?.inputFingerprint !== inputFingerprint
+                || checkpoint?.totalBatches !== groups.length) checkpoint = null;
+            if (checkpoint) {
+                // A truncated/corrupt checkpoint must never certify missing or
+                // rewritten source entries merely because its header matches.
+                try {
+                    const restored = checkpoint.stage === 'history' ? Object.values(checkpoint.draft.base.entries) : checkpoint.classification.entries;
+                    const expected = groups.slice(0, checkpoint.classifiedBatches).flat();
+                    const byId = new Map(restored.map(entry => [entry.id, entry]));
+                    invariant(restored.length === expected.length && byId.size === expected.length && expected.every(source => {
+                        const entry = byId.get(source.id);
+                        return entry && entryText(entry) === entryText(source) && entry.source?.book === source.source.book
+                            && entry.source.uid === source.source.uid && entry.source.original === source.source.original
+                            && JSON.stringify(entry.source.metadata) === JSON.stringify(source.source.metadata);
+                    }), '初始化断点原书不完整');
+                } catch { checkpoint = null; }
+            }
+            const baseCheckpoint = () => ({ version: 1, sourceFingerprint, inputFingerprint,
+                identity: this.#initializationIdentity(targetStore), classifiedBatches: 0, totalBatches: groups.length });
+            checkpoint ??= { ...baseCheckpoint(), stage: 'classification', classification: { entries: [], strategies: [] } };
+            let classified = checkpoint.stage === 'history' ? Object.values(checkpoint.draft.base.entries) : checkpoint.classification.entries;
+            let strategies = checkpoint.classification?.strategies ?? [];
+            let strategy = checkpoint.stage === 'history' ? checkpoint.draft.base.strategy : checkpoint.strategy;
+            // Classification inputs do not include the live card scope. A card
+            // can finish its first turn while these independent book batches run.
+            const saveClassification = async () => {
+                this.#assertActivity(activity); assertSettings();
+                const identity = this.#initializationIdentity(targetStore);
+                inputFingerprint = await initializationFingerprint(this.#initializationInputs(targetStore));
+                this.#assertActivity(activity); assertSettings();
+                checkpoint = { ...checkpoint, identity, inputFingerprint, updatedAt: new Date().toISOString() };
+                await this.#saveActivity(activity, () => targetStore.saveInitializationCheckpoint(checkpoint, {
+                    expectedRevision: identity.revision, isCurrent: () => { this.#assertActivity(activity); assertSettings(); },
+                }));
+                this.#initializationContextFingerprint = inputFingerprint;
+            };
+            for (let i = checkpoint.classifiedBatches; i < groups.length; i++) {
                 this.progress = { stage: '扫描世界书', done: i, total: groups.length }; this.#notify();
                 this.#updateActivity(activity, { label: `扫描世界书 ${i + 1}/${groups.length}` });
                 const result = await classifyEntries(this.client, groups[i], this.rules.naturalLanguage, signal);
-                this.#assertActivity(activity);
+                this.#assertActivity(activity); assertSettings();
                 classified.push(...result.entries); strategies.push(result.strategy);
+                checkpoint = { ...checkpoint, stage: i + 1 === groups.length ? 'strategy' : 'classification',
+                    classifiedBatches: i + 1, classification: { entries: classified, strategies } };
+                await saveClassification();
             }
             const ruled = applyRules(classified, this.compiledRules);
             this.constraints = ruled.constraints;
-            this.progress = { stage: '统合记忆策略', done: 0, total: 1 };
-            this.#updateActivity(activity, { label: '正在统合记忆策略' });
-            const strategy = await alignStrategy(this.client, strategies, ruled.entries, this.rules.naturalLanguage, signal);
-            this.#assertActivity(activity);
+            if (strategy === undefined) {
+                this.progress = { stage: '统合记忆策略', done: 0, total: 1 };
+                this.#updateActivity(activity, { label: '正在统合记忆策略' });
+                strategy = await alignStrategy(this.client, strategies, ruled.entries, this.rules.naturalLanguage, signal);
+                checkpoint = { ...checkpoint, stage: 'strategy', strategy };
+                await saveClassification();
+            }
             let committed = false;
-            // Card scope updates remain usable while scanning. A changed scope
-            // invalidates only the history draft, not the classified worldbook.
+            // Live scope changes invalidate only the historical draft in this
+            // attempt. Already accepted classification remains available here.
             for (let attempt = 0; attempt < 3 && !committed; attempt++) {
-                await this.#waitForInitializationContext(activity);
-                const baseRevision = targetStore.state.revision;
-                const draft = new MemoryStore({ read: async () => null, write: async () => {} }, { auditLimit: this.settings.auditLimit });
-                await draft.load(context.chatId, context.bookName);
-                draft.state.data.scopeContext = clone(targetStore.state.data.scopeContext ?? null);
-                draft.state.data.messageScopes = clone(targetStore.state.data.messageScopes ?? {});
-                await draft.initialize(ruled.entries, strategy);
-                if (!targetStore.state.data.inventoryEnabled) await draft.manual({ type: 'inventory-toggle', enabled: false });
-                await this.#processBatches(draft, this.host.snapshot().messages, signal, activity);
-                await this.#waitForInitializationContext(activity);
-                if (targetStore.state.revision !== baseRevision) continue;
-                // Strong sends during scanning use native prompts and are caught
-                // up only once their final selected reply and scope have settled.
-                const latest = this.host.snapshot().messages;
-                const keys = latest.map(m => m.key);
-                if (!isPrefix(draft.state.processed, keys)) await draft.reconcile(keys);
-                if (draft.state.processed.length < latest.length) await this.#processBatches(draft, latest, signal, activity);
-                this.#assertActivity(activity);
-                if (targetStore.state.revision !== baseRevision || targetStore.state.data.scopeContext?.deferPost || this.host.snapshot().generating) continue;
-                const latestRaw = await untilAborted(this.host.loadWorldbook(), signal);
-                invariant(!sourceBookChanges(draft.state, latestRaw, this.rules.configEntryUids).changed, '扫描期间原书已变化，已有资料保留，请重试');
-                await this.#saveActivity(activity, () => targetStore.replaceFromDraft(draft.snapshot(), baseRevision));
-                this.sourceChanges = sourceBookChanges(targetStore.state, latestRaw, this.rules.configEntryUids);
-                committed = true;
+                await this.#waitForInitializationContext(activity); assertSettings();
+                const identity = this.#initializationIdentity(targetStore), baseRevision = identity.revision;
+                inputFingerprint = await initializationFingerprint(this.#initializationInputs(targetStore));
+                this.#assertActivity(activity); assertSettings();
+                const assertDraftCurrent = () => {
+                    this.#assertActivity(activity); assertSettings();
+                    if (targetStore.state.revision !== baseRevision) throw Object.assign(new Error('初始化期间资料范围已变化'), { dwmInitializationChanged: true });
+                };
+                const savedCheckpoint = targetStore.initializationCheckpoint();
+                const previousDraft = savedCheckpoint?.stage === 'history' && savedCheckpoint.sourceFingerprint === sourceFingerprint
+                    && savedCheckpoint.inputFingerprint === inputFingerprint ? savedCheckpoint.draft : null;
+                const draft = new MemoryStore({ read: async () => previousDraft, write: async (_chatId, value) => {
+                    assertDraftCurrent();
+                    const nextCheckpoint = { version: 1, stage: 'history', sourceFingerprint, inputFingerprint, identity,
+                        classifiedBatches: groups.length, totalBatches: groups.length, updatedAt: new Date().toISOString(), draft: value };
+                    await targetStore.saveInitializationCheckpoint(nextCheckpoint, { expectedRevision: baseRevision, isCurrent: assertDraftCurrent });
+                    this.#initializationContextFingerprint = inputFingerprint;
+                } }, { auditLimit: this.settings.auditLimit });
+                try {
+                    await draft.load(context.chatId, context.bookName); assertDraftCurrent();
+                    if (!previousDraft) {
+                        draft.state.data.scopeContext = clone(targetStore.state.data.scopeContext ?? null);
+                        draft.state.data.messageScopes = clone(targetStore.state.data.messageScopes ?? {});
+                        draft.state.data.inventoryEnabled = targetStore.state.data.inventoryEnabled;
+                        await this.#saveActivity(activity, () => draft.initialize(ruled.entries, strategy));
+                    }
+                    await this.#saveActivity(activity, () => draft.reconcile(this.host.snapshot().messages.map(m => m.key)));
+                    await this.#processBatches(draft, this.host.snapshot().messages, signal, activity);
+                    await this.#waitForInitializationContext(activity); assertDraftCurrent();
+                    // Strong sends during scanning use native prompts and are
+                    // caught up only after their selected reply/scope settles.
+                    const latest = this.host.snapshot().messages, keys = latest.map(m => m.key);
+                    if (!isPrefix(draft.state.processed, keys)) await this.#saveActivity(activity, () => draft.reconcile(keys));
+                    if (draft.state.processed.length < latest.length) await this.#processBatches(draft, latest, signal, activity);
+                    assertDraftCurrent();
+                    if (targetStore.state.data.scopeContext?.deferPost || this.host.snapshot().generating) continue;
+                    const latestRaw = await untilAborted(this.host.loadWorldbook(), signal);
+                    const latestFingerprint = await initializationFingerprint({ raw: latestRaw, rules: discoverRules(latestRaw) });
+                    this.#assertActivity(activity);
+                    this.#initializationSourceFingerprint = latestFingerprint;
+                    invariant(latestFingerprint === sourceFingerprint, '扫描期间原书或规则已变化，已有资料保留，请重试');
+                    assertDraftCurrent();
+                    const commitKeys = this.host.snapshot().messages.map(message => message.key);
+                    if (targetStore.state.data.scopeContext?.deferPost || this.host.snapshot().generating
+                        || draft.state.processed.length !== commitKeys.length || !isPrefix(draft.state.processed, commitKeys)) continue;
+                    await this.#saveActivity(activity, () => targetStore.replaceFromDraft(draft.snapshot(), baseRevision));
+                    this.sourceChanges = sourceBookChanges(targetStore.state, latestRaw, this.rules.configEntryUids);
+                    committed = true;
+                } catch (error) {
+                    this.#assertActivity(activity);
+                    if (!error.dwmInitializationChanged && !error.dwmInitializationPathChanged) throw error;
+                }
             }
             invariant(committed, '扫描期间状态持续变化，原资料保留；请在本轮结束后重试初始化');
             this.#assertActivity(activity);
@@ -784,7 +904,9 @@ export class Controller {
             const result = await maintain(this.client, this.#guarded(before), batch, signal, scopeId, observedState);
             this.#assertActivity(activity);
             if (store === this.store) await this.#assertSourceCurrent(activity);
-            if (store === this.store) invariant(isPrefix(keys.slice(0, count + batch.length), this.host.snapshot().messages.map(message => message.key)), '当前剧情候选已变化，旧整理结果不再提交');
+            if (!isPrefix(keys.slice(0, count + batch.length), this.host.snapshot().messages.map(message => message.key))) {
+                throw Object.assign(new Error('当前剧情候选已变化，旧整理结果不再提交'), { dwmInitializationPathChanged: store !== this.store });
+            }
             this.#validateGuarded(before, result, batch.map(m => m.key), scopeId);
             count += batch.length;
             await this.#saveActivity(activity, () => store.commit(result, { expectedRevision: before.revision, sourceKeys: keys.slice(0, count),
@@ -798,6 +920,12 @@ export class Controller {
             return rule.maxChars ? [[entry.id, rule.maxChars]] : [];
         }));
     }
+    #maintenanceSchedule() {
+        const pending = this.host.snapshot().messages.slice(this.store?.state.processed.length ?? 0);
+        const pendingReplies = pending.filter(message => message.role === 'assistant' && String(message.content ?? '').trim()).length;
+        const full = pending.reduce((sum, message) => sum + String(message.content ?? '').length, 0) >= this.settings.batchChars;
+        return { every: this.settings.maintenanceEvery, pendingReplies, waiting: pending.length > 0 && pendingReplies < this.settings.maintenanceEvery && !full };
+    }
     async maintain({ automatic = false } = {}) {
         if (this.host.pendingReplacement?.()) return { executed: false, reason: '正在重新生成回复，完成后再更新记忆' };
         if (automatic) this.#resumePostForNewReply();
@@ -808,6 +936,11 @@ export class Controller {
         if (!this.#enabled()) return { executed: false, reason: '记忆已暂停，请先启用当前存档与插件总开关' };
         invariant(this.store?.state.initialized, '请先完成初始化');
         invariant(!this.#initializing, '初始化正在处理历史');
+        const schedule = this.#maintenanceSchedule();
+        if (automatic && schedule.waiting && !this.error) {
+            const reason = `已积累 ${schedule.pendingReplies}/${schedule.every} 轮，达到间隔后自动补记；待补记原文保留`;
+            this.#state(reason); return { executed: false, reason };
+        }
         this.#autoPostPaused = false;
         const activity = this.#beginActivity('maintain', '后置正在读取记忆规则');
         const epoch = this.#epoch, signal = activity.signal, store = this.store;
@@ -1113,7 +1246,8 @@ export class Controller {
         const activity = this.#beginActivity('compact', '后置正在整理历史事件');
         const epoch = this.#epoch, base = this.store.snapshot();
         const scopeId = normalizeScopeId(base.data.scopeContext?.activeScopeId);
-        this.#compactAttempts.set(scopeId, this.#compactMeasure().count);
+        const covered = { ...this.#compactMeasure(scopeId), anchorLength: base.processed.length, endKey: base.processed.at(-1) ?? null };
+        this.#compactAttempts.set(scopeId, covered);
         this.#state('正在整理历史事件');
         try {
             await this.#loadRules(epoch, base.chatId, activity.signal);
@@ -1133,25 +1267,41 @@ export class Controller {
             if (result.operations.length) await this.#saveActivity(activity, () => this.store.commit(result, { expectedRevision: current.revision,
                 sourceKeys: current.processed, allowedEvidence: evidence, maxChars: this.#maxChars(current), reason: 'compact', scopeId }));
             this.#assertActivity(activity);
-            this.#compactMarks.set(scopeId, this.#compactMeasure());
+            // A concurrent maintenance may have added facts this request never read.
+            const completed = this.#compactMeasure(scopeId);
+            const mark = { ...covered, size: completed.count === covered.count ? completed.size : covered.size };
+            await this.#saveActivity(activity, () => this.store.updatePreferences({ compaction: { ...this.store.state.preferences?.compaction, [scopeId]: mark } }));
+            this.#assertActivity(activity);
+            this.#compactMarks.set(scopeId, mark);
             this.#compactAttempts.delete(scopeId);
             this.#state('整理已完成');
             return { executed: true, message: this.status };
         } catch (error) { if (epoch === this.#epoch && !activity.signal.aborted) this.#state('整理未完成', error.message); throw error; }
         finally { if (epoch === this.#epoch) this.#compacting = false; this.#endActivity(activity); }
     }
-    #compactMeasure() {
-        const state = this.store.state, scopeId = normalizeScopeId(state.data.scopeContext?.activeScopeId);
-        return { count: state.journal.filter(j => j.reason === 'maintenance').length,
+    #compactMeasure(scopeId = normalizeScopeId(this.store.state.data.scopeContext?.activeScopeId)) {
+        const state = this.store.state;
+        const commits = state.journal.filter(j => j.reason === 'maintenance');
+        const related = j => scopeId === GLOBAL_SCOPE && Object.hasOwn(j.patch, 'summary')
+            || Object.hasOwn(j.patch.scopeChanges?.scopeSummaries ?? {}, scopeId)
+            || Object.values(j.patch.entries).some(entry => entry && entryScope(entry) === scopeId && entry.kind === 'event');
+        return { count: commits.filter(related).length, cycles: commits.length, commitId: commits.at(-1)?.id ?? null,
             size: scopeSummary(state.data, scopeId).length + Object.values(state.data.entries)
-                .filter(e => e.enabled && entryScope(e) === scopeId && e.kind === 'event').reduce((n, e) => n + entryText(e).length, 0) };
+                .filter(e => e.enabled && entryScope(e) === scopeId && e.kind === 'event' && e.segments.some(s => s.writable)).reduce((n, e) => n + entryText(e).length, 0) };
     }
     #shouldCompact() {
         if (!this.store?.state.initialized) return false;
         const scopeId = normalizeScopeId(this.store.state.data.scopeContext?.activeScopeId);
-        const current = this.#compactMeasure(), last = this.#compactMarks.get(scopeId) ?? { count: 0, size: 0 };
+        const current = this.#compactMeasure();
+        if (!current.size || !current.count) return false;
+        const saved = this.#compactMarks.get(scopeId) ?? this.store.state.preferences?.compaction?.[scopeId];
+        const valid = saved && Number.isInteger(saved.count) && saved.count <= current.count
+            && this.store.state.journal.some(commit => commit.id === saved.commitId)
+            && (!saved.anchorLength || this.store.state.processed[saved.anchorLength - 1] === saved.endKey);
+        const last = valid ? saved : { count: 0, size: 0 };
         const attempt = this.#compactAttempts.get(scopeId);
-        if (attempt !== undefined && current.count - attempt < 3) return false;
+        if (attempt && this.store.state.journal.some(commit => commit.id === attempt.commitId)
+            && current.cycles >= attempt.cycles && current.cycles - attempt.cycles < 3) return false;
         return current.count - last.count >= this.settings.compactEvery
             || (current.size >= this.settings.compactChars && current.size >= Math.max(1, last.size * 1.25));
     }
