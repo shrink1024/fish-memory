@@ -1,6 +1,6 @@
 {
   "name": "st-dynamic-world-memory",
-  "version": "0.1.0-alpha.3",
+  "version": "0.1.0-alpha.4",
   "private": true,
   "type": "module",
   "description": "Save-scoped dynamic worldbook and narrative memory for SillyTavern",

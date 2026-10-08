@@ -31,8 +31,8 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
     let localError = '', notice = '', busy = false, destroyed = false, cancelRequested = false;
     let mobileDetail = false, entryMode = 'read', visibleCount = 80, composing = false, queuedRender = false;
     let ruleNL = '', ruleScript = '', ruleOutput = '', ruleMatch = { field: 'title', op: 'contains', value: '', action: 'lock', limit: '' };
-    let recentTurnsDraft = null, timeoutDraft = null, mvuDraft = null, connectionModeDraft = null, lastSaveId = null;
-    let localPreview = null, presetSelection = new Set(), presetDraftKey = null, scanPresetWithInitialization = true;
+    let recentTurnsDraft = null, timeoutDraft = null, cadenceDraft = null, mvuDraft = null, connectionModeDraft = null, lastSaveId = null;
+    let localPreview = null, presetSelection = new Set(), presetDraftKey = null;
     const entryDrafts = new Map(), poolDrafts = new Map(), expanded = new Set(), scrollPositions = new Map();
     const connectionDraft = { endpoint: '', model: '', apiKey: '' };
     const h = (tag, className = '', content) => {
@@ -110,10 +110,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
     }
     function initialize(view) {
         if (view.save?.initialized && !doc.defaultView?.confirm?.('请先用酒馆导出此聊天 JSONL 备份。重新扫描会在成功后替换当前动态资料；失败会保留已有资料。是否重新扫描整个存档？')) return;
-        call(async () => {
-            if (scanPresetWithInitialization && view.preset?.available && !view.preset?.saved) await controller.scanPreset();
-            return controller.initialize();
-        }, '存档扫描已完成');
+        call(() => controller.initialize(), '存档扫描已完成');
     }
     function progressText(progress) {
         if (typeof progress === 'string') return progress;
@@ -229,7 +226,8 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         const conditions = h('ul', 'dwm-readiness'); for (const [label, ready] of checks) conditions.append(h('li', ready ? 'dwm-muted' : 'dwm-warning', `${ready ? '✓' : '○'} ${label}`)); panel.append(conditions);
         if (readiness.template === false) panel.append(h('p', 'dwm-muted', '请在酒馆扩展中安装并启用 ST-Prompt-Template，再打开此存档。'));
         if (view.initialization?.message) panel.append(h('p', view.initialization.retry ? 'dwm-warning' : 'dwm-muted', view.initialization.message));
-        if (view.preset?.available) panel.append(toggle('初始化时扫描预设偏好', scanPresetWithInitialization, '额外调用一次辅助模型；扫描后仍需在设置中选择并确认，才会采用。', value => { scanPresetWithInitialization = value; }));
+        if (view.initializationResume) panel.append(h('p', 'dwm-notice', `已有扫描进度：世界书 ${view.initializationResume.classifiedBatches}/${view.initializationResume.totalBatches} 批，历史 ${view.initializationResume.processedCount} 条。再次扫描会先核对资料，继续仍有效的进度。`));
+        if (view.preset?.available) panel.append(h('p', 'dwm-muted', '预设偏好可在设置中单独扫描，不影响建立记忆。'));
         panel.append(row(button(view.initialization?.retry ? '手动扫描 / 重试初始化' : '建立此存档记忆', () => initialize(view), { primary: true, disabled: !view.save || Boolean(view.progress) || Boolean(view.activity) || Object.values(readiness).some(value => value === false) }), button('设置辅助模型', () => navigate('settings'), { navigation: true })));
         if (view.progress) panel.append(h('p', 'dwm-warning', '扫描中继续发送将走酒馆原生流程；新增剧情会在扫描后补记。'));
         if (view.connectionMode === 'test') panel.append(h('p', 'dwm-muted', '本页使用模拟模型，不会调用真实 API。'));
@@ -475,6 +473,15 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         usage.append(row(rounds.wrap, button('保存轮数', () => call(async () => { await controller.updateSettings({ recentTurns: Number(rounds.input.value) }); recentTurnsDraft = null; }))));
         if (view.save?.initialized) usage.append(toggle('维护玩家物品清单', view.save.data.inventoryEnabled, '角色卡已有物品机制时可关闭；数据保留，停用期间不维护或发送。', value => call(() => controller.manual({ type: 'inventory-toggle', enabled: value }))));
         parent.append(usage);
+        const cadence = card('自动维护频率', '合并数轮后再更新记忆，减少重复读取世界书。待补记原文继续发送；达到一批的大小时会提前补记。');
+        const every = cadenceDraft ?? current.maintenanceEvery ?? DEFAULT_SETTINGS.maintenanceEvery;
+        const cadenceOptions = [[1, '每轮更新'], [3, '每 3 轮更新（默认）'], [5, '每 5 轮更新'], [10, '每 10 轮更新'], [20, '每 20 轮更新']].map(([value, label]) => [String(value), label]);
+        if (!cadenceOptions.some(([value]) => Number(value) === Number(every))) cadenceOptions.push([String(every), `每 ${every} 轮更新`]);
+        cadence.append(selectField('积累多少轮后自动补记', String(every), cadenceOptions, value => { cadenceDraft = value; }).wrap);
+        if (view.maintenance?.pendingReplies) cadence.append(h('p', 'dwm-muted', `当前有 ${view.maintenance.pendingReplies} 轮待补记，原文保留。`));
+        cadence.append(row(button('保存维护频率', () => call(async () => { await controller.updateSettings({ maintenanceEvery: Number(cadenceDraft ?? every) }); cadenceDraft = null; }, '维护频率已保存')),
+            button('立即补记', () => call(() => controller.maintain(), '补记完成'), { disabled: !view.save?.initialized })));
+        parent.append(cadence);
         renderTimeouts(parent, current);
         renderPreset(parent, view);
         renderConnection(parent, view);

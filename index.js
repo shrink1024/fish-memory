@@ -4,8 +4,8 @@ import { Controller } from './src/runtime/controller.js';
 import { mountPanel } from './src/ui/panel.js';
 import { createTraceStore } from './src/diagnostics/trace-store.js';
 import { installCapture } from './src/diagnostics/capture.js';
-import { mountActivityFooter } from './src/ui/activity.js';
 import { createProblemExporter } from './src/diagnostics/problem-export.js';
+import { createFloatingManager } from './src/ui/floating-manager.js';
 
 async function boot() {
     if (!globalThis.SillyTavern?.getContext || document.getElementById('dynamic-world-memory')) return;
@@ -80,48 +80,12 @@ async function boot() {
     const drawer = document.createElement('details');
     const title = document.createElement('summary'); title.textContent = '鱼忆｜动态世界书与记忆';
     const openManager = document.createElement('button'); openManager.type = 'button'; openManager.textContent = '打开管理窗口';
-    const manager = document.createElement('dialog'); manager.id = 'dwm-management-dialog'; manager.className = 'dwm-management';
-    manager.setAttribute('aria-label', '鱼忆管理窗口');
-    const managerChrome = document.createElement('div'); managerChrome.className = 'dwm-management-chrome';
-    const managerBody = document.createElement('div'); managerBody.className = 'dwm-management-body';
-    const closeManager = document.createElement('button'); closeManager.type = 'button'; closeManager.className = 'dwm-management-close';
-    closeManager.title = '关闭管理窗口'; closeManager.setAttribute('aria-label', '关闭管理窗口');
-    const closeIcon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    closeIcon.setAttribute('viewBox', '0 0 24 24'); closeIcon.setAttribute('aria-hidden', 'true'); closeIcon.setAttribute('focusable', 'false');
-    const closePath = document.createElementNS('http://www.w3.org/2000/svg', 'path'); closePath.setAttribute('d', 'M6 6l12 12M18 6 6 18');
-    closeIcon.append(closePath); closeManager.append(closeIcon); managerChrome.append(closeManager);
-    manager.append(managerChrome, managerBody);
-    let managerOpener = null, toolbarButton = null;
-    const setManagerState = open => {
-        openManager.setAttribute('aria-expanded', String(open));
-        toolbarButton?.setAttribute('aria-expanded', String(open));
-        toolbarButton?.classList.toggle('openIcon', open);
-        toolbarButton?.classList.toggle('closedIcon', !open);
-    };
-    const showManager = event => {
-        if (manager.open) return;
-        managerOpener = event?.currentTarget ?? toolbarButton ?? openManager;
-        mount.hidden = false; managerBody.append(mount);
-        manager.showModal();
-        setManagerState(true);
-        closeManager.focus();
-    };
-    const bindManagerEntry = button => {
-        button.setAttribute('aria-haspopup', 'dialog');
-        button.setAttribute('aria-controls', manager.id);
-        button.setAttribute('aria-expanded', 'false');
-        button.addEventListener('click', showManager);
-    };
-    closeManager.addEventListener('click', () => manager.close());
-    manager.addEventListener('close', () => {
-        mount.hidden = true;
-        setManagerState(false);
-        if (managerOpener?.isConnected) managerOpener.focus({ preventScroll: true });
-        managerOpener = null;
-    });
+    const manager = createFloatingManager(document);
+    manager.body.append(mount);
+    const showManager = event => manager.open(event);
+    const bindManagerEntry = button => manager.bindEntry(button);
+    let toolbarButton = null;
     bindManagerEntry(openManager);
-    document.body.append(manager);
-    mount.hidden = true; managerBody.append(mount);
     drawer.append(title, openManager);
     (document.querySelector('#extensions_settings2') ?? document.querySelector('#extensions_settings') ?? document.body).append(drawer);
     const toolbar = document.getElementById('top-settings-holder');
@@ -146,15 +110,17 @@ async function boot() {
     const problems = createProblemExporter({ controller, context: () => {
         const live = SillyTavern.getContext();
         return { chatId: live.getCurrentChatId?.() ?? live.chatId ?? '', character: live.name2 ?? '', memoryChatId: host.snapshot().chatId,
-            pluginVersion: '0.1.0-alpha.1', mainApi: live.mainApi, browser: navigator.userAgent };
+            pluginVersion: '0.1.0-alpha.4', mainApi: live.mainApi, browser: navigator.userAgent };
     } });
-    mountPanel(mount, controller, { exportProblem: () => problems.export() });
-    const activityFooter = mountActivityFooter(document, controller);
+    const panel = mountPanel(mount, controller, { exportProblem: () => problems.export() });
+    const renderManagerStatus = () => manager.render(controller.uiStatus());
+    const unsubscribeManager = controller.subscribe(renderManagerStatus);
+    renderManagerStatus();
     globalThis.dwmFilterOutgoingHistory = (...args) => host.filterOutgoingHistory(...args);
     host.bindController(controller);
     await controller.start();
     // Public handle is for explicit local diagnostics. Agent views are built separately.
-    globalThis.DynamicWorldMemory = Object.freeze({ version: '0.1.0-alpha.1', apiVersion: 1,
+    globalThis.DynamicWorldMemory = Object.freeze({ version: '0.1.0-alpha.4', apiVersion: 1,
         setContext: input => controller.setContext(input), clearContext: owner => controller.clearContext(owner),
         readScope: scopeId => controller.readScope(scopeId), whenIdle: () => controller.whenIdle(), whenCommitted: () => controller.whenCommitted(),
         ui: Object.freeze({ status: () => controller.uiStatus(), subscribe: fn => controller.subscribe(() => fn(controller.uiStatus())),
@@ -170,7 +136,9 @@ async function boot() {
     globalThis.addEventListener('pagehide', event => {
         if (event.persisted) return;
         controller.cancel('页面已关闭，辅助等待已结束');
-        activityFooter.destroy();
+        unsubscribeManager();
+        panel.destroy();
+        manager.destroy();
         host.traceCapture.dispose();
         if (types?.WORLD_INFO_ACTIVATED) events?.removeListener(types.WORLD_INFO_ACTIVATED, activated);
         if (types?.CHAT_CHANGED) events?.removeListener(types.CHAT_CHANGED, changed);

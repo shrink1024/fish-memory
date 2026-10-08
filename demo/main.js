@@ -1,5 +1,6 @@
 import { Controller } from '../src/runtime/controller.js';
 import { mountPanel } from '../src/ui/panel.js';
+import { createFloatingManager } from '../src/ui/floating-manager.js';
 
 // Handwritten, deterministic fixtures. No real model or player save is connected.
 const rawEntries = [
@@ -50,7 +51,13 @@ const model = { complete: async ({ purpose, input, signal }) => {
     return { operations };
 } };
 const controller = new Controller(host, { model, settings: { enabled: true } });
+const manager = createFloatingManager(document);
+document.body.append(manager.element);
+manager.body.append(document.querySelector('#app'));
 mountPanel(document.querySelector('#app'), controller);
+manager.bindEntry(document.querySelector('#open-memory'));
+controller.subscribe(() => manager.render(controller.uiStatus()));
+manager.render(controller.uiStatus());
 await controller.start();
 const renderMessages = () => { document.querySelector('#messages').textContent = messages.map(m => `${m.role === 'user' ? '玩家' : '正文'}：${m.content}`).join('\n\n'); };
 renderMessages();

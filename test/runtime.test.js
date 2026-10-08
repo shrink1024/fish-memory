@@ -58,7 +58,7 @@ function classify(input) {
 }
 
 async function ready(f, settings = {}) {
-    const controller = new Controller(f.host, { model: f.model, settings: { enabled: true, batchChars: 30, ...settings } });
+    const controller = new Controller(f.host, { model: f.model, settings: { enabled: true, maintenanceEvery: 1, batchChars: 30, ...settings } });
     await controller.start();
     await controller.initialize();
     return controller;
@@ -618,7 +618,7 @@ test('size-driven compaction retries after short failure cooldown instead of tre
     } });
     const c = await ready(f, { compactChars: 1000, compactEvery: 20 });
     for (let i = 1; i <= 4; i++) {
-        f.state.messages.push(msg(`step-${i}`, '推进'));
+        f.state.messages.push(msg(`step-${i}`, '推进', 'assistant'));
         c.messageReceived({ type: 'normal' });
         await until(() => c.view().save.processedCount === i);
         // Let the scheduled compaction continuation complete before the next turn.

@@ -31,7 +31,7 @@ function fixture(handler) {
     return { state, saved, calls, plans, host, model };
 }
 async function ready(f) {
-    const c = new Controller(f.host, { model: f.model, settings: { enabled: true, batchChars: 10000 } });
+    const c = new Controller(f.host, { model: f.model, settings: { enabled: true, maintenanceEvery: 1, batchChars: 10000 } });
     await c.start(); await c.initialize(); return c;
 }
 async function turn(c, f, { from, to = from, key, text, post = to }) {
@@ -89,7 +89,7 @@ test('deferred finalization persists attribution separate from next active world
     assert.equal(c.store.state.data.scopeSummaries['domain-A'], '在迷域完成结算，回到域枢。');
     assert.equal(c.store.state.data.scopeSummaries.hub, undefined);
     assert.equal((await c.previewPlan()).details, '');
-    const reopened = new Controller(f.host, { model: f.model, settings: { enabled: true } });
+    const reopened = new Controller(f.host, { model: f.model, settings: { enabled: true, maintenanceEvery: 1 } });
     await reopened.start();
     assert.equal(reopened.store.state.data.scopeContext.activeScopeId, 'hub');
     assert.match((await reopened.readScope('domain-A')).summary, /完成结算/);
@@ -117,7 +117,7 @@ test('regenerating a remembered tail preserves the card pause through deletion, 
     assert.equal(f.calls.filter(x => x.purpose === 'maintain').length, maintenanceCount);
 
     // The pause must survive disk reload, not only a Controller field.
-    c = new Controller(f.host, { model: f.model, settings: { enabled: true } });
+    c = new Controller(f.host, { model: f.model, settings: { enabled: true, maintenanceEvery: 1 } });
     await c.start();
     assert.equal((await c.whenIdle()).context.deferPost, true);
     f.state.messages.push(message('new-tail', '在迷域完成结算，回到域枢。'));

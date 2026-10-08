@@ -18,6 +18,8 @@ button:focus-visible,summary:focus-visible { outline:3px solid #438977; outline-
 #story summary { cursor:pointer; padding:10px 0; min-height:44px; color:var(--demo-muted); }
 #messages,#plan { white-space:pre-wrap; overflow-wrap:anywhere; font-size:13px; }
 #messages { padding:12px 0; }
+#send_form { position:fixed; bottom:0; left:50%; transform:translateX(-50%); width:min(100%,900px); padding:10px; background:var(--demo-bg); border-top:1px solid var(--demo-line); }
+#send_form textarea { display:block; width:100%; resize:vertical; min-height:50px; font:inherit; }
 #plan:empty,#demo-error:empty { display:none; }
 #plan { margin:0 0 16px; }
 #demo-error { color:#ab5046; }
@@ -26,10 +28,11 @@ button:focus-visible,summary:focus-visible { outline:3px solid #438977; outline-
 </head>
 <body>
 <header class="demo-header"><div><h1>鱼忆 · 隔离开发预览</h1><p>合成剧情与模拟模型，不连接玩家存档或真实 API。刷新后重置。</p></div><button id="theme" type="button">切换明暗</button></header>
-<div class="demo-controls"><button id="example" type="button">载入完整演示样例</button><button id="advance" type="button">追加剧情：莉娜迁居</button><button id="send" type="button">模拟正文选材</button><button id="fail" type="button">下一次模拟失败</button></div>
+<div class="demo-controls"><button id="open-memory" type="button">打开鱼忆</button><button id="example" type="button">载入完整演示样例</button><button id="advance" type="button">追加剧情：莉娜迁居</button><button id="send" type="button">模拟正文选材</button><button id="fail" type="button">下一次模拟失败</button></div>
 <p id="demo-error" role="alert"></p><p id="plan" role="status"></p>
 <main id="app"></main>
 <details id="story"><summary>查看合成剧情原文</summary><div id="messages"></div></details>
+<form id="send_form" onsubmit="return false"><label for="demo-input">模拟聊天输入区</label><textarea id="demo-input" placeholder="展开或收起鱼忆，不影响这里的内容"></textarea></form>
 <script type="module" src="/demo/main.js"></script>
 </body>
 </html>

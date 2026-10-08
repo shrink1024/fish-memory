@@ -52,7 +52,9 @@ export function applyMaintenance(data, result, { allowedEvidence = [], maxChars 
             for (const change of op.segments) {
                 const segment = e.segments.find(s => s.id === change.id);
                 invariant(segment?.writable, '禁止覆盖受保护片段');
-                segment.text = plainText(change.text, '动态正文', maxChars[e.id] ?? 100000);
+                // An unchanged legacy segment may already exceed today's rule.
+                // Only newly written text must satisfy the current length limit.
+                if (change.text !== segment.text) segment.text = plainText(change.text, '动态正文', maxChars[e.id] ?? 100000);
             }
             if (op.intro !== undefined) e.intro = plainText(op.intro, '简介', 2000);
             if (op.retrieveWhen !== undefined) e.retrieveWhen = plainText(op.retrieveWhen, '提取指导', 4000);
@@ -113,7 +115,9 @@ export function applyMaintenance(data, result, { allowedEvidence = [], maxChars 
         }
     }
     for (const [id, max] of Object.entries(maxChars)) {
-        if (next.entries[id]) invariant(entryText(next.entries[id]).length <= max, `条目 ${id} 超出作者长度约束`);
+        if (next.entries[id] && (!data.entries[id] || entryText(next.entries[id]) !== entryText(data.entries[id]))) {
+            invariant(entryText(next.entries[id]).length <= max, `条目 ${id} 超出作者长度约束`);
+        }
     }
     assertOriginalPreserved(data, next);
     return { next, touched: [...touched] };
