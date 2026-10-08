@@ -1,4 +1,5 @@
 import { invariant, plainText } from '../core/util.js';
+import { DEFAULT_SETTINGS, validTimeout } from '../core/state.js';
 
 /** Detach cancelled consumers even when the host cannot stop its underlying request. */
 export async function untilAborted(operation, signal) {
@@ -38,27 +39,33 @@ export function serializeAgentInput(input) {
 }
 
 export class AgentClient {
-    constructor(generate, { timeoutMs, initializationTimeoutMs } = {}) {
+    constructor(generate, { timeoutMs, initializationTimeoutMs, getTimeouts } = {}) {
         this.generate = generate;
-        this.timeoutMs = timeoutMs ?? 90000;
+        this.timeoutMs = timeoutMs ?? DEFAULT_SETTINGS.timeoutMs;
         // An explicit legacy timeout still covers every purpose unless separately overridden.
-        this.initializationTimeoutMs = initializationTimeoutMs ?? timeoutMs ?? 180000;
+        this.initializationTimeoutMs = initializationTimeoutMs ?? timeoutMs ?? DEFAULT_SETTINGS.initializationTimeoutMs;
+        invariant(validTimeout(this.timeoutMs) && validTimeout(this.initializationTimeoutMs), '辅助模型等待时间应为 0（关闭插件限时）或 1000–86400000 毫秒的整数');
+        this.getTimeouts = getTimeouts;
     }
     async complete({ purpose, system, input, signal }) {
         signal?.throwIfAborted();
-        const timeoutMs = ['initialize', 'strategy'].includes(purpose) ? this.initializationTimeoutMs : this.timeoutMs;
-        const timeout = AbortSignal.timeout(timeoutMs);
-        const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+        // Read settings once for this request. Saving new limits does not alter work already in flight.
+        const current = this.getTimeouts?.();
+        const longTask = ['initialize', 'strategy', 'maintain', 'compact'].includes(purpose);
+        const timeoutMs = longTask ? current?.initializationTimeoutMs ?? this.initializationTimeoutMs : current?.timeoutMs ?? this.timeoutMs;
+        invariant(validTimeout(timeoutMs), '辅助模型等待时间应为 0（关闭插件限时）或 1000–86400000 毫秒的整数');
+        const timeout = timeoutMs === 0 ? null : AbortSignal.timeout(timeoutMs);
+        const combined = signal && timeout ? AbortSignal.any([signal, timeout]) : signal ?? timeout;
         try {
-            combined.throwIfAborted();
+            combined?.throwIfAborted();
             const operation = this.generate({ purpose, system, input: serializeAgentInput(input), signal: combined });
             const result = await untilAborted(operation, combined);
-            combined.throwIfAborted();
+            combined?.throwIfAborted();
             return parseObject(result);
         } catch (error) {
             // A host may throw its own AbortError; preserve the caller's cancellation first.
             signal?.throwIfAborted();
-            if (timeout.aborted) throw new DOMException(`辅助模型请求已等待 ${timeoutMs / 1000} 秒，现已超时，迟到结果不会采用。请检查辅助模型连接后重试。`, 'TimeoutError');
+            if (timeout?.aborted) throw new DOMException(`辅助模型请求已等待 ${timeoutMs / 1000} 秒，现已超时，迟到结果不会采用。可在“设置 → 辅助模型等待时间”提高上限或关闭插件限时后重试。`, 'TimeoutError');
             throw error;
         }
     }

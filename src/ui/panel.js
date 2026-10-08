@@ -4,6 +4,7 @@ import { diffText } from './diff.js';
 import { createTraceViewer } from './trace-viewer.js';
 import { createPromptPreview } from './prompt-preview.js';
 import { createActivityIndicator } from './activity.js';
+import { DEFAULT_SETTINGS } from '../core/state.js';
 
 const KIND_NAMES = { fact: '世界资料', rule: '规则', npc: '人物', npc_pool: '路人', event: '事件', inventory: '物品' };
 const TASK_NAMES = { initialize: '扫描世界书', strategy: '统合记忆策略', maintain: '维护记忆', select: '本轮选材', compact: '整理事件' };
@@ -30,7 +31,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
     let localError = '', notice = '', busy = false, destroyed = false, cancelRequested = false;
     let mobileDetail = false, entryMode = 'read', visibleCount = 80, composing = false, queuedRender = false;
     let ruleNL = '', ruleScript = '', ruleOutput = '', ruleMatch = { field: 'title', op: 'contains', value: '', action: 'lock', limit: '' };
-    let recentTurnsDraft = null, mvuDraft = null, connectionModeDraft = null, lastSaveId = null;
+    let recentTurnsDraft = null, timeoutDraft = null, mvuDraft = null, connectionModeDraft = null, lastSaveId = null;
     let localPreview = null, presetSelection = new Set(), presetDraftKey = null, scanPresetWithInitialization = true;
     const entryDrafts = new Map(), poolDrafts = new Map(), expanded = new Set(), scrollPositions = new Map();
     const connectionDraft = { endpoint: '', model: '', apiKey: '' };
@@ -474,6 +475,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         usage.append(row(rounds.wrap, button('保存轮数', () => call(async () => { await controller.updateSettings({ recentTurns: Number(rounds.input.value) }); recentTurnsDraft = null; }))));
         if (view.save?.initialized) usage.append(toggle('维护玩家物品清单', view.save.data.inventoryEnabled, '角色卡已有物品机制时可关闭；数据保留，停用期间不维护或发送。', value => call(() => controller.manual({ type: 'inventory-toggle', enabled: value }))));
         parent.append(usage);
+        renderTimeouts(parent, current);
         renderPreset(parent, view);
         renderConnection(parent, view);
         renderMvu(parent, view);
@@ -481,6 +483,23 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         rescan.append(h('p', 'dwm-muted', '扫描角色主世界书和当前保留的完整剧情。成功后替换动态资料，失败保留原有结果。扫描期间发送走原生流程。'));
         rescan.append(button(view.save?.initialized ? '重新扫描' : '初始化存档', () => initialize(view), { disabled: !view.save })); parent.append(rescan);
         const author = details('作者规则工具', 'author-tools'); renderRuleEditor(author); parent.append(author);
+    }
+    function renderTimeouts(parent, current) {
+        const panel = card('辅助模型等待时间', '每次请求单独计时。长聊天会分批处理，整个扫描或补记可以超过这里设置的时间。');
+        const values = timeoutDraft ?? Object.fromEntries(['initializationTimeoutMs', 'timeoutMs'].map(key => [key, current[key] ?? DEFAULT_SETTINGS[key]]));
+        for (const [key, label] of [['initializationTimeoutMs', '扫描、补记与整理'], ['timeoutMs', '前置选材与预设扫描']]) {
+            const options = [1, 3, 5, 10, 15, 30, 60, 120, 360, 1440].map(minutes => [String(minutes * 60000), minutes >= 60 ? `${minutes / 60} 小时` : `${minutes} 分钟`]);
+            options.push(['0', '不限时（手动停止）']);
+            if (!options.some(([value]) => Number(value) === values[key])) options.unshift([String(values[key]), `当前自定义：${values[key] / 1000} 秒`]);
+            const control = selectField(label, String(values[key]), options, value => { timeoutDraft = { ...values, ...timeoutDraft, [key]: Number(value) }; }, key);
+            control.input.disabled = busy;
+            panel.append(control.wrap);
+        }
+        panel.append(h('p', 'dwm-muted', '保存后从下一次请求生效，正在运行的请求仍按原上限等待。选择不限时只关闭鱼忆自身的计时，酒馆、代理或模型服务仍可能提前结束请求；运行中可点“停止等待”或“停止整理”。'));
+        panel.append(button('保存等待时间', () => call(async () => {
+            await controller.updateSettings(timeoutDraft ?? values); timeoutDraft = null;
+        }, '等待时间已保存，从下一次辅助请求生效')));
+        parent.append(panel);
     }
     function renderPreset(parent, view) {
         const preset = view.preset ?? {}, panel = card('辅助 Agent 的预设偏好', '只采用语言、专名、术语和称谓。叙事、变量更新、输出协议、工具权限及绕过安全限制的条目不继承；原预设不会改动。');

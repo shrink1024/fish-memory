@@ -9,8 +9,9 @@ export const DEFAULT_SETTINGS = Object.freeze({
     windowEnabled: true,
     recentTurns: 12,
     batchChars: 18000,
-    timeoutMs: 90000,
-    initializationTimeoutMs: 180000,
+    timeoutMs: 300000,
+    initializationTimeoutMs: 1800000,
+    timeoutSettingsVersion: 1,
     auditLimit: 100,
     compactEvery: 20,
     selectionLimit: 16,
@@ -20,6 +21,21 @@ export const DEFAULT_SETTINGS = Object.freeze({
     mvuFields: [],
     mvuBookName: null,
 });
+
+export function validTimeout(value) {
+    return Number.isInteger(value) && (value === 0 || (value >= 1000 && value <= 86400000));
+}
+
+/** Upgrade only the old implicit defaults; retain custom limits and explicit unlimited waits. */
+export function normalizeTimeoutSettings(settings = {}) {
+    const normalized = { timeoutSettingsVersion: 1 };
+    for (const [key, previousDefault] of [['timeoutMs', 90000], ['initializationTimeoutMs', 180000]]) {
+        const value = settings[key];
+        normalized[key] = validTimeout(value) && (settings.timeoutSettingsVersion === 1 || value !== previousDefault)
+            ? value : DEFAULT_SETTINGS[key];
+    }
+    return normalized;
+}
 
 export const GLOBAL_SCOPE = 'global';
 export function normalizeScopeId(value = GLOBAL_SCOPE) {

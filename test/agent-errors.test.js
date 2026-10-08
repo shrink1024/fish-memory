@@ -19,15 +19,15 @@ function controlledTimeouts(t) {
     return timers;
 }
 
-test('worldbook scanning and strategy have a separate default budget without extending other agent requests', async t => {
+test('initialization, history maintenance, and compaction use the long-task budget', async t => {
     const timers = controlledTimeouts(t);
     const client = new AgentClient(async () => '{"ok":true}');
     for (const purpose of ['initialize', 'strategy', 'select', 'maintain', 'compact', 'preferences']) {
         assert.deepEqual(await client.complete(request(purpose)), { ok: true });
     }
-    assert.deepEqual(timers.map(timer => timer.milliseconds), [180000, 180000, 90000, 90000, 90000, 90000]);
-    assert.equal(DEFAULT_SETTINGS.initializationTimeoutMs, 180000);
-    assert.equal(DEFAULT_SETTINGS.timeoutMs, 90000);
+    assert.deepEqual(timers.map(timer => timer.milliseconds), [1800000, 1800000, 300000, 1800000, 1800000, 300000]);
+    assert.equal(DEFAULT_SETTINGS.initializationTimeoutMs, 1800000);
+    assert.equal(DEFAULT_SETTINGS.timeoutMs, 300000);
 });
 
 test('an explicit legacy timeout applies to all purposes unless an initialization budget is also supplied', async t => {
@@ -47,6 +47,8 @@ test('timed out requests explain their actual budget and never adopt a late host
     const rejected = assert.rejects(pending, error => {
         assert.equal(error.name, 'TimeoutError');
         assert.match(error.message, /180\s*秒/);
+        assert.match(error.message, /设置.*辅助模型等待时间/);
+        assert.match(error.message, /关闭插件限时/);
         assert.match(error.message, /重试/);
         return true;
     });
@@ -60,7 +62,7 @@ test('front selection timeout keeps its shorter budget and readable retry guidan
     const timers = controlledTimeouts(t);
     const client = new AgentClient(() => new Promise(() => {}));
     const rejected = assert.rejects(client.complete(request()), error => {
-        assert.equal(error.name, 'TimeoutError'); assert.match(error.message, /90\s*秒/); assert.match(error.message, /重试/); return true;
+        assert.equal(error.name, 'TimeoutError'); assert.match(error.message, /300\s*秒/); assert.match(error.message, /重试/); return true;
     });
     timers[0].expire(); await rejected;
 });
