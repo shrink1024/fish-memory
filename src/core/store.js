@@ -6,6 +6,30 @@ function anchor(sourceKeys) {
     return { anchorLength: sourceKeys.length, endKey: sourceKeys.length ? sourceKeys.at(-1) : null };
 }
 
+function validateInitializationCheckpoint(checkpoint, save) {
+    invariant(checkpoint?.version === 1 && ['classification', 'strategy', 'history'].includes(checkpoint.stage), '初始化断点格式无效');
+    const identity = checkpoint.identity;
+    invariant(identity?.saveId === save.id && identity.chatId === save.chatId && identity.bookName === save.bookName
+        && identity.revision === save.revision, '初始化断点不属于当前存档版本');
+    invariant([checkpoint.sourceFingerprint, checkpoint.inputFingerprint].every(value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)), '初始化断点来源无效');
+    invariant(Number.isInteger(checkpoint.classifiedBatches) && Number.isInteger(checkpoint.totalBatches)
+        && checkpoint.classifiedBatches >= 0 && checkpoint.classifiedBatches <= checkpoint.totalBatches, '初始化断点进度无效');
+    if (checkpoint.stage === 'history') {
+        invariant(checkpoint.classifiedBatches === checkpoint.totalBatches && !checkpoint.classification, '初始化历史断点无效');
+        invariant(checkpoint.draft && !Object.hasOwn(checkpoint.draft, 'initializationCheckpoint'), '初始化草稿不能嵌套断点');
+        validateSave(checkpoint.draft);
+        invariant(checkpoint.draft.initialized && checkpoint.draft.chatId === save.chatId && checkpoint.draft.bookName === save.bookName, '初始化草稿归属无效');
+    } else {
+        invariant(!checkpoint.draft && Array.isArray(checkpoint.classification?.entries)
+            && Array.isArray(checkpoint.classification.strategies)
+            && checkpoint.classification.strategies.length === checkpoint.classifiedBatches, '初始化分类断点无效');
+        checkpoint.classification.entries.forEach(createEntry);
+        checkpoint.classification.strategies.forEach(value => plainText(value, '分类策略', 10000));
+        if (checkpoint.strategy !== undefined) plainText(checkpoint.strategy, '记忆策略', 10000);
+    }
+    return checkpoint;
+}
+
 function replayOnPath(state, sourceKeys) {
     const common = commonPrefix(state.storyKeys, sourceKeys);
     const next = clone(state);
@@ -55,6 +79,7 @@ export class MemoryStore {
                 // Branch history is inherited; the source chat's live authority
                 // is not. The card must restore its branch's committed context.
                 next.data.scopeContext = null;
+                delete next.initializationCheckpoint;
             }
             this.state = next;
             return this.snapshot();
@@ -63,9 +88,30 @@ export class MemoryStore {
     async #persist(next) {
         const previous = this.state;
         next.revision = previous.revision + 1;
+        // Any formal save change invalidates the separate unfinished draft.
+        delete next.initializationCheckpoint;
         await this.storage.write(next.chatId, clone(next), previous.revision);
         this.state = next;
         return this.snapshot();
+    }
+    initializationCheckpoint() {
+        if (!this.state?.initializationCheckpoint) return null;
+        try { return clone(validateInitializationCheckpoint(this.state.initializationCheckpoint, this.state)); }
+        catch { return null; }
+    }
+    async saveInitializationCheckpoint(checkpoint, { expectedRevision, isCurrent = () => {} } = {}) {
+        return this.#queue.run(async () => {
+            isCurrent();
+            invariant(this.state.revision === expectedRevision, '初始化期间存档已经变化');
+            validateInitializationCheckpoint(checkpoint, this.state);
+            const next = this.snapshot();
+            next.initializationCheckpoint = clone(checkpoint);
+            // Checkpoint writes are serialized with regular writes, but they do
+            // not certify narrative or advance the formal data revision.
+            await this.storage.write(next.chatId, clone(next), this.state.revision);
+            this.state = next;
+            return clone(next.initializationCheckpoint);
+        });
     }
     async initialize(entries, strategy, { expectedRevision } = {}) {
         return this.#queue.run(async () => {

@@ -9,6 +9,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
     windowEnabled: true,
     recentTurns: 12,
     batchChars: 18000,
+    maintenanceEvery: 3,
     timeoutMs: 300000,
     initializationTimeoutMs: 1800000,
     timeoutSettingsVersion: 1,
