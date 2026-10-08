@@ -59,7 +59,7 @@ async function fixture(t, { scoped = false, singleBatch = false, selectFailure =
         }
         return { operations: [] };
     } };
-    const c = new Controller(host, { model, settings: { enabled: true, recentTurns: 1, windowEnabled: true, batchChars: 100000, compactEvery: 100000 } });
+    const c = new Controller(host, { model, settings: { enabled: true, maintenanceEvery: 1, recentTurns: 1, windowEnabled: true, batchChars: 100000, compactEvery: 100000 } });
     if (singleBatch) live.chat.push(message('a2', OLD));
     await c.start(); await c.initialize();
     if (scoped) { await c.setContext({ owner: 'card', activeScopeId: 'A' }); await c.whenIdle(); }

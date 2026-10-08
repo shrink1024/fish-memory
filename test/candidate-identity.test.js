@@ -34,7 +34,7 @@ async function fixture(t, { candidates = [LOST, KEPT, THIRD], live: restored } =
     const host = await createSillyTavernHost({ context: () => live, eventSource: source, eventTypes: types,
         extensions: { findExtension: () => ({ enabled: true }) }, worldInfo: { loadWorldInfo: async () => ({ entries: {} }) },
         save: async () => {}, script: { setExtensionPrompt: (key, value) => slots.set(key, value) } });
-    const controller = new Controller(host, { settings: { enabled: true, windowEnabled: false }, model: { complete: async request => {
+    const controller = new Controller(host, { settings: { enabled: true, maintenanceEvery: 1, windowEnabled: false }, model: { complete: async request => {
         calls.push(structuredClone({ purpose: request.purpose, input: request.input }));
         if (request.purpose === 'select') return { ids: [] };
         if (request.purpose === 'maintain') return { operations: [{ type: 'summary',

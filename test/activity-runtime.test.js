@@ -38,7 +38,7 @@ function fixture({ raw = false, handler, book, messages = [], settings = {} } = 
     };
     host.rawGenerate = async request => JSON.stringify(await complete({ ...request, input: JSON.parse(request.input) }));
     const controller = new Controller(host, { ...(raw ? {} : { model: { complete } }),
-        settings: { enabled: true, timeoutMs: 10000, ...settings } });
+        settings: { enabled: true, maintenanceEvery: 1, timeoutMs: 10000, ...settings } });
     return { controller, state, host, calls, plans, saved, get stops() { return stops; }, holdWrite(value) { writeGate = value; } };
 }
 async function ready(options) { const f = fixture(options); await f.controller.start(); await f.controller.initialize(); return f; }
