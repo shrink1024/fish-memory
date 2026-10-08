@@ -10,7 +10,7 @@ export const DIRECTORY_NAME = 'st-dynamic-world-memory';
 export const RUNTIME_FILES = [
     'index.js', 'style.css', 'manifest.json', 'recovery.html',
     'src/adapters/mvu.js', 'src/adapters/settings.js', 'src/adapters/sillytavern.js',
-    'src/agents/client.js', 'src/agents/preset-preferences.js', 'src/agents/prompts.js', 'src/agents/requests.js', 'src/agents/tasks.js',
+    'src/agents/client.js', 'src/agents/preset-preferences.js', 'src/agents/prompts.js', 'src/agents/requests.js', 'src/agents/source-segments.js', 'src/agents/tasks.js',
     'src/core/operations.js', 'src/core/source-book.js', 'src/core/state.js', 'src/core/store.js', 'src/core/util.js', 'src/core/views.js', 'src/core/window.js',
     'src/diagnostics/capture.js', 'src/diagnostics/problem-export.js', 'src/diagnostics/prompt-preview.js', 'src/diagnostics/trace-store.js',
     'src/rules/index.js', 'src/rules/README.md', 'src/runtime/controller.js', 'src/runtime/prompt-plan.js',
