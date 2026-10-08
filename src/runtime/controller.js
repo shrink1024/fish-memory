@@ -54,10 +54,10 @@ export class Controller {
         this.client = model ? this.#instrument(model) : this.#client(request => host.rawGenerate(request));
     }
     #client(generate) {
-        return this.#instrument(new AgentClient(generate, { timeoutMs: this.settings.timeoutMs }));
+        return this.#instrument(new AgentClient(generate, { timeoutMs: this.settings.timeoutMs, initializationTimeoutMs: this.settings.initializationTimeoutMs }));
     }
     #instrument(client) {
-        return { complete: async request => {
+        const complete = async (request, accept = result => result) => {
             const presetFingerprint = this.#preset().fingerprint, preferences = this.#auxiliaryPreferences();
             request = applyAuxiliaryPreferences(request, preferences);
             const epoch = this.#epoch, start = Date.now();
@@ -73,11 +73,15 @@ export class Controller {
             try {
                 request.signal?.throwIfAborted();
                 const result = await untilAborted(client.complete(request), request.signal);
+                metric.outputChars = JSON.stringify(result).length;
+                // Retain the model response even if task validation rejects it.
+                if (fallbackId) this.traces.update(fallbackId, { responseBody: result });
                 if (preferences.length && request.purpose !== 'preferences') invariant(this.#preset().fingerprint === presetFingerprint, '请求期间预设已改变，旧偏好结果不再采用');
-                metric.ok = true; metric.outputChars = JSON.stringify(result).length;
-                if (fallbackId) this.traces.finish(fallbackId, { status: 'complete', responseBody: result });
+                const accepted = await untilAborted(accept(result), request.signal);
+                metric.ok = true;
+                if (fallbackId) this.traces.finish(fallbackId, { status: 'complete' });
                 trace?.end();
-                return result;
+                return accepted;
             } catch (error) {
                 metric.error = String(error.message ?? error).slice(0, 500);
                 metric.outcome = error.dwmYielded ? 'yielded' : error.dwmCancelled ? 'stopped' : error.name === 'AbortError' ? 'cancelled' : 'error';
@@ -93,7 +97,8 @@ export class Controller {
                     this.#notify();
                 }
             }
-        } };
+        };
+        return { complete: request => complete(request), completeValidated: complete };
     }
     #beginActivity(kind, label, { isCurrent = () => true } = {}) {
         const abort = new AbortController();
@@ -249,11 +254,14 @@ export class Controller {
         const activity = this.#beginActivity('preferences', '正在扫描预设中的通用偏好');
         this.#state('正在扫描预设；不会修改原预设');
         try {
-            const result = await this.client.complete({ purpose: 'preferences', system: PREFERENCE_SCAN, input: { entries: preset.entries }, signal: activity.signal });
+            const candidates = await this.client.completeValidated({ purpose: 'preferences', system: PREFERENCE_SCAN, input: { entries: preset.entries }, signal: activity.signal }, result => {
+                this.#assertActivity(activity);
+                invariant(this.#preset().fingerprint === preset.fingerprint && this.host.snapshot().bookName === this.store.state.bookName, '扫描期间预设或世界书已改变，请重新扫描');
+                return validatePreferenceCandidates(result, preset);
+            });
             this.#assertActivity(activity);
-            invariant(this.#preset().fingerprint === preset.fingerprint && this.host.snapshot().bookName === this.store.state.bookName, '扫描期间预设或世界书已改变，请重新扫描');
             this.#presetDraft = { id: uid('preset-draft'), chatId: activity.chatId, bookName: this.store.state.bookName, name: preset.name,
-                fingerprint: preset.fingerprint, candidates: validatePreferenceCandidates(result, preset) };
+                fingerprint: preset.fingerprint, candidates };
             this.#state('预设扫描完成，请选择要采用的偏好');
             return { executed: true, message: this.status };
         } catch (error) {
@@ -727,7 +735,9 @@ export class Controller {
             this.#assertActivity(activity);
             await this.#saveActivity(activity, () => this.#syncWindow({ duringInitialization: true }));
             this.#assertActivity(activity);
-            this.#state(this.#enabled() ? '存档扫描已完成，记忆已启用' : '存档扫描已完成；记忆尚未启用');
+            const reviewCount = Object.values(targetStore.state.data.entries).filter(entry => entry.needsReview).length;
+            const completed = this.#enabled() ? '存档扫描已完成，记忆已启用' : '存档扫描已完成；记忆尚未启用';
+            this.#state(`${completed}${reviewCount ? `；其中 ${reviewCount} 条待核对，请在“资料”查看` : ''}`);
             this.#initializationNotice(null);
             return { executed: true, message: this.status };
         } catch (error) {

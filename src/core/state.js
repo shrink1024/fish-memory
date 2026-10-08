@@ -10,6 +10,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
     recentTurns: 12,
     batchChars: 18000,
     timeoutMs: 90000,
+    initializationTimeoutMs: 180000,
     auditLimit: 100,
     compactEvery: 20,
     selectionLimit: 16,
