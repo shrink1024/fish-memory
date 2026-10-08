@@ -3,16 +3,71 @@
 .dwm-fallback button { margin: 8px; padding: 8px 14px; cursor: pointer; }
 .dwm-fallback::backdrop { background: #0009; }
 
-#dwm-management-dialog { box-sizing: border-box; width: min(1240px, 96vw); max-width: 96vw; height: 90vh; max-height: 90vh; height: 90dvh; max-height: 90dvh; overflow: hidden; padding: 8px 12px 12px; color: var(--SmartThemeBodyColor, #eee); background: var(--SmartThemeBlurTintColor, #202229); border: 1px solid #667; border-radius: 12px; }
-#dwm-management-dialog[open] { display: flex; flex-direction: column; gap: 8px; }
-#dwm-management-dialog::backdrop { background: #000a; }
-#dwm-management-dialog > .dwm-management-chrome { display: flex; justify-content: flex-end; flex: 0 0 44px; min-width: 0; }
-#dwm-management-dialog > .dwm-management-body { flex: 1 1 auto; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; }
-#dwm-management-dialog .dwm-management-close { all: unset; box-sizing: border-box; display: grid; place-items: center; flex: 0 0 44px; width: 44px; min-width: 44px; max-width: 44px; height: 44px; min-height: 44px; max-height: 44px; border: 1px solid transparent; border-radius: 8px; color: inherit; cursor: pointer; touch-action: manipulation; }
-#dwm-management-dialog .dwm-management-close:hover { background: color-mix(in srgb, currentColor 10%, transparent); }
-#dwm-management-dialog .dwm-management-close:active { background: color-mix(in srgb, currentColor 18%, transparent); }
-#dwm-management-dialog .dwm-management-close:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
-#dwm-management-dialog .dwm-management-close > svg { display: block; width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; pointer-events: none; }
+/* One fixed, nonmodal layer. The surrounding conversation remains interactive. */
+.dwm-floating-root {
+    --dwm-float-bg: var(--SmartThemeBlurTintColor, #f7f7f3);
+    --dwm-float-text: var(--SmartThemeBodyColor, #253c3b);
+    --dwm-float-muted: color-mix(in srgb, var(--dwm-float-text) 76%, var(--dwm-float-bg));
+    --dwm-float-accent: color-mix(in srgb, var(--dwm-float-text) 65%, #429a88);
+    --dwm-float-line: color-mix(in srgb, var(--dwm-float-text) 22%, var(--dwm-float-bg));
+    position: fixed; z-index: 10000; inset: 0 auto auto 0; width: 100vw; height: 100dvh;
+    box-sizing: border-box; pointer-events: none; overflow: clip;
+    padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+    color: var(--dwm-float-text); font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    text-align: left; text-shadow: none; color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+    .dwm-floating-root { --dwm-float-bg: var(--SmartThemeBlurTintColor, #182524); --dwm-float-text: var(--SmartThemeBodyColor, #e6eae5); }
+}
+.dwm-floating-root [hidden] { display: none !important; }
+.dwm-floating-root *, .dwm-floating-root *::before, .dwm-floating-root *::after { box-sizing: border-box; }
+.dwm-floating-root :is(button, select):focus-visible { outline: 3px solid var(--dwm-float-accent); outline-offset: 3px; }
+.dwm-floating-root .dwm-visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+
+#dwm-management-dialog {
+    position: absolute; top: max(12px, env(safe-area-inset-top)); right: max(12px, env(safe-area-inset-right));
+    width: min(1040px, calc(100% - max(12px, env(safe-area-inset-left)) - max(12px, env(safe-area-inset-right))));
+    height: min(780px, 78%); max-height: calc(100% - max(12px, env(safe-area-inset-top)) - max(12px, env(safe-area-inset-bottom)));
+    display: flex; flex-direction: column; min-width: 0; min-height: 0; margin: 0; padding: 0; overflow: hidden; pointer-events: auto;
+    border: 1px solid var(--dwm-float-line); border-radius: 16px; color: var(--dwm-float-text); background: var(--dwm-float-bg);
+    box-shadow: 0 16px 56px #0003, 0 2px 8px #0002;
+}
+.dwm-management-chrome { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; min-width: 0; padding: 8px 10px 8px 16px; border-bottom: 1px solid var(--dwm-float-line); }
+.dwm-management-heading { display: grid; gap: 1px; flex: 1; min-width: 0; }
+.dwm-management-heading strong { font-size: 15px; font-weight: 650; color: inherit; }
+.dwm-management-heading > span { font-size: 11px; color: var(--dwm-float-muted); }
+.dwm-bubble-position-label { flex: 0 1 126px; min-width: 0; margin: 0; }
+.dwm-floating-root .dwm-bubble-position { width: 100%; min-width: 0; min-height: 44px; margin: 0; padding: 8px; font: inherit; font-size: 12px; color: inherit; background: var(--dwm-float-bg); border: 1px solid var(--dwm-float-line); border-radius: 8px; cursor: pointer; }
+.dwm-management-body { flex: 1 1 auto; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.dwm-management-body > #dynamic-world-memory { min-width: 0; }
+.dwm-floating-root .dwm-management-close { appearance: none; display: flex; justify-content: center; align-items: center; gap: 4px; flex: 0 0 auto; min-height: 44px; min-width: 64px; padding: 8px; margin: 0; border: 1px solid var(--dwm-float-line); border-radius: 8px; color: inherit; background: transparent; font: inherit; font-size: 13px; cursor: pointer; touch-action: manipulation; }
+.dwm-management-close > svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; pointer-events: none; }
+.dwm-management-close:hover, .dwm-bubble-position:hover { background: color-mix(in srgb, var(--dwm-float-text) 8%, var(--dwm-float-bg)); }
+.dwm-management-close:active { background: color-mix(in srgb, var(--dwm-float-text) 15%, var(--dwm-float-bg)); }
+
+.dwm-floating-root .dwm-floating-bubble {
+    appearance: none; position: absolute; display: flex; align-items: center; gap: 8px; width: max-content; min-width: 132px; max-width: calc(100% - 24px); min-height: 58px;
+    margin: 0; padding: 9px 12px; border: 1px solid var(--dwm-float-line); border-radius: 20px 20px 8px 20px; pointer-events: auto; touch-action: none; user-select: none; -webkit-user-select: none;
+    color: var(--dwm-float-text); background: var(--dwm-float-bg); box-shadow: 0 4px 20px #0002, 0 1px 4px #0002;
+    font: inherit; text-align: left; text-shadow: none; cursor: grab; transition: background-color 120ms ease, box-shadow 120ms ease;
+}
+.dwm-floating-root[data-edge='left'] .dwm-floating-bubble { border-radius: 20px 20px 20px 8px; }
+.dwm-floating-bubble:hover { box-shadow: 0 5px 24px #0003, 0 1px 4px #0002; }
+.dwm-floating-bubble:active, .dwm-floating-bubble[data-dragging='true'] { cursor: grabbing; background: color-mix(in srgb, var(--dwm-float-text) 8%, var(--dwm-float-bg)); }
+.dwm-bubble-fish { flex: 0 0 26px; width: 26px; height: 26px; fill: none; stroke: var(--dwm-float-accent); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; }
+.dwm-bubble-copy { display: grid; gap: 1px; min-width: 0; pointer-events: none; }
+.dwm-bubble-name { font-size: 15px; line-height: 1.3; font-weight: 650; letter-spacing: .05em; }
+.dwm-bubble-status { font-size: 12px; line-height: 1.5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--dwm-float-muted); }
+.dwm-floating-bubble[data-state='busy'] { border-color: var(--dwm-float-accent); }
+.dwm-floating-bubble[data-state='attention'] .dwm-bubble-status { text-decoration: underline dotted; text-underline-offset: 3px; }
+
+@media (max-width: 480px) {
+    .dwm-management-chrome { padding-left: 12px; }
+    .dwm-management-heading > span { max-width: 100px; }
+    .dwm-bubble-position-label { flex-basis: 108px; }
+    .dwm-management-body :is(input:not([type='checkbox']), select, textarea) { font-size: 16px; }
+}
+@media (prefers-reduced-motion: reduce) { .dwm-floating-root * { transition: none !important; scroll-behavior: auto !important; } }
 
 #dwm-toolbar-entry { min-width: 0; }
 #dwm-toolbar-button { appearance: none; width: 100%; max-width: 44px; min-height: min(44px, var(--topBarBlockSize, 44px)); margin: 0; border: 0; border-radius: 4px; background: transparent; color: inherit; line-height: 1; }
