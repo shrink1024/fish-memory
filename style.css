@@ -1,0 +1,19 @@
+@import url('./src/ui/style.css');
+.dwm-fallback { max-width: 560px; padding: 24px; border: 1px solid #666; border-radius: 12px; background: #20232a; color: #eee; }
+.dwm-fallback button { margin: 8px; padding: 8px 14px; cursor: pointer; }
+.dwm-fallback::backdrop { background: #0009; }
+
+#dwm-management-dialog { box-sizing: border-box; width: min(1240px, 96vw); max-width: 96vw; height: 90vh; max-height: 90vh; height: 90dvh; max-height: 90dvh; overflow: hidden; padding: 8px 12px 12px; color: var(--SmartThemeBodyColor, #eee); background: var(--SmartThemeBlurTintColor, #202229); border: 1px solid #667; border-radius: 12px; }
+#dwm-management-dialog[open] { display: flex; flex-direction: column; gap: 8px; }
+#dwm-management-dialog::backdrop { background: #000a; }
+#dwm-management-dialog > .dwm-management-chrome { display: flex; justify-content: flex-end; flex: 0 0 44px; min-width: 0; }
+#dwm-management-dialog > .dwm-management-body { flex: 1 1 auto; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+#dwm-management-dialog .dwm-management-close { all: unset; box-sizing: border-box; display: grid; place-items: center; flex: 0 0 44px; width: 44px; min-width: 44px; max-width: 44px; height: 44px; min-height: 44px; max-height: 44px; border: 1px solid transparent; border-radius: 8px; color: inherit; cursor: pointer; touch-action: manipulation; }
+#dwm-management-dialog .dwm-management-close:hover { background: color-mix(in srgb, currentColor 10%, transparent); }
+#dwm-management-dialog .dwm-management-close:active { background: color-mix(in srgb, currentColor 18%, transparent); }
+#dwm-management-dialog .dwm-management-close:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+#dwm-management-dialog .dwm-management-close > svg { display: block; width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; pointer-events: none; }
+
+#dwm-toolbar-entry { min-width: 0; }
+#dwm-toolbar-button { appearance: none; width: 100%; max-width: 44px; min-height: min(44px, var(--topBarBlockSize, 44px)); margin: 0; border: 0; border-radius: 4px; background: transparent; color: inherit; line-height: 1; }
+#dwm-toolbar-button:focus-visible { opacity: 1; outline: 2px solid currentColor; outline-offset: 2px; }

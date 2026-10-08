@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; img-src 'none'">
+<title>鱼忆 · 旧档隐藏恢复</title>
+<style>
+:root{color-scheme:light;--ink:#192f34;--muted:#476067;--paper:#f4f7f6;--line:#b8c9c6;--accent:#146452}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.7 system-ui,sans-serif}main{max-width:760px;margin:6vh auto;padding:24px}h1{font-size:28px;line-height:1.3}p{margin:14px 0}small{color:var(--muted)}label{display:block;font-weight:650;margin:24px 0 8px}input{max-width:100%;min-height:44px}input::file-selector-button,button{font:inherit;padding:10px 16px;border:1px solid var(--accent);border-radius:6px;background:var(--accent);color:white;cursor:pointer}button:hover{background:#0d4e40}a{color:var(--accent)}:focus-visible{outline:3px solid #b06e14;outline-offset:4px}.result{padding:16px 0;border-bottom:1px solid var(--line);overflow-wrap:anywhere}.result p{margin:0 0 12px}.error{color:#9b2518}#status{min-height:28px}.note{padding:16px;background:white;border:1px solid var(--line)}@media(max-width:480px){main{margin:16px auto;padding:20px}}
+</style>
+<main><small>鱼忆 / dev.11 及更早的隐藏标记</small><h1>恢复旧档的完整正文发送</h1>
+<p>如果旧版鱼忆启用过历史窗口，聊天里可能留下鱼忆的隐藏标记。此工具仅清理标记属于鱼忆的消息，保留其他隐藏、正文、候选和记忆。</p>
+<p class="note">文件只在当前浏览器里处理，不会上传。原文件保持不变；每份修复结果单独下载。请保留原备份，在酒馆导入修复副本后核对剧情，再继续游玩。</p>
+<ol><li>从酒馆导出需要检查的聊天，选择原生 JSONL 格式；也可使用自己备份的 JSONL 聊天文件。</li><li>选择一个或多个文件，查看各自检查结果。</li><li>下载修复副本，回到对应角色的酒馆聊天管理中导入。未出现鱼忆标记的文件无需处理。</li></ol>
+<label for="files">选择聊天文件（可多选）</label><input id="files" type="file" accept=".jsonl" multiple aria-describedby="status"><p id="status" role="status" aria-live="polite">尚未选择文件。</p><div id="results"></div>
+<p><small>新版窗口只影响当次发送，不新增这种持久隐藏。卸载扩展本身无法修复尚未打开的旧档，可在卸载后继续使用本页。此工具不重建记忆，也不解除其他工具或玩家设置的隐藏。</small></p></main>
+<script>
+function recoverJsonl(text) {
+    const owner = 'dynamic-world-memory';
+    let messages = 0, candidates = 0;
+    const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/);
+    const output = lines.map((line, index) => {
+        if (!line.trim()) return line;
+        let value;
+        try { value = JSON.parse(line); } catch { throw new Error(`第 ${index + 1} 行不是有效 JSON，未生成修复文件。`); }
+        if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`第 ${index + 1} 行不是酒馆记录对象。`);
+        if (index === 0 && !('chat_metadata' in value || 'user_name' in value || 'character_name' in value)) throw new Error('缺少原生酒馆 JSONL 文件头，请重新导出。');
+        if (typeof value.mes !== 'string') return line;
+        let changed = false;
+        if (value.extra?.dwmHidden?.owner === owner) {
+            value.is_system = false; delete value.extra.dwmHidden; messages++; changed = true;
+        }
+        for (const info of value.swipe_info ?? []) if (info?.extra?.dwmHidden?.owner === owner) {
+            delete info.extra.dwmHidden; candidates++; changed = true;
+        }
+        return changed ? JSON.stringify(value) : line;
+    });
+    return { text: output.join('\n'), messages, candidates };
+}
+let urls = [];
+document.getElementById('files').addEventListener('change', async event => {
+    for (const url of urls) URL.revokeObjectURL(url); urls = [];
+    const files = [...event.target.files], results = document.getElementById('results'), status = document.getElementById('status');
+    results.replaceChildren(); status.textContent = `正在检查 ${files.length} 个文件…`;
+    for (const file of files) {
+        const row = document.createElement('section'); row.className = 'result';
+        const title = document.createElement('strong'); title.textContent = file.name; row.append(title);
+        const message = document.createElement('p'); row.append(message);
+        try {
+            if (file.size > 100 * 1024 * 1024) throw new Error('文件超过100 MB，请拆分或联系作者协助；未生成修复文件。');
+            const result = recoverJsonl(await file.text());
+            const count = result.messages + result.candidates;
+            message.textContent = count ? `恢复 ${result.messages} 条正文，清理 ${result.candidates} 份候选标记。` : '没有发现鱼忆隐藏标记，无需修复。';
+            if (count) {
+                const url = URL.createObjectURL(new Blob([result.text], { type: 'application/jsonl;charset=utf-8' })); urls.push(url);
+                const button = document.createElement('button'); button.textContent = '下载修复副本';
+                button.addEventListener('click', () => { const a = document.createElement('a'); a.href = url; a.download = file.name.replace(/\.jsonl$/i, '') + '.recovered.jsonl'; a.click(); }); row.append(button);
+            }
+        } catch (error) { message.className = 'error'; message.textContent = error.message; }
+        results.append(row);
+    }
+    status.textContent = `已检查 ${files.length} 个文件。原文件均未修改。`;
+});
+</script></html>

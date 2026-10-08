@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>鱼忆 · 隔离开发预览</title><link rel="stylesheet" href="/style.css">
+<style>
+:root { color-scheme: light; --SmartThemeBlurTintColor:#f8f9f5; --SmartThemeBodyColor:#283b38; --demo-bg:#e9ede6; --demo-line:#c7d1c8; --demo-muted:#596c65; }
+:root[data-theme="dark"] { color-scheme:dark; --SmartThemeBlurTintColor:#182524; --SmartThemeBodyColor:#e6eae5; --demo-bg:#101918; --demo-line:#3c514b; --demo-muted:#a7b9af; }
+* { box-sizing:border-box; }
+body { margin:0 auto; padding:28px 24px 60px; max-width:1220px; background:var(--demo-bg); color:var(--SmartThemeBodyColor); font:14px/1.65 -apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif; }
+.demo-header { display:flex; justify-content:space-between; gap:20px; align-items:center; margin:0 0 18px; }
+.demo-header h1 { font-size:15px; font-weight:600; margin:0 0 4px; }
+.demo-header p { margin:0; color:var(--demo-muted); font-size:12px; }
+.demo-controls { margin-bottom:16px; display:flex; gap:8px; flex-wrap:wrap; }
+body > button, .demo-controls button, .demo-header button { cursor:pointer; border:1px solid var(--demo-line); border-radius:7px; min-height:44px; padding:8px 12px; background:var(--SmartThemeBlurTintColor); color:inherit; font:inherit; }
+button:focus-visible,summary:focus-visible { outline:3px solid #438977; outline-offset:3px; }
+#story { border:1px solid var(--demo-line); border-radius:12px; padding:6px 16px; margin-top:20px; }
+#story summary { cursor:pointer; padding:10px 0; min-height:44px; color:var(--demo-muted); }
+#messages,#plan { white-space:pre-wrap; overflow-wrap:anywhere; font-size:13px; }
+#messages { padding:12px 0; }
+#plan:empty,#demo-error:empty { display:none; }
+#plan { margin:0 0 16px; }
+#demo-error { color:#ab5046; }
+@media(max-width:600px) { body { padding:16px 10px 32px; } .demo-header { gap:12px; } .demo-header button { flex:0 0 auto; } .demo-controls button { font-size:12px; padding-inline:10px; } }
+</style>
+</head>
+<body>
+<header class="demo-header"><div><h1>鱼忆 · 隔离开发预览</h1><p>合成剧情与模拟模型，不连接玩家存档或真实 API。刷新后重置。</p></div><button id="theme" type="button">切换明暗</button></header>
+<div class="demo-controls"><button id="example" type="button">载入完整演示样例</button><button id="advance" type="button">追加剧情：莉娜迁居</button><button id="send" type="button">模拟正文选材</button><button id="fail" type="button">下一次模拟失败</button></div>
+<p id="demo-error" role="alert"></p><p id="plan" role="status"></p>
+<main id="app"></main>
+<details id="story"><summary>查看合成剧情原文</summary><div id="messages"></div></details>
+<script type="module" src="/demo/main.js"></script>
+</body>
+</html>
