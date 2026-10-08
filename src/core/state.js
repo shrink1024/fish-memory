@@ -6,7 +6,7 @@ export const KINDS = ['fact', 'rule', 'npc', 'npc_pool', 'event', 'inventory'];
 export const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
     inventoryEnabled: true,
-    windowEnabled: false,
+    windowEnabled: true,
     recentTurns: 12,
     batchChars: 18000,
     timeoutMs: 90000,
