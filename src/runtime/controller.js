@@ -1,7 +1,7 @@
 import { sourceBookChanges } from '../core/source-book.js';
 import { presetSnapshot, PREFERENCE_SCAN, validatePreferenceCandidates, selectedPreferences, applyAuxiliaryPreferences } from '../agents/preset-preferences.js';
 import { MemoryStore } from '../core/store.js';
-import { DEFAULT_SETTINGS, makeSourceEntry, entryText, normalizeScopeId, entryScope, scopeSummary, scopeInventory, readableScopes, GLOBAL_SCOPE } from '../core/state.js';
+import { DEFAULT_SETTINGS, normalizeTimeoutSettings, validTimeout, makeSourceEntry, entryText, normalizeScopeId, entryScope, scopeSummary, scopeInventory, readableScopes, GLOBAL_SCOPE } from '../core/state.js';
 import { playerView, scopeRead, memoryMetrics } from '../core/views.js';
 import { clone, invariant, uid, isPrefix, SerialQueue } from '../core/util.js';
 import { planWindow } from '../core/window.js';
@@ -40,7 +40,7 @@ export class Controller {
     #autoInitAttempts = new Set();
     #autoInitialization = null;
     constructor(host, { model, traces = createTraceStore(), settings = {}, persistSettings = async () => {}, chooseFallback = async () => 'cancel' } = {}) {
-        this.host = host; this.settings = { ...DEFAULT_SETTINGS, ...settings };
+        this.host = host; this.settings = { ...DEFAULT_SETTINGS, ...settings, ...normalizeTimeoutSettings(settings) };
         // Player-only, page-lifetime diagnostics. Never include this in view/save/agent data.
         this.traces = traces;
         this.persistSettings = persistSettings; this.chooseFallback = chooseFallback;
@@ -54,7 +54,7 @@ export class Controller {
         this.client = model ? this.#instrument(model) : this.#client(request => host.rawGenerate(request));
     }
     #client(generate) {
-        return this.#instrument(new AgentClient(generate, { timeoutMs: this.settings.timeoutMs, initializationTimeoutMs: this.settings.initializationTimeoutMs }));
+        return this.#instrument(new AgentClient(generate, { getTimeouts: () => this.settings }));
     }
     #instrument(client) {
         const complete = async (request, accept = result => result) => {
@@ -617,9 +617,12 @@ export class Controller {
         return { executed: true, message: this.status };
     }
     async updateSettings(patch) {
-        const next = { ...this.settings, ...patch };
+        const next = { ...this.settings, ...patch, timeoutSettingsVersion: 1 };
         if ('mvuFields' in patch) next.mvuBookName = this.host.snapshot().bookName;
         invariant(Number.isInteger(next.recentTurns) && next.recentTurns >= 1 && next.recentTurns <= 1000, '保留轮数应为 1–1000');
+        for (const key of ['timeoutMs', 'initializationTimeoutMs']) {
+            invariant(validTimeout(next[key]), '辅助模型等待时间应为 0（关闭插件限时）或 1000–86400000 毫秒的整数');
+        }
         for (const [key, min, max] of [['batchChars', 1, 200000], ['selectionLimit', 1, 200], ['selectionChars', 100, 200000], ['compactChars', 1000, 1000000], ['compactEvery', 1, 1000]]) {
             invariant(Number.isInteger(next[key]) && next[key] >= min && next[key] <= max, `${key} 超出允许范围`);
         }
