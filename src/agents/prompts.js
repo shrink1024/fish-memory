@@ -17,12 +17,13 @@ const OBSERVED_STATE = `可选observedState是玩家明确开放的MVU字段在�
 export const INITIALIZE = `${COMMON}
 任务：完整阅读本批角色卡原世界书，为每一条分类和编写一句话简介、适用场景。结合作者自然语言规则判断维护权限。
 叙事铁律、玩法/变量更新规则、脚本等不可维护。事实即使常驻也可能变化。混合条目按连续片段分开，不能明确分开的片段锁定并needsReview=true。
-所有segments的text按顺序拼接必须逐字等于输入正文，不能增删改写；片段id在条目内唯一。writable表示后置是否可维护。
+原文由程序保存，不要返回或重抄正文。segments只描述分段位置与权限：片段id在条目内唯一；writable表示后置是否可维护。整条同一权限时只返回一个片段{id,writable}，不需要start或text。
+混合条目需要分段时，首段从原文开头开始，省略start；后续每段用start提供该段开头的一小段逐字原文，必须在整条原文中只出现一次，并按原文先后排列。程序从此起点取到下一段起点之前，最后一段取到原文末尾，换行、空格和宏均由程序保留。不要计算字符下标，也不要返回各段全文。找不到唯一边界时，整条用一个writable=false的片段并标needsReview=true。
 kind只能为fact/rule/npc/npc_pool/event；rule的所有片段都必须writable=false。
 constant、enabled、原书来源由程序保留，不可改。重要角色可标important=true；不要仅凭出场频率判断。
 strategy描述适合本卡的事件粒度、人物关系与记忆压缩重点，不代写剧情。
 keywordHints仅是作者原有关键词参考，可帮助推断提取场景，不能变成硬触发条件或绕过作者禁用、锁定和生效条件。
-输出 {"strategy":"...","entries":[{"id":"输入原id","kind":"fact","intro":"一句话","retrieveWhen":"何时需要，何时不应提取","important":false,"needsReview":false,"segments":[{"id":"body","text":"逐字原文","writable":true}]}]}。
+输出 {"strategy":"...","entries":[{"id":"输入原id","kind":"fact","intro":"一句话","retrieveWhen":"何时需要，何时不应提取","important":false,"needsReview":false,"segments":[{"id":"body","writable":true}]}]}。混合条目示意：segments:[{"id":"rule","writable":false},{"id":"state","start":"现状：城门已经开放","writable":true}]，start须替换为输入原文里对应片段的唯一开头。
 本批每一条都必须返回，禁止输出未给出的条目。
 ${TASK_COMPLETION}`;
 
