@@ -11,10 +11,10 @@ export const RUNTIME_FILES = [
     'index.js', 'style.css', 'manifest.json', 'recovery.html',
     'src/adapters/mvu.js', 'src/adapters/settings.js', 'src/adapters/sillytavern.js',
     'src/agents/client.js', 'src/agents/preset-preferences.js', 'src/agents/prompts.js', 'src/agents/requests.js', 'src/agents/source-segments.js', 'src/agents/tasks.js',
-    'src/core/operations.js', 'src/core/source-book.js', 'src/core/state.js', 'src/core/store.js', 'src/core/util.js', 'src/core/views.js', 'src/core/window.js',
+    'src/core/fingerprint.js', 'src/core/operations.js', 'src/core/source-book.js', 'src/core/state.js', 'src/core/store.js', 'src/core/util.js', 'src/core/views.js', 'src/core/window.js',
     'src/diagnostics/capture.js', 'src/diagnostics/problem-export.js', 'src/diagnostics/prompt-preview.js', 'src/diagnostics/trace-store.js',
     'src/rules/index.js', 'src/rules/README.md', 'src/runtime/controller.js', 'src/runtime/prompt-plan.js',
-    'src/ui/activity.js', 'src/ui/diff.js', 'src/ui/panel.js', 'src/ui/prompt-preview.js', 'src/ui/style.css', 'src/ui/trace-viewer.js',
+    'src/ui/activity.js', 'src/ui/diff.js', 'src/ui/floating-manager.js', 'src/ui/panel.js', 'src/ui/prompt-preview.js', 'src/ui/style.css', 'src/ui/trace-viewer.js',
 ];
 export const PLAYER_FILES = ['README.md', 'INSTALL.md', 'COMPATIBILITY.md', 'docs/public/CHANGELOG.md', 'docs/public/FEEDBACK.md'];
 export const SOURCE_FILES = [
