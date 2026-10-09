@@ -1,13 +1,24 @@
-import { clone, invariant, plainText } from '../core/util.js';
+import { invariant, plainText } from '../core/util.js';
 import { createEntry, entryText, GLOBAL_SCOPE } from '../core/state.js';
 import { initializeRequest, strategyRequest, maintainRequest, selectRequest, compactRequest } from './requests.js';
 import { sourceSegments } from './source-segments.js';
+import { restoreProtectedReferences } from '../core/views.js';
 
 // The controller keeps the trace open until task validation finishes. Simple
 // standalone clients can still execute the same task without diagnostics.
 async function completeTask(client, request, accept) {
+    const validate = result => {
+        try { return accept(result); }
+        catch (error) {
+            // Only these pure task-result checks are eligible for one format
+            // correction. Cancellation, stale-state and persistence checks live
+            // outside this boundary and must never initiate another model call.
+            if (error.dwmResponseInvalid !== false) error.dwmResponseInvalid = true;
+            throw error;
+        }
+    };
     return typeof client.completeValidated === 'function'
-        ? client.completeValidated(request, accept) : accept(await client.complete(request));
+        ? client.completeValidated(request, validate) : validate(await client.complete(request));
 }
 
 export async function classifyEntries(client, entries, naturalLanguage = '', signal) {
@@ -37,20 +48,25 @@ export async function alignStrategy(client, strategies, entries, naturalLanguage
         result => plainText(result.strategy, '统一记忆策略', 10000));
 }
 
-export async function maintain(client, save, messages, signal, scopeId = GLOBAL_SCOPE, observedState = null) {
-    return completeTask(client, { ...maintainRequest(save, messages, scopeId, observedState), signal }, result => {
+export async function maintain(client, save, messages, signal, scopeId = GLOBAL_SCOPE, observedState = null, validate = () => {}) {
+    const request = maintainRequest(save, messages, scopeId, observedState);
+    return completeTask(client, { ...request, signal }, result => {
         invariant(Array.isArray(result.operations), '后置维护须返回 operations 操作列表；无变化时返回空数组');
-        return result;
+        const restored = restoreProtectedReferences(result, request.input.memory);
+        validate(restored);
+        return restored;
     });
 }
 export async function select(client, save, messages, { eligible = () => true, selectionLimit = 16, selectionChars = 24000, observedState = null, signal } = {}) {
     const request = selectRequest(save, messages, { eligible, selectionLimit, selectionChars, observedState });
     const catalog = request.input.catalog;
     return completeTask(client, { ...request, signal }, result => {
-        invariant(Array.isArray(result.ids) && result.ids.length <= selectionLimit, '前置选材数量或格式无效');
-        const allowed = new Set(catalog.map(e => e.id));
-        invariant(result.ids.every(id => typeof id === 'string' && allowed.has(id)), '前置选择了不允许的资料');
-        return [...new Set(result.ids)];
+        invariant(Array.isArray(result.ids), '前置选材格式无效，ids 须为列表');
+        const allowed = new Map(catalog.map(e => [e.id, e]));
+        invariant(result.ids.every(id => typeof id === 'string' && allowed.has(id)), '前置选择了目录中不允许的资料，请仅使用本批目录原 id');
+        const ids = [...new Set(result.ids)];
+        invariant(ids.filter(id => !allowed.get(id).constant).length <= selectionLimit, '前置选材数量超过按需名额，请保留本轮最相关的资料');
+        return ids;
     });
 }
 export async function compact(client, save, signal, scopeId = GLOBAL_SCOPE) {
@@ -60,6 +76,6 @@ export async function compact(client, save, signal, scopeId = GLOBAL_SCOPE) {
         invariant(Array.isArray(result.operations) && result.operations.every(op => op && ['summary', 'update', 'mergeEvents'].includes(op.type)), '整理只能更新脉络与给出的历史事件');
         const ids = new Set(memory.entries.map(e => e.id));
         invariant(result.operations.every(op => op.type === 'summary' || (op.type === 'mergeEvents' ? Array.isArray(op.sources) && op.sources.every(source => ids.has(source.id)) : ids.has(op.id))), '整理不得修改当前事实或未提供的条目');
-        return clone(result);
+        return restoreProtectedReferences(result, memory);
     });
 }
