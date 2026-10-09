@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { Controller } from '../src/runtime/controller.js';
 import { createSillyTavernHost } from '../src/adapters/sillytavern.js';
 
+const nativeOptions = () => Object.fromEntries(['automatic_trigger', 'force_name2', 'quiet_prompt', 'quietToLoud', 'skipWIAN', 'force_chid', 'signal', 'quietImage'].map(key => [key, undefined]));
+
 const BASE = 'remembered earlier history';
 const OLD = 'discarded old reply';
 const NEW = 'replacement reply';
@@ -73,8 +75,8 @@ async function fixture(t, { scoped = false, singleBatch = false, selectFailure =
         async start(type) {
             generating = true;
             if (type === 'swipe') { live.chat.at(-1).swipe_id = live.chat.at(-1).swipes.length; await source.emit(types.MESSAGE_SWIPED, live.chat.length - 1); }
-            await source.emit(types.GENERATION_STARTED, type, {}, false);
-            await source.emit(types.GENERATION_AFTER_COMMANDS, type, {}, false);
+            await source.emit(types.GENERATION_STARTED, type, nativeOptions(), false);
+            await source.emit(types.GENERATION_AFTER_COMMANDS, type, nativeOptions(), false);
         },
         async receive(type) {
             if (type === 'regenerate') live.chat.push(message('new', NEW));
@@ -117,7 +119,8 @@ for (const type of ['regenerate', 'swipe']) for (const failure of ['stop', 'pref
         const previous = structuredClone(f.live.chat.at(-1));
         const originalSummary = f.summary();
         const previousCalls = f.calls.filter(c => c.purpose === 'maintain').length;
-        await f.start(type);
+        if (failure === 'preflight failure') await assert.rejects(f.start(type), { name: 'AbortError' });
+        else await f.start(type);
         if (failure === 'stop') {
             if (type === 'regenerate') { f.live.chat.pop(); await f.emit('MESSAGE_DELETED', f.live.chat.length); }
             await f.emit('GENERATION_STOPPED');
@@ -136,7 +139,7 @@ test('regenerate does not suppress unrelated deletion or a second delete', async
     await f.start('regenerate');
     f.live.chat.pop(); await f.emit('MESSAGE_DELETED', 3);
     assert.ok(f.slots.get('dwm:summary'));
-    f.live.chat.pop(); await f.emit('MESSAGE_DELETED', 2);
+    f.live.chat.pop(); await f.emit('MESSAGE_DELETED', 2); await tick(); await f.c.whenIdle();
     assert.equal(f.slots.get('dwm:summary'), '');
     assert.deepEqual(f.c.store.state.processed, f.host.snapshot().messages.map(m => m.key));
     assert.equal(f.summary().includes(OLD), false);
@@ -169,10 +172,23 @@ test('stopped regenerate keeps original memory when card cleanup precedes native
 test('a finished failed generation cannot claim a later user deletion as its native replacement', async t => {
     const f = await fixture(t);
     await f.start('regenerate');
+    // Native unblockGeneration clears is_send_press before ENDED. The event
+    // alone can also come from a foreign generator while this one is active.
+    f.setGenerating(false);
     await f.emit('GENERATION_ENDED');
-    f.live.chat.pop(); await f.emit('MESSAGE_DELETED', 3);
+    f.live.chat.pop(); await f.emit('MESSAGE_DELETED', 3); await tick(); await f.c.whenIdle();
     assert.equal(f.summary().includes(OLD), false);
     assert.deepEqual(f.c.store.state.processed, f.host.snapshot().messages.map(m => m.key));
+});
+for (const type of ['regenerate', 'swipe']) test(`${type}: unidentified end retains the active replacement and its stored original history`, async t => {
+    const f = await fixture(t);
+    await f.start(type);
+    const saved = structuredClone(f.c.store.state), summary = f.slots.get('dwm:summary');
+    assert.ok(f.host.pendingReplacement());
+    await f.emit('GENERATION_ENDED');
+    assert.ok(f.host.pendingReplacement(), 'END alone cannot settle this replacement');
+    assert.equal(f.slots.get('dwm:summary'), summary);
+    assert.deepEqual(f.c.store.state, saved, 'an unrelated end never commits a speculative branch');
 });
 test('trial selection during an unfilled swipe leaves the original saved journal intact', async t => {
     const f = await fixture(t);

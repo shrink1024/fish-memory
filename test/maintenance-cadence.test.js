@@ -1,25 +1,27 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Controller } from '../src/runtime/controller.js';
+import { DEFAULT_SETTINGS, MAINTENANCE_EVERY_MAX } from '../src/core/state.js';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 async function settled() { for (let i = 0; i < 12; i++) await tick(); }
 function fixture({ settings = {}, handler } = {}) {
     const state = { chatId: 'cadence', bookName: 'main', templateEnabled: true, messages: [], userInput: '' };
-    const calls = [], saves = new Map(), windows = [];
+    const calls = [], saves = new Map(), windows = [], settingsWrites = [];
     const host = {
         snapshot: () => structuredClone(state), loadWorldbook: async () => [],
         storage: { read: async id => structuredClone(saves.get(id) ?? null), write: async (id, save) => saves.set(id, structuredClone(save)) },
         clearPlan() {}, setPlan() {}, eligible: () => true, applyWindow: async actions => windows.push(...actions),
     };
-    const options = { settings, model: { complete: async request => { calls.push(request); return await handler?.(request) ?? (request.purpose === 'select' ? { ids: [] } : { operations: [] }); } } };
+    const options = { settings, persistSettings: async value => { settingsWrites.push(structuredClone(value)); options.settings = structuredClone(value); },
+        model: { complete: async request => { calls.push(request); return await handler?.(request) ?? (request.purpose === 'select' ? { ids: [] } : { operations: [] }); } } };
     let controller = new Controller(host, options);
     const start = async () => { await controller.start(); await controller.initialize(); };
     const reply = async (number, content = '合成回复') => {
         state.messages.push({ key: `u${number}`, role: 'user', content: '合成输入' }, { key: `a${number}`, role: 'assistant', content });
         controller.messageReceived(); await settled();
     };
-    return { get controller() { return controller; }, state, calls, windows, start, reply,
+    return { get controller() { return controller; }, state, calls, windows, settingsWrites, start, reply,
         reload: async () => { controller = new Controller(host, options); await controller.start(); } };
 }
 
@@ -39,7 +41,8 @@ test('default cadence accumulates three replies without hiding or omitting pendi
 });
 
 test('manual catch-up and the every-reply setting stay immediate', async () => {
-    const f = fixture(); await f.start(); await f.reply(1);
+    const f = fixture({ settings: { maintenanceEvery: 21 } }); await f.start(); await f.reply(1);
+    assert.equal(f.calls.filter(r => r.purpose === 'maintain').length, 0);
     await f.controller.maintain();
     assert.equal(f.controller.store.state.processed.length, 2);
     await f.controller.updateSettings({ maintenanceEvery: 1 }); await f.reply(2);
@@ -48,9 +51,43 @@ test('manual catch-up and the every-reply setting stay immediate', async () => {
 });
 
 test('pending text reaching the batch size is processed before the reply threshold', async () => {
-    const f = fixture({ settings: { batchChars: 100 } }); await f.start(); await f.reply(1, '长'.repeat(100));
+    const f = fixture({ settings: { maintenanceEvery: 21, batchChars: 100 } }); await f.start(); await f.reply(1, '长'.repeat(100));
     assert.equal(f.controller.store.state.processed.length, 2);
     assert.ok(f.calls.some(r => r.purpose === 'maintain'));
+});
+
+test('a custom interval above twenty persists and counts AI replies across a reload', async () => {
+    const f = fixture(); await f.start();
+    await f.controller.updateSettings({ maintenanceEvery: 21 });
+    assert.equal(f.settingsWrites.at(-1).maintenanceEvery, 21);
+    for (let i = 1; i <= 10; i++) await f.reply(i);
+    await f.reload();
+    assert.equal(f.controller.settings.maintenanceEvery, 21);
+    assert.equal(f.controller.view().maintenance.pendingReplies, 10);
+    for (let i = 11; i <= 20; i++) await f.reply(i);
+    assert.equal(f.calls.filter(r => r.purpose === 'maintain').length, 0);
+    assert.equal(f.controller.store.state.processed.length, 0);
+    await f.reply(21);
+    const requests = f.calls.filter(r => r.purpose === 'maintain');
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].input.messages.filter(message => message.role === 'assistant').length, 21);
+    assert.equal(f.controller.store.state.processed.length, 42);
+    assert.equal(f.controller.view().maintenance.pendingReplies, 0);
+});
+
+test('custom intervals accept the upper bound and reject invalid values without saving them', async () => {
+    assert.equal(MAINTENANCE_EVERY_MAX, 1000);
+    const f = fixture(); await f.start();
+    await f.controller.updateSettings({ maintenanceEvery: 1000 });
+    await f.reload();
+    assert.equal(f.controller.settings.maintenanceEvery, 1000);
+    for (const maintenanceEvery of [0, 1.5, 1001]) {
+        await assert.rejects(f.controller.updateSettings({ maintenanceEvery }), /自动维护间隔/);
+        assert.equal(f.controller.settings.maintenanceEvery, 1000);
+        const invalid = fixture({ settings: { maintenanceEvery } });
+        assert.equal(invalid.controller.settings.maintenanceEvery, DEFAULT_SETTINGS.maintenanceEvery);
+    }
+    assert.equal(f.settingsWrites.length, 1);
 });
 
 test('pending cadence survives a reload without treating unprocessed replies as remembered', async () => {
@@ -132,7 +169,7 @@ test('an early changed candidate invalidates a compaction marker even when the f
     await f.controller.maintain(); await f.controller.compact();
     assert.equal(f.calls.filter(request => request.purpose === 'compact').length, 1);
     f.state.messages[1] = { key: 'a1-new', role: 'assistant', content: '改选后不同的剧情' };
-    await f.controller.messageSwiped();
+    await f.controller.messageSwiped(); await settled(); await f.controller.whenIdle();
     updateSummary = false; await f.reply(4, '不改变摘要的闲聊');
     const requests = f.calls.filter(request => request.purpose === 'compact');
     assert.equal(requests.length, 2, 'the unchanged tail key does not certify the earlier path');

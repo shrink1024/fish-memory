@@ -31,6 +31,31 @@ test('保存成功才推进，持久化失败保持完整旧版本', async () =>
     await assert.rejects(store.commit(update(1, '住北城', 'a'), { expectedRevision: before.revision, sourceKeys: ['a'] }), /disk full/);
     assert.deepEqual(store.snapshot(), before);
 });
+test('maintenance cannot persist reading coverage from outside the current message path', async () => {
+    const { store, persistence } = await setup();
+    const before = store.snapshot();
+    await assert.rejects(store.commit({ operations: [] }, { expectedRevision: before.revision,
+        sourceKeys: ['current'], allowedEvidence: ['other-branch'] }), /依据.*当前剧情/);
+    assert.deepEqual(store.snapshot(), before);
+    assert.deepEqual(persistence.db.get(before.chatId), before);
+});
+test('legacy saves never infer reading coverage and rollback removes newly covered candidate keys', async () => {
+    const { store, persistence } = await setup();
+    await store.commit({ operations: [{ type: 'summary', text: '旧摘要' }] }, {
+        expectedRevision: store.state.revision, sourceKeys: ['old', 'hidden'], allowedEvidence: ['old'] });
+    const legacy = store.snapshot(); delete legacy.rememberedKeys;
+    persistence.db.set(legacy.chatId, legacy);
+    const reopened = new MemoryStore(persistence);
+    await reopened.load(legacy.chatId, 'world');
+    assert.equal(reopened.state.rememberedKeys, undefined);
+    await reopened.commit({ operations: [] }, { expectedRevision: reopened.state.revision,
+        sourceKeys: ['old', 'hidden', 'new'], allowedEvidence: ['new'] });
+    assert.deepEqual(reopened.state.rememberedKeys, ['new']);
+    await reopened.reconcile(['old', 'hidden', 'new-swipe']);
+    assert.deepEqual(reopened.state.processed, ['old', 'hidden']);
+    assert.deepEqual(reopened.state.rememberedKeys, []);
+    validateSave(reopened.snapshot());
+});
 test('受保护正文和审计不进入后置，写权限由程序拒绝', async () => {
     const { store } = await setup();
     const view = JSON.stringify(maintenanceView(store.snapshot()));
@@ -109,14 +134,14 @@ test('journal uses one story path and scalar anchors instead of copying every pr
     assert.ok(JSON.stringify(saved.journal).length < 25000);
 });
 
-test('manual edit anchored to an unprocessed swipe rolls back without certifying progress', async () => {
+test('manual correction survives an unprocessed swipe without certifying progress', async () => {
     const { store } = await setup();
     await store.commit(update(1, '住北城', 'a'), { expectedRevision: store.state.revision, sourceKeys: ['a'] });
     await store.manual({ type: 'edit', id: 'home', segments: [{ id: 'body', text: '玩家暂改', writable: true }] }, ['a', 'reply:0']);
     assert.deepEqual(store.state.processed, ['a']);
     assert.deepEqual(store.state.storyKeys, ['a', 'reply:0']);
     await store.reconcile(['a', 'reply:1']);
-    assert.equal(entryText(store.state.data.entries.home), '住北城');
+    assert.equal(entryText(store.state.data.entries.home), '玩家暂改');
     assert.deepEqual(store.state.processed, ['a']);
     assert.deepEqual(store.state.storyKeys, ['a']);
     await store.manual({ type: 'edit', id: 'home', segments: [{ id: 'body', text: '新分支修正', writable: true }] }, ['a', 'reply:1']);
@@ -130,8 +155,8 @@ test('inventory disabled anchor follows branch replay and successful catch-up cl
     await store.manual({ type: 'inventory-toggle', enabled: false }, ['a', 'reply:0']);
     assert.equal(store.state.inventoryDisabledAt, 1);
     await store.reconcile(['a', 'reply:1']);
-    assert.equal(store.state.data.inventoryEnabled, true);
-    assert.equal(store.state.inventoryDisabledAt, null);
+    assert.equal(store.state.data.inventoryEnabled, false);
+    assert.equal(store.state.inventoryDisabledAt, 1);
     await store.manual({ type: 'inventory-toggle', enabled: false }, ['a', 'reply:1']);
     await store.manual({ type: 'inventory-toggle', enabled: true }, ['a', 'reply:1']);
     assert.equal(store.state.inventoryDisabledAt, 1);
@@ -256,7 +281,7 @@ test('player can split one named person from a pool without erasing other people
     await assert.rejects(store.manual(action, ['earlier', 'pending:0']), /已从该合集独立建档/);
     assert.equal(Object.values(store.state.data.entries).filter(e => e.kind === 'npc').length, 1);
     await store.reconcile(['earlier', 'pending:1']);
-    assert.equal(Object.values(store.state.data.entries).filter(e => e.kind === 'npc').length, 0);
+    assert.equal(Object.values(store.state.data.entries).filter(e => e.kind === 'npc').length, 1, 'explicit player promotion survives while its source pool survives');
     assert.equal(entryText(store.state.data.entries.pool), original);
 });
 

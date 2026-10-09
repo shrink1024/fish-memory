@@ -66,7 +66,8 @@ test('stopping initialization while reading discards late book data and does not
     const initializing = f.controller.initialize(); initializing.catch(() => {});
     const activity = f.controller.view().activity;
     assert.equal(activity.kind, 'initialize');
-    assert.match(activity.hint, /已发给酒馆的请求可能继续/);
+    assert.match(activity.hint, /中止网络等待/);
+    assert.match(activity.hint, /服务端可能继续运行或计费/);
     assert.deepEqual(await f.controller.requestStop(activity.id), { stopped: true });
     await assert.rejects(initializing, /用户已停止/);
     reading.resolve([{ uid: 99, comment: '迟到世界书', content: '不得使用' }]); await tick();
@@ -140,7 +141,7 @@ test('stale foreground activity cannot stop a new generation or replace its acti
     const current = f.controller.generationBefore(); await until(() => serial === 2);
     const currentId = f.controller.view().activities.find(activity => activity.id !== oldId).id;
     assert.equal(f.controller.view().activity.id, currentId, 'a superseded native run must no longer own the visible stop button');
-    assert.deepEqual(await f.controller.requestStop(oldId), { stopped: false, reason: '该任务已过期' });
+    assert.deepEqual(await f.controller.requestStop(oldId), { stopped: false, reason: '该任务已结束' });
     await old;
     assert.equal(f.stops, 0); assert.equal(f.controller.view().activity.id, currentId);
     oldResponse.resolve({ ids: [] }); await tick();

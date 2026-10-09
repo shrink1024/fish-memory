@@ -51,7 +51,7 @@ test('native window omits outgoing copies only; clearing a plan or reloading lea
             { mes: 'recent', is_user: true, is_system: false, extra: { dwmKey: 'recent' } },
         ] };
     let saves = 0;
-    const deps = { context: () => live, script: { setExtensionPrompt() {} }, extensions: {}, worldInfo: {}, save: async () => { saves++; } };
+    const deps = { context: () => live, script: { setExtensionPrompt() {} }, extensions: {}, worldInfo: { loadWorldInfo: async () => ({ entries: {} }) }, save: async () => { saves++; } };
     const host = await createSillyTavernHost(deps);
     const first = host.snapshot().messages[0];
     await host.applyWindow([{ ...first, hidden: true }]);
@@ -60,11 +60,11 @@ test('native window omits outgoing copies only; clearing a plan or reloading lea
     assert.equal(saves, 0);
     host.setPlan({ chatId: host.snapshot().chatId, bookName: 'book', summary: 'covers first' });
     const outgoing = live.chat.filter(m => !m.is_system).map(m => ({ ...m }));
-    host.filterOutgoingHistory(outgoing, null, null, 'normal');
+    await host.filterOutgoingHistory(outgoing, null, null, 'normal');
     assert.deepEqual(outgoing.map(m => m.mes), ['recent']);
     host.clearPlan();
     const next = live.chat.filter(m => !m.is_system).map(m => ({ ...m }));
-    host.filterOutgoingHistory(next, null, null, 'normal');
+    await host.filterOutgoingHistory(next, null, null, 'normal');
     assert.deepEqual(next.map(m => m.mes), ['remembered', 'recent']);
     const reloaded = await createSillyTavernHost(deps);
     assert.equal(reloaded.snapshot().messages[0].hidden, false);

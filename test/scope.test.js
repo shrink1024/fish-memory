@@ -292,3 +292,35 @@ test('cancelled preparation restores the old scope without materializing target 
     assert.equal(c.store.state.data.scopeContext.activeScopeId, 'A');
     assert.equal(f.calls.filter(call => call.purpose === 'maintain').length, 0);
 });
+
+test('readScope refuses old memory after the current card rebinds to another worldbook', async () => {
+    const f = fixture(), c = await ready(f);
+    f.state.messages.push(message('old', '旧主书的剧情资料'));
+    await c.maintain();
+    assert.equal((await c.readScope('global')).summary, '旧主书的剧情资料');
+    f.state.bookName = 'new-book'; await c.chatChanged();
+    let bookReads = 0;
+    const originalLoad = f.host.loadWorldbook;
+    f.host.loadWorldbook = () => { bookReads++; return originalLoad(); };
+    await assert.rejects(c.readScope('global'), /主世界书.*(?:改变|不同|一致|扫描)|重新扫描/);
+    assert.equal(bookReads, 0, 'reject the mismatched binding before reading rules from another book');
+    assert.equal(c.store.state.bookName, 'main');
+    assert.equal(c.store.state.data.summary, '旧主书的剧情资料');
+});
+
+for (const boundary of ['committed', 'rules']) test(`readScope rechecks chat and book after the ${boundary} await`, async () => {
+    for (const change of ['book', 'chat']) {
+        const f = fixture(), c = await ready(f);
+        const mutate = () => { if (change === 'book') f.state.bookName = 'new-book'; else f.state.chatId = 'new-chat'; };
+        if (boundary === 'committed') {
+            const original = c.whenCommitted.bind(c);
+            c.whenCommitted = async () => { const result = await original(); mutate(); return result; };
+        } else {
+            const original = f.host.loadWorldbook;
+            f.host.loadWorldbook = async () => { const result = await original(); mutate(); return result; };
+        }
+        await assert.rejects(c.readScope('global'), /作废|切换|主世界书|重新扫描/, `${boundary}/${change}`);
+        assert.equal(c.store.state.chatId, 'scope-chat');
+        assert.equal(c.store.state.bookName, 'main');
+    }
+});

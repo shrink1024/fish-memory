@@ -39,6 +39,17 @@ test('memory status uses actual controller view fields and never exposes another
     await assert.rejects(f.exporter.export(), /载入|切换|存档/);
 });
 
+test('worldbook diagnosis remains exportable before a memory store can be created', async () => {
+    const f = fixture(); f.controller.store = null;
+    f.view.readiness = { chat: true, book: false, single: true, template: true };
+    f.view.worldbook = { primaryName: null, state: 'unbound', embeddedBook: true,
+        additionalBookCount: 1, message: '角色尚未绑定主世界书。' };
+    const result = await f.exporter.export();
+    assert.deepEqual(result.memory.worldbook, f.view.worldbook);
+    assert.deepEqual(result.memory.readiness, f.view.readiness);
+    assert.equal(result.memory.initialized, false);
+});
+
 test('source exceptions and malformed runs do not prevent exporting the remaining evidence', async () => {
     const f = fixture();
     f.exporter.register({ id: 'good', read: () => ({ runs: 'not-an-array', detail: '有用资料' }) });
