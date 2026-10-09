@@ -2,7 +2,7 @@ import { sourceBookChanges } from '../core/source-book.js';
 import { presetSnapshot, PREFERENCE_SCAN, validatePreferenceCandidates, selectedPreferences, applyAuxiliaryPreferences } from '../agents/preset-preferences.js';
 import { MemoryStore } from '../core/store.js';
 import { sha256Fingerprint } from '../core/fingerprint.js';
-import { DEFAULT_SETTINGS, normalizeTimeoutSettings, validTimeout, makeSourceEntry, entryText, normalizeScopeId, entryScope, scopeSummary, scopeInventory, readableScopes, GLOBAL_SCOPE } from '../core/state.js';
+import { DEFAULT_SETTINGS, MAINTENANCE_EVERY_MAX, normalizeTimeoutSettings, validTimeout, makeSourceEntry, entryText, normalizeScopeId, entryScope, scopeSummary, scopeInventory, readableScopes, GLOBAL_SCOPE } from '../core/state.js';
 import { playerView, scopeRead, memoryMetrics } from '../core/views.js';
 import { clone, invariant, uid, isPrefix, SerialQueue } from '../core/util.js';
 import { planWindow } from '../core/window.js';
@@ -12,7 +12,7 @@ import { classifyEntries, alignStrategy, maintain, select, compact } from '../ag
 import { discoverRules, compileRules, applyRules, evaluateRules } from '../rules/index.js';
 import { createTraceStore } from '../diagnostics/trace-store.js';
 import { buildPromptPreview } from '../diagnostics/prompt-preview.js';
-import { selectionMessages, requestBatches } from '../agents/requests.js';
+import { selectionMessages, requestBatches, INITIALIZATION_BATCH_ITEMS, isReadableMessage } from '../agents/requests.js';
 import { assemblePromptPlan, previewNarration } from './prompt-plan.js';
 
 export const batches = requestBatches;
@@ -31,6 +31,7 @@ export class Controller {
     #nativeBypass = false;
     #contextQueue = new SerialQueue();
     #selectionLeases = new Set();
+    #selectionWaiters = new Set();
     #compactMarks = new Map();
     #compactAttempts = new Map();
     #mvuReadSerial = 0;
@@ -41,14 +42,18 @@ export class Controller {
     #activityClaims = new Map();
     #presetDraft = null;
     #loading = null;
+    #loadedTarget = null;
+    #worldbookCheck = null;
     #autoInitTask = null;
     #autoInitAttempts = new Set();
     #autoInitialization = null;
     #initializationSourceFingerprint = '';
     #initializationContextFingerprint = '';
+    #initializationClassificationFingerprint = '';
+    #connectionConfig = null;
     constructor(host, { model, traces = createTraceStore(), settings = {}, persistSettings = async () => {}, chooseFallback = async () => 'cancel' } = {}) {
         this.host = host; this.settings = { ...DEFAULT_SETTINGS, ...settings, ...normalizeTimeoutSettings(settings) };
-        if (!Number.isInteger(this.settings.maintenanceEvery) || this.settings.maintenanceEvery < 1 || this.settings.maintenanceEvery > 20) this.settings.maintenanceEvery = DEFAULT_SETTINGS.maintenanceEvery;
+        if (!Number.isInteger(this.settings.maintenanceEvery) || this.settings.maintenanceEvery < 1 || this.settings.maintenanceEvery > MAINTENANCE_EVERY_MAX) this.settings.maintenanceEvery = DEFAULT_SETTINGS.maintenanceEvery;
         // Player-only, page-lifetime diagnostics. Never include this in view/save/agent data.
         this.traces = traces;
         this.persistSettings = persistSettings; this.chooseFallback = chooseFallback;
@@ -70,22 +75,36 @@ export class Controller {
             request = applyAuxiliaryPreferences(request, preferences);
             const epoch = this.#epoch, start = Date.now();
             const serializedInput = serializeAgentInput(request.input);
-            const trace = this.host.traceCapture?.register({ ...request, input: serializedInput });
-            const fallbackId = trace ? null : this.traces.start({ source: '鱼忆', label: ({ initialize: '扫描世界书', strategy: '统合记忆策略', select: '前置选材', maintain: '后置维护', compact: '整理事件', preferences: '扫描预设偏好' })[request.purpose] ?? request.purpose,
+            let trace = this.host.traceCapture?.register({ ...request, input: serializedInput });
+            const startFallback = input => this.traces.start({ source: '鱼忆', label: ({ initialize: '扫描世界书', strategy: '统合记忆策略', select: '前置选材', maintain: '后置维护', compact: '整理事件', preferences: '扫描预设偏好' })[request.purpose] ?? request.purpose,
                 transport: this.connectionMode === 'test' ? 'test' : 'agent-boundary',
                 context: { chatId: this.host.snapshot().chatId },
-                request: { messages: [{ role: 'system', content: request.system }, { role: 'user', content: serializedInput }] },
+                request: { messages: [{ role: 'system', content: request.system }, { role: 'user', content: input }] },
                 captureNote: '辅助接口记录，未捕获网络包；模拟模式的输出为合成数据。' });
+            let fallbackId = trace ? null : startFallback(serializedInput);
             const metric = { task: request.purpose, at: new Date(start).toISOString(),
                 inputChars: request.system.length + serializedInput.length, outputChars: 0, ok: false };
             try {
                 request.signal?.throwIfAborted();
-                const result = await untilAborted(client.complete(request), request.signal);
-                metric.outputChars = JSON.stringify(result).length;
-                // Retain the model response even if task validation rejects it.
-                if (fallbackId) this.traces.update(fallbackId, { responseBody: result });
-                if (preferences.length && request.purpose !== 'preferences') invariant(this.#preset().fingerprint === presetFingerprint, '请求期间预设已改变，旧偏好结果不再采用');
-                const accepted = await untilAborted(accept(result), request.signal);
+                const validate = async result => {
+                    metric.outputChars = JSON.stringify(result).length;
+                    if (fallbackId) this.traces.update(fallbackId, { responseBody: result });
+                    if (preferences.length && request.purpose !== 'preferences') invariant(this.#preset().fingerprint === presetFingerprint, '请求期间预设已改变，旧偏好结果不再采用');
+                    return untilAborted(accept(result), request.signal);
+                };
+                const onAttempt = attempt => {
+                    metric.attempts = attempt.attempt + 1;
+                    if (!attempt.attempt) return;
+                    const error = new Error('模型输出格式未通过校验，正在进行一次纠正重试');
+                    trace?.end(error);
+                    if (fallbackId) this.traces.finish(fallbackId, { status: 'error', processingError: error.message });
+                    trace = this.host.traceCapture?.register(attempt);
+                    fallbackId = trace ? null : startFallback(attempt.input);
+                    metric.inputChars += attempt.system.length + attempt.input.length;
+                };
+                const accepted = client instanceof AgentClient
+                    ? await untilAborted(client.complete({ ...request, validate, onAttempt }), request.signal)
+                    : await validate(await untilAborted(client.complete(request), request.signal));
                 metric.ok = true;
                 if (fallbackId) this.traces.finish(fallbackId, { status: 'complete' });
                 trace?.end();
@@ -108,19 +127,19 @@ export class Controller {
         };
         return { complete: request => complete(request), completeValidated: complete };
     }
-    #beginActivity(kind, label, { isCurrent = () => true } = {}) {
+    #beginActivity(kind, label, { isCurrent = () => true, signal } = {}) {
         const abort = new AbortController();
         const activity = { id: uid('activity'), kind, label, startedAt: Date.now(), phase: 'running', cancellable: true,
             stopLabel: kind === 'select' ? '停止本轮' : kind === 'maintain' || kind === 'compact' ? '停止整理' : '停止等待',
             hint: kind === 'select' ? '停止将结束本轮发送；已有记忆保留。' : this.#backgroundHint(),
-            abort, signal: AbortSignal.any([this.#abort.signal, abort.signal]), isCurrent,
+            abort, signal: AbortSignal.any([this.#abort.signal, abort.signal, ...(signal ? [signal] : [])]), isCurrent,
             epoch: this.#epoch, chatId: this.host.snapshot().chatId };
         this.#activities.set(activity.id, activity); this.#notify();
         return activity;
     }
     #backgroundHint() {
         return ['raw', 'tavern'].includes(this.connectionMode)
-            ? '停止后不再采用结果；已发给酒馆的请求可能继续运行。已保存的进度保留。'
+            ? '停止会中止网络等待并放弃迟到结果；服务端可能继续运行或计费。已保存的进度保留。'
             : '停止当前任务，已保存的进度保留。';
     }
     #pauseAutomaticPost() {
@@ -147,6 +166,7 @@ export class Controller {
         invariant(activity.isCurrent(), '本轮已停止或被新的发送替代');
     }
     async #saveActivity(activity, operation) {
+        if (['maintain', 'compact', 'inventory'].includes(activity.kind)) await this.#afterSelection(activity);
         this.#assertActivity(activity);
         const previous = { label: activity.label, hint: activity.hint };
         this.#updateActivity(activity, { label: '正在保存已完成的结果', cancellable: false, hint: '保存提交期间不能撤回；完成后可停止后续批次。' });
@@ -180,14 +200,21 @@ export class Controller {
         return { stopped: true };
     }
     #selecting() { return [...this.#selectionLeases].some(lease => lease.epoch === this.#epoch); }
+    async #afterSelection(activity) {
+        while (this.#selecting()) {
+            let release;
+            const waiting = new Promise(resolve => { release = resolve; this.#selectionWaiters.add(resolve); });
+            try { await untilAborted(waiting, activity.signal); }
+            finally { this.#selectionWaiters.delete(release); }
+        }
+        this.#assertActivity(activity);
+    }
     async #withSelection(task, activity) {
         const lease = { epoch: this.#epoch }, chatId = this.host.snapshot().chatId;
         this.#selectionLeases.add(lease);
         try {
-            // Only atomic storage writes block the foreground. In-flight model
-            // work yields locally; no host-wide STOP can cancel the new send.
-            const yielded = this.#yieldBackground();
-            if (yielded && activity?.kind === 'select') this.#pauseAutomaticPost();
+            // Keep already requested model work. Background commits wait for
+            // this immutable selection snapshot, while the send stays prompt.
             await untilAborted(this.store?.idle() ?? Promise.resolve(), activity?.signal ?? this.#abort.signal);
             this.#assertCurrent(lease.epoch, chatId);
             if (activity) {
@@ -195,8 +222,11 @@ export class Controller {
                 this.#updateActivity(activity, { label: activity.kind === 'preview' ? '正在试选本轮资料' : '前置正在选择本轮资料',
                     hint: activity.kind === 'select' ? '停止将结束本轮发送；已有记忆保留。' : this.#backgroundHint() });
             }
-            return await task();
-        } finally { this.#selectionLeases.delete(lease); }
+            return await untilAborted(task(), activity?.signal ?? this.#abort.signal);
+        } finally {
+            this.#selectionLeases.delete(lease);
+            if (!this.#selecting()) for (const release of this.#selectionWaiters) release();
+        }
     }
     async refreshMvu() {
         const epoch = this.#epoch, chatId = this.host.snapshot().chatId;
@@ -308,10 +338,11 @@ export class Controller {
         task.promise = Promise.resolve().then(async () => {
             if (!this.settings.enabled) return;
             if (!target.chatId || !target.bookName || target.group) {
-                this.#initializationNotice('waiting', target.group ? '自动建档等待单角色聊天' : '自动建档等待角色主世界书就绪'); return;
+                this.#initializationNotice(null); return;
             }
             const { epoch, signal } = await this.#readyForChat(target);
             const current = () => { this.#assertCurrent(epoch, target.chatId); invariant(this.host.snapshot().bookName === target.bookName, '角色主世界书已改变'); };
+            if (this.store.state.bookName !== target.bookName) return;
             if (!this.#enabled() || this.store.state.initialized) { this.#initializationNotice(null); return; }
             if (this.#initializing) return;
             const save = this.store.state, snapshot = this.host.snapshot();
@@ -370,9 +401,9 @@ export class Controller {
         invariant(target.chatId && target.bookName && !target.group, '请先打开带主世界书的单角色聊天');
         invariant(matches(this.host.snapshot()), '存档已切换，本次处理已作废');
         const loading = this.#loading && matches(this.#loading.target) && !this.#loading.abort.signal.aborted
-            ? this.#loading.promise : !matches(this.store?.state) ? this.chatChanged() : null;
+            ? this.#loading.promise : !matches(this.#loadedTarget) ? this.chatChanged() : null;
         if (loading) await loading;
-        invariant(matches(this.host.snapshot()) && matches(this.store?.state), '存档已切换或尚未载入，本次处理已作废');
+        invariant(matches(this.host.snapshot()) && matches(this.#loadedTarget) && this.store?.state.chatId === target.chatId, '存档已切换或尚未载入，本次处理已作废');
         this.#abort.signal.throwIfAborted();
         return { epoch: this.#epoch, signal: this.#abort.signal };
     }
@@ -453,6 +484,10 @@ export class Controller {
             const context = { owner: input.owner, activeScopeId, requestedScopeIds, deferPost: Boolean(input.deferPost) };
             await this.store.manual({ type: 'scope-context', context, messageScopes }, keys);
             this.#assertCurrent(epoch, chatId);
+            if (this.store.initializationCheckpoint()) {
+                this.#initializationContextFingerprint = await initializationFingerprint(this.#initializationInputs(this.store));
+                this.#assertCurrent(epoch, chatId);
+            }
             this.host.clearPlan(); this.#notify();
             if (!context.deferPost && this.#enabled() && this.store.state.initialized) this.maintain({ automatic: true }).catch(() => {});
             if (!context.deferPost && !this.#initializing) this.readinessChanged();
@@ -482,6 +517,10 @@ export class Controller {
             }
             await this.store.manual({ type: 'scope-context', context: null, messageScopes }, keys);
             this.#assertCurrent(epoch, chatId);
+            if (this.store.initializationCheckpoint()) {
+                this.#initializationContextFingerprint = await initializationFingerprint(this.#initializationInputs(this.store));
+                this.#assertCurrent(epoch, chatId);
+            }
             this.host.clearPlan(); this.#notify();
             return { apiVersion: 1, chatId, revision: this.store.state.revision, context: null };
         }), signal);
@@ -489,11 +528,18 @@ export class Controller {
     async readScope(scopeId) {
         normalizeScopeId(scopeId);
         const target = this.host.snapshot();
+        const assertBinding = () => {
+            const current = this.host.snapshot();
+            invariant(current.chatId === target.chatId && this.store?.state.chatId === target.chatId, '存档已切换，本次资料读取已作废');
+            invariant(current.bookName === target.bookName && this.store.state.bookName === target.bookName,
+                '角色主世界书已改变，请重新扫描后再读取资料；旧资料保留');
+        };
         await this.whenCommitted();
+        assertBinding();
         invariant(this.store?.state.initialized, '请先完成初始化');
         const epoch = this.#epoch, chatId = target.chatId;
         await this.#loadRules(epoch, chatId);
-        this.#assertCurrent(epoch, chatId);
+        this.#assertCurrent(epoch, chatId); assertBinding();
         const save = this.#guarded(this.host.pendingReplacement?.()
             ? this.store.project(this.host.generationSnapshot().messages.map(m => m.key)) : this.store.snapshot());
         return { apiVersion: 1, chatId, revision: save.revision, ...scopeRead(save, scopeId) };
@@ -507,14 +553,21 @@ export class Controller {
             activity: activities[0] ?? null, activities, autoPostPaused: this.#autoPostPaused,
             initialization: clone(this.#autoInitialization), sourceChanges: clone(this.sourceChanges),
             maintenance: this.#maintenanceSchedule(), initializationResume: this.initializationResumeSummary(),
+            window: this.host.windowStatus?.() ?? { omittedCount: null, reason: this.#hasNarrativeMemory(this.store?.state) ? '实际省略以发送记录为准' : '尚无故事脉络，保留原文' },
+            warnings: [...(this.host.getWarnings?.() ?? []), ...(this.store?.state.initialized && this.store.state.processed.length
+                && !Array.isArray(this.store.state.rememberedKeys) ? [{ code: 'legacy-history-coverage',
+                    message: '旧记忆缺少逐楼阅读记录，无法确认的旧消息会保留原文。需要重新缩减历史时，请先备份聊天，再重新扫描。' }] : [])],
             enabled: this.#enabled(), saveEnabled: this.store?.state.preferences?.enabled !== false,
             activityClaimed: [...this.#activityClaims.values()].some(claim => claim.chatId === snapshot.chatId),
             preset: { name: preset.name, available: Boolean(preset.entries.length),
                 stale: Boolean(this.store?.state.preferences?.preset && this.store.state.preferences.preset.fingerprint !== preset.fingerprint),
                 saved: clone(this.store?.state.preferences?.preset ?? null), draft: clone(this.#presetDraft) },
             readiness: { chat: Boolean(snapshot.chatId), book: Boolean(snapshot.bookName), template: Boolean(snapshot.templateEnabled), single: !snapshot.group },
+            worldbook: this.host.worldbookStatus?.() ?? null,
+            worldbookChecking: Boolean(this.#worldbookCheck && this.#worldbookCheck.target.chatId === snapshot.chatId && this.#worldbookCheck.target.bookName === snapshot.bookName),
             save: this.store?.state ? playerView(this.store.state) : null,
             sourceBook: this.store?.state?.bookName ?? '', connectionMode: this.connectionMode,
+            connection: { mode: this.connectionMode, model: this.#connectionConfig?.model ?? '', hasApiKey: Boolean(this.#connectionConfig?.apiKey) },
             mvu: clone(this.mvu), diagnostics: { ...clone(this.diagnostics), memory: memoryMetrics(this.store?.state),
                 pendingCount: Math.max(0, this.host.snapshot().messages.length - (this.store?.state.processed.length ?? 0)) } };
     }
@@ -526,17 +579,55 @@ export class Controller {
         this.#abort.signal.throwIfAborted();
     }
     async start() { await this.chatChanged(); return this; }
+    async checkWorldbook() {
+        const target = this.host.snapshot();
+        if (this.#worldbookCheck?.target.chatId === target.chatId && this.#worldbookCheck.target.bookName === target.bookName) return this.#worldbookCheck.promise;
+        const idle = () => !this.#loading && !this.#initializing && !this.progress && !this.view().activity
+            && !this.host.snapshot().generating;
+        invariant(idle(), '请等待当前扫描、生成或存档载入完成，再检查世界书');
+        invariant(typeof this.host.checkWorldbook === 'function', '当前宿主不支持检查世界书');
+        const epoch = this.#epoch, task = { target, promise: null };
+        this.#worldbookCheck = task;
+        task.promise = Promise.resolve().then(async () => {
+            const result = await this.host.checkWorldbook();
+            this.#assertCurrent(epoch, target.chatId);
+            invariant(this.host.snapshot().bookName === target.bookName, '检查期间主世界书已改变，请重新检查');
+            // A user check never starts a model task or replaces an existing
+            // memory baseline. Only load a previously unavailable chat when idle.
+            if (idle()) {
+                if (!this.store && ['ready', 'empty'].includes(result.state)) {
+                    await this.chatChanged();
+                    invariant(this.host.snapshot().chatId === target.chatId && this.host.snapshot().bookName === target.bookName,
+                        '检查期间聊天或主世界书已改变，请重新检查');
+                }
+                else if (!this.store?.state.initialized) {
+                    if (this.#autoInitialization?.state === 'waiting') this.#autoInitialization = null;
+                    this.#state(['ready', 'empty'].includes(result.state) ? '主世界书已就绪，可手动建立记忆' : result.message);
+                }
+            }
+            return { executed: true, message: result.message };
+        }).finally(() => {
+            if (this.#worldbookCheck === task) this.#worldbookCheck = null;
+            this.#notify();
+        });
+        this.#notify();
+        return task.promise;
+    }
     chatChanged() {
         const target = this.host.snapshot();
         if (this.#loading?.target.chatId === target.chatId && this.#loading.target.bookName === target.bookName
             && !this.#loading.abort.signal.aborted) return this.#loading.promise;
-        if (this.#initializing && this.store?.state.chatId === target.chatId && this.store.state.bookName === target.bookName) return Promise.resolve();
+        if (this.#initializing && this.#loadedTarget?.chatId === target.chatId && this.#loadedTarget.bookName === target.bookName) return Promise.resolve();
         this.#loading?.abort.abort(Object.assign(new Error('存档已切换，本次载入已作废'), { name: 'AbortError' }));
         const loading = { target, abort: new AbortController(), promise: null };
         this.#loading = loading;
         // Publish the promise before notifying subscribers. Card listeners may
         // ask for the scope while this same CHAT_CHANGED event is still running.
-        loading.promise = Promise.resolve().then(() => untilAborted(this.#loadChat(loading), loading.abort.signal)).finally(() => {
+        loading.promise = Promise.resolve().then(() => untilAborted(this.#loadChat(loading), loading.abort.signal)).catch(error => {
+            if (this.#loading === loading && !loading.abort.signal.aborted && this.host.snapshot().chatId === target.chatId
+                && this.host.snapshot().bookName === target.bookName) this.#state('存档载入失败，请检查报错后重新打开聊天', error.message);
+            throw error;
+        }).finally(() => {
             if (this.#loading === loading) this.#loading = null;
         });
         return loading.promise;
@@ -546,6 +637,7 @@ export class Controller {
         invariant(this.#loading === loading && this.host.snapshot().chatId === loading.target.chatId
             && this.host.snapshot().bookName === loading.target.bookName, '存档已切换，本次载入已作废');
         this.store = null;
+        this.#loadedTarget = null;
         this.cancel('正在切换存档', { keepLoading: true });
         // Another CHAT_CHANGED listener may already have claimed this new chat.
         // Revoke old-chat owners only; a newly issued claim remains valid.
@@ -554,7 +646,7 @@ export class Controller {
         this.#presetDraft = null;
         this.sourceChanges = { changed: false, added: [], removed: [], updated: [] };
         this.#autoInitialization = null;
-        this.#initializationSourceFingerprint = ''; this.#initializationContextFingerprint = '';
+        this.#initializationSourceFingerprint = ''; this.#initializationContextFingerprint = ''; this.#initializationClassificationFingerprint = '';
         this.#epoch++; this.store = null; this.#maintenance = null; this.#initializing = false;
         this.#autoPostPaused = false;
         this.#pausedPostKeys.clear();
@@ -563,17 +655,26 @@ export class Controller {
         if (this.host.restoreLegacyWindow) await this.host.restoreLegacyWindow();
         await this.#restoreWindow();
         const epoch = this.#epoch, snapshot = this.host.snapshot();
-        if (!snapshot.chatId || !snapshot.bookName) { this.#state('请选择带主世界书的角色聊天'); return; }
+        if (!snapshot.chatId || !snapshot.bookName) { this.#state(this.host.worldbookStatus?.().message ?? '请选择带主世界书的角色聊天'); return; }
         if (snapshot.group) { this.#state('此开发版先支持单角色聊天'); return; }
         const store = new MemoryStore(this.host.storage, { auditLimit: this.settings.auditLimit });
-        await untilAborted(store.load(snapshot.chatId, snapshot.bookName), loading.abort.signal);
+        await untilAborted(store.load(snapshot.chatId, snapshot.bookName, null, { allowBookMismatch: true }), loading.abort.signal);
         this.#assertCurrent(epoch, snapshot.chatId);
+        invariant(this.host.snapshot().bookName === snapshot.bookName, '载入期间主世界书已改变，请重新检查');
         this.store = store;
+        this.#loadedTarget = { chatId: snapshot.chatId, bookName: snapshot.bookName };
+        if (store.state.bookName !== snapshot.bookName) {
+            this.sourceChanges = { changed: true, rebound: true, added: [], removed: [], updated: [] };
+            this.#state('主世界书绑定已改变，旧资料保留；请备份后重新扫描');
+            this.#initializationNotice('retry', '主世界书绑定已改变，请备份后重新扫描；成功前保留旧资料', true);
+            return;
+        }
         try {
             const raw = await this.#loadRules(epoch, snapshot.chatId);
             if (store.initializationCheckpoint()) {
                 this.#initializationSourceFingerprint = await initializationFingerprint({ raw, rules: this.rules });
                 this.#initializationContextFingerprint = await initializationFingerprint(this.#initializationInputs(store));
+                this.#initializationClassificationFingerprint = await initializationFingerprint(this.#classificationInputs(store));
                 this.#assertCurrent(epoch, snapshot.chatId);
             }
         }
@@ -595,6 +696,9 @@ export class Controller {
         this.rules = discoverRules(raw);
         this.compiledRules = compileRules(this.rules.script);
         this.sourceChanges = sourceBookChanges(this.store?.state, raw, this.rules.configEntryUids);
+        if (this.store?.state && this.host.snapshot().bookName !== this.store.state.bookName) {
+            this.sourceChanges = { ...this.sourceChanges, changed: true, rebound: true };
+        }
         return raw;
     }
     async #assertSourceCurrent(activity) {
@@ -603,20 +707,31 @@ export class Controller {
         invariant(!this.sourceChanges.changed, '原书已变化：请先导出聊天 JSONL 备份，再重新扫描；旧资料保留，旧处理结果不再采用。');
     }
     cancel(reason = '本轮已取消，记忆未变', { keepLoading = false } = {}) {
+        const cancelledInitialization = this.#initializing;
         if (!keepLoading) this.#loading?.abort.abort(Object.assign(new Error('当前载入等待已取消'), { name: 'AbortError' }));
         this.#abort.abort(new Error('已取消'));
         this.#abort = new AbortController();
         this.#epoch++;
         this.#initializing = false; this.#maintenance = null; this.#compacting = false; this.#nativeBypass = false;
         this.#activities.clear();
+        for (const release of this.#selectionWaiters) release();
         this.host.clearPlan();
         this.progress = null;
+        if (cancelledInitialization && this.store?.state.chatId === this.host.snapshot().chatId) {
+            this.#initializationNotice('retry', '扫描已中断，已保存的进度保留；可继续扫描', true);
+        }
         this.#state(reason);
     }
     async updateConnection({ mode = 'raw', endpoint, model, apiKey }) {
         invariant(!this.view().activity, '请先停止或等待当前任务完成，再应用连接；当前任务继续运行。');
+        // Blank means retain the session key only for the same endpoint. Never
+        // forward an existing credential when changing to a different server.
+        const normalizedEndpoint = endpoint?.trim().replace(/\/$/, '');
+        const retainedKey = normalizedEndpoint && normalizedEndpoint === this.#connectionConfig?.endpoint ? this.#connectionConfig.apiKey : '';
+        const config = { endpoint: normalizedEndpoint, model, apiKey: apiKey || retainedKey };
         const client = this.#client(['raw', 'tavern'].includes(mode) ? request => this.host.rawGenerate(request)
-            : compatibleConnection({ endpoint, model, apiKey }));
+            : compatibleConnection(config));
+        this.#connectionConfig = ['raw', 'tavern'].includes(mode) ? null : config;
         this.connectionMode = mode; this.client = client;
         this.#state('连接已更新');
         this.readinessChanged();
@@ -639,7 +754,7 @@ export class Controller {
         const next = { ...this.settings, ...patch, timeoutSettingsVersion: 1 };
         if ('mvuFields' in patch) next.mvuBookName = this.host.snapshot().bookName;
         invariant(Number.isInteger(next.recentTurns) && next.recentTurns >= 1 && next.recentTurns <= 1000, '保留轮数应为 1–1000');
-        invariant(Number.isInteger(next.maintenanceEvery) && next.maintenanceEvery >= 1 && next.maintenanceEvery <= 20, '自动维护间隔应为 1–20 轮');
+        invariant(Number.isInteger(next.maintenanceEvery) && next.maintenanceEvery >= 1 && next.maintenanceEvery <= MAINTENANCE_EVERY_MAX, `自动维护间隔应为 1–${MAINTENANCE_EVERY_MAX} 次 AI 回复`);
         for (const key of ['timeoutMs', 'initializationTimeoutMs']) {
             invariant(validTimeout(next[key]), '辅助模型等待时间应为 0（关闭插件限时）或 1000–86400000 毫秒的整数');
         }
@@ -664,10 +779,22 @@ export class Controller {
     async #syncWindow({ duringInitialization = false } = {}) {
         const snapshot = this.host.snapshot();
         if ((this.#initializing && !duringInitialization) || this.#nativeBypass || snapshot.chatId !== this.store?.state?.chatId) return;
+        const remembered = new Set(this.store.state.rememberedKeys ?? []);
         const actions = planWindow(snapshot.messages, this.store.state.processed, {
-            enabled: this.#enabled() && !this.sourceChanges.changed && this.settings.windowEnabled, recentTurns: this.settings.recentTurns,
+            enabled: this.#enabled() && !this.sourceChanges.changed && this.settings.windowEnabled && this.#hasNarrativeMemory(this.store.state), recentTurns: this.settings.recentTurns,
+            canOmit: message => this.#scopeRemembered(this.store.state, message, remembered),
         });
         if (actions.length) await this.host.applyWindow(actions);
+    }
+    #hasNarrativeMemory(save) {
+        // A successful empty operation list is not proof that old narrative was
+        // retained. Keep source text until at least a narrative summary exists.
+        return Boolean(save?.data.summary?.trim() || Object.values(save?.data.scopeSummaries ?? {}).some(text => text.trim()));
+    }
+    #scopeRemembered(save, message, remembered) {
+        if (!remembered.has(message.key)) return false;
+        const scopeId = save.data.messageScopes?.[message.key] ?? GLOBAL_SCOPE;
+        return Boolean(scopeSummary(save.data, scopeId).trim());
     }
     async #restoreWindow() {
         const actions = planWindow(this.host.snapshot().messages, [], { enabled: false, recentTurns: this.settings.recentTurns });
@@ -692,10 +819,15 @@ export class Controller {
     #initializationInputs(store) {
         return { scopeContext: store.state.data.scopeContext, messageScopes: store.state.data.messageScopes,
             inventoryEnabled: store.state.data.inventoryEnabled, preferences: store.state.preferences,
-            presetFingerprint: this.#preset().fingerprint, batchChars: this.settings.batchChars };
+            presetFingerprint: this.#preset().fingerprint, batchChars: this.settings.batchChars,
+            classificationProtocol: 2, batchItems: INITIALIZATION_BATCH_ITEMS };
     }
     #initializationRequestSettings(store) {
-        return JSON.stringify({ preferences: store.state.preferences, presetFingerprint: this.#preset().fingerprint, batchChars: this.settings.batchChars });
+        return JSON.stringify(this.#classificationInputs(store));
+    }
+    #classificationInputs(store) {
+        return { preferences: store.state.preferences, presetFingerprint: this.#preset().fingerprint,
+            batchChars: this.settings.batchChars, classificationProtocol: 2, batchItems: INITIALIZATION_BATCH_ITEMS };
     }
     #initializationIdentity(store) {
         return { saveId: store.state.id, chatId: store.state.chatId, bookName: store.state.bookName, revision: store.state.revision };
@@ -707,9 +839,11 @@ export class Controller {
             || checkpoint.identity.chatId !== save.chatId || checkpoint.identity.bookName !== save.bookName
             || checkpoint.identity.revision !== save.revision
             || checkpoint.sourceFingerprint !== this.#initializationSourceFingerprint
-            || checkpoint.inputFingerprint !== this.#initializationContextFingerprint) return null;
+            || checkpoint.inputFingerprint !== this.#initializationContextFingerprint
+                && checkpoint.classificationFingerprint !== this.#initializationClassificationFingerprint) return null;
+        const historyMatches = checkpoint.inputFingerprint === this.#initializationContextFingerprint;
         return { stage: checkpoint.stage, classifiedBatches: checkpoint.classifiedBatches, totalBatches: checkpoint.totalBatches,
-            processedCount: checkpoint.draft?.processed?.length ?? 0, updatedAt: checkpoint.updatedAt };
+            processedCount: historyMatches ? checkpoint.draft?.processed?.length ?? 0 : 0, updatedAt: checkpoint.updatedAt };
     }
     async initialize({ automatic = false } = {}) {
         invariant(this.store, '请先打开角色聊天');
@@ -739,10 +873,13 @@ export class Controller {
             let inputFingerprint = await initializationFingerprint(this.#initializationInputs(targetStore));
             this.#assertActivity(activity); assertSettings();
             this.#initializationContextFingerprint = inputFingerprint;
+            const classificationFingerprint = await initializationFingerprint(this.#classificationInputs(targetStore));
+            this.#initializationClassificationFingerprint = classificationFingerprint;
             const entries = raw.filter(e => !this.rules.configEntryUids.includes(e.uid)).map(e => makeSourceEntry(context.bookName, e));
-            const groups = batches(entries, this.settings.batchChars, entryText);
+            const groups = batches(entries, this.settings.batchChars, entryText, INITIALIZATION_BATCH_ITEMS);
             let checkpoint = targetStore.initializationCheckpoint();
             if (checkpoint?.sourceFingerprint !== sourceFingerprint || checkpoint?.inputFingerprint !== inputFingerprint
+                && checkpoint?.classificationFingerprint !== classificationFingerprint
                 || checkpoint?.totalBatches !== groups.length) checkpoint = null;
             if (checkpoint) {
                 // A truncated/corrupt checkpoint must never certify missing or
@@ -759,7 +896,7 @@ export class Controller {
                     }), '初始化断点原书不完整');
                 } catch { checkpoint = null; }
             }
-            const baseCheckpoint = () => ({ version: 1, sourceFingerprint, inputFingerprint,
+            const baseCheckpoint = () => ({ version: 1, sourceFingerprint, inputFingerprint, classificationFingerprint, targetBookName: context.bookName,
                 identity: this.#initializationIdentity(targetStore), classifiedBatches: 0, totalBatches: groups.length });
             checkpoint ??= { ...baseCheckpoint(), stage: 'classification', classification: { entries: [], strategies: [] } };
             let classified = checkpoint.stage === 'history' ? Object.values(checkpoint.draft.base.entries) : checkpoint.classification.entries;
@@ -772,7 +909,7 @@ export class Controller {
                 const identity = this.#initializationIdentity(targetStore);
                 inputFingerprint = await initializationFingerprint(this.#initializationInputs(targetStore));
                 this.#assertActivity(activity); assertSettings();
-                checkpoint = { ...checkpoint, identity, inputFingerprint, updatedAt: new Date().toISOString() };
+                checkpoint = { ...checkpoint, identity, inputFingerprint, classificationFingerprint, updatedAt: new Date().toISOString() };
                 await this.#saveActivity(activity, () => targetStore.saveInitializationCheckpoint(checkpoint, {
                     expectedRevision: identity.revision, isCurrent: () => { this.#assertActivity(activity); assertSettings(); },
                 }));
@@ -814,7 +951,7 @@ export class Controller {
                     && savedCheckpoint.inputFingerprint === inputFingerprint ? savedCheckpoint.draft : null;
                 const draft = new MemoryStore({ read: async () => previousDraft, write: async (_chatId, value) => {
                     assertDraftCurrent();
-                    const nextCheckpoint = { version: 1, stage: 'history', sourceFingerprint, inputFingerprint, identity,
+                    const nextCheckpoint = { version: 1, stage: 'history', sourceFingerprint, inputFingerprint, classificationFingerprint, identity, targetBookName: context.bookName,
                         classifiedBatches: groups.length, totalBatches: groups.length, updatedAt: new Date().toISOString(), draft: value };
                     await targetStore.saveInitializationCheckpoint(nextCheckpoint, { expectedRevision: baseRevision, isCurrent: assertDraftCurrent });
                     this.#initializationContextFingerprint = inputFingerprint;
@@ -888,6 +1025,7 @@ export class Controller {
         let count = store.state.processed.length;
         for (const batch of groups) {
             this.#assertActivity(activity);
+            if (store === this.store) await this.#afterSelection(activity);
             if (store === this.store && this.#selecting()) break;
             this.progress = { stage: '维护剧情记忆', done: count, total: messages.length }; this.#notify();
             this.#updateActivity(activity, { label: activity.kind === 'initialize' ? `扫描历史剧情 ${count}/${messages.length}` : `正在整理最近 ${messages.length - count} 条消息` });
@@ -901,16 +1039,19 @@ export class Controller {
                 this.#assertActivity(activity);
                 observedState = this.#observedState(projection, this.host.snapshot(), batch);
             }
-            const result = await maintain(this.client, this.#guarded(before), batch, signal, scopeId, observedState);
+            const readable = batch.filter(isReadableMessage);
+            const result = readable.length ? await maintain(this.client, this.#guarded(before), readable, signal, scopeId, observedState,
+                candidate => this.#validateGuarded(before, candidate, readable.map(m => m.key), scopeId)) : { operations: [] };
             this.#assertActivity(activity);
+            if (store === this.store) await this.#afterSelection(activity);
             if (store === this.store) await this.#assertSourceCurrent(activity);
             if (!isPrefix(keys.slice(0, count + batch.length), this.host.snapshot().messages.map(message => message.key))) {
                 throw Object.assign(new Error('当前剧情候选已变化，旧整理结果不再提交'), { dwmInitializationPathChanged: store !== this.store });
             }
-            this.#validateGuarded(before, result, batch.map(m => m.key), scopeId);
+            this.#validateGuarded(before, result, readable.map(m => m.key), scopeId);
             count += batch.length;
             await this.#saveActivity(activity, () => store.commit(result, { expectedRevision: before.revision, sourceKeys: keys.slice(0, count),
-                allowedEvidence: batch.map(m => m.key), maxChars: this.#maxChars(before), scopeId }));
+                allowedEvidence: readable.map(m => m.key), maxChars: this.#maxChars(before), scopeId }));
             this.#assertActivity(activity);
         }
     }
@@ -1109,8 +1250,12 @@ export class Controller {
             ...assemblePromptPlan(save, ids, { eligible, compiledRules: this.compiledRules, configEntryUids: this.rules.configEntryUids }) };
     }
 
-    async generationBefore({ type, dryRun, isCurrent = () => true } = {}) {
-        if (dryRun || !isCurrent()) return;
+    async generationBefore({ type, dryRun, isCurrent = () => true, signal } = {}) {
+        if (dryRun || !isCurrent() || ['quiet', 'impersonate'].includes(type)) return;
+        if (signal?.aborted) return { cancel: true };
+        for (const activity of this.#activities.values()) if (activity.kind === 'select') {
+            activity.abort.abort(Object.assign(new Error('已由新的发送替换'), { name: 'AbortError' }));
+        }
         this.host.clearPlan();
         if (this.host.restoreLegacyWindow) await this.host.restoreLegacyWindow();
         if (this.#initializing || ['quiet', 'impersonate'].includes(type)) {
@@ -1120,7 +1265,7 @@ export class Controller {
         }
         if (!this.#enabled() || !this.store?.state.initialized) { await this.#restoreWindow(); return; }
         const epoch = this.#epoch, chatId = this.host.snapshot().chatId;
-        const activity = this.#beginActivity('select', '前置正在读取记忆规则', { isCurrent });
+        const activity = this.#beginActivity('select', '前置正在读取记忆规则', { isCurrent, signal });
         try {
             await this.#withSelection(async () => {
                 if (!isCurrent()) return;
@@ -1135,11 +1280,13 @@ export class Controller {
                 if (!this.#enabled()) { this.#nativeBypass = true; await this.#restoreWindow(); return; }
                 {
                     const snapshot = readSnapshot(), projected = this.store.project(snapshot.messages.map(m => m.key));
+                    const remembered = new Set(projected.rememberedKeys ?? []);
                     // A rolled-back batch may also contain older valid text.
                     // Restore that text when the projected summary no longer
                     // certifies it, before ST builds the outgoing history.
                     const actions = planWindow(snapshot.messages, projected.processed, {
-                        enabled: this.settings.windowEnabled, recentTurns: this.settings.recentTurns,
+                        enabled: this.settings.windowEnabled && this.#hasNarrativeMemory(projected), recentTurns: this.settings.recentTurns,
+                        canOmit: message => this.#scopeRemembered(projected, message, remembered),
                     });
                     if (actions.length) await this.#saveActivity(activity, () => this.host.applyWindow(actions));
                     this.#assertActivity(activity);
@@ -1158,7 +1305,7 @@ export class Controller {
                 throw error;
             });
             if (activity.signal.aborted || !isCurrent() || epoch !== this.#epoch || this.host.snapshot().chatId !== chatId) return { cancel: true };
-            if (choice === 'retry') return this.generationBefore({ type, dryRun, isCurrent });
+            if (choice === 'retry') return this.generationBefore({ type, dryRun, isCurrent, signal });
             if (choice === 'original') { this.#nativeBypass = true; await this.#restoreWindow(); return; }
             await this.host.stopGeneration?.();
             return { cancel: true };
@@ -1174,16 +1321,30 @@ export class Controller {
             if (epoch === this.#epoch && !this.#autoPostPaused && this.#shouldCompact()) this.compact().catch(() => {});
         }).catch(() => {});
     }
-    generationStopped() { const userStopped = this.status === '本轮已停止'; this.#pauseAutomaticPost(); this.cancel(userStopped ? '本轮已停止' : '本轮被酒馆或角色卡取消，记忆未变'); }
+    generationStopped() {
+        this.#pauseAutomaticPost();
+        for (const activity of this.#activities.values()) if (activity.kind === 'select') {
+            activity.abort.abort(Object.assign(new Error('本轮发送已停止'), { name: 'AbortError' }));
+        }
+        this.host.clearPlan(); this.#nativeBypass = false;
+        this.#state('本轮发送已停止，已有记忆保留');
+    }
     generationEnded() {
         this.#nativeBypass = false;
         this.#notify();
         return this.#syncWindow().catch(error => { this.error = error.message; this.#notify(); });
         // Not proof of a successful reply; adapter handles finalized messages.
     }
-    async messageSwiped() { this.cancel(); if (this.store?.state.initialized) await this.maintain(); }
-    async messageDeleted() { this.cancel(); if (this.store?.state.initialized) await this.maintain(); }
-    async messageSwipeDeleted() { this.cancel(); if (this.store?.state.initialized) await this.maintain(); }
+    #storyChanged() {
+        this.cancel();
+        const epoch = this.#epoch;
+        // ST awaits event listeners while its UI is in SWIPING/deletion state.
+        // Reconcile asynchronously; never make that lock wait for a model.
+        if (this.store?.state.initialized) Promise.resolve().then(() => epoch === this.#epoch && this.maintain()).catch(() => {});
+    }
+    messageSwiped() { this.#storyChanged(); }
+    messageDeleted() { this.#storyChanged(); }
+    messageSwipeDeleted() { this.#storyChanged(); }
     async manual(action) {
         invariant(this.store?.state.initialized && !this.#initializing, '请先完成初始化');
         if (action.type === 'reset') {
@@ -1255,7 +1416,7 @@ export class Controller {
             const result = await compact(this.client, this.#guarded(base), activity.signal, scopeId);
             this.#assertActivity(activity);
             await this.#assertSourceCurrent(activity);
-            if (this.#selecting()) { this.#state('本次整理已让出，优先准备本轮资料'); return; }
+            await this.#afterSelection(activity);
             const current = this.store.snapshot();
             // Append-only new events do not invalidate updates to untouched old entries.
             result.operations = result.operations.filter(op => op.type === 'summary'
