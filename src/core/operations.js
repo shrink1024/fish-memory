@@ -1,4 +1,5 @@
 import { clone, invariant, plainText, uid, limitText } from './util.js';
+import { assertNoPendingProtectedReferences } from './views.js';
 import { createEntry, assertOriginalPreserved, entryText, entryScope, normalizeScopeId, GLOBAL_SCOPE } from './state.js';
 
 // Navigation sources, not a claim that every retained fact is supported by every
@@ -21,6 +22,7 @@ export function applyMaintenance(data, result, { allowedEvidence = [], maxChars 
     };
     for (const op of result.operations) {
         invariant(op && typeof op === 'object', '无效维护操作');
+        assertNoPendingProtectedReferences(op);
         invariant(op.scopeId === undefined || op.scopeId === scopeId, '后置不得改变本批资料归属');
         if (op.type === 'summary') {
             const text = plainText(op.text, '常驻脉络', maxChars.summary ?? 20000);

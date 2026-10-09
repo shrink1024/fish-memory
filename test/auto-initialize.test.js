@@ -57,7 +57,7 @@ test('opening a new solo chat with Fish enabled starts initialization without op
         for (const listener of listeners.get('chat') ?? []) await listener();
         await until(() => controller.store?.state.initialized);
         assert.deepEqual(calls, ['initialize', 'maintain']);
-        assert.equal(live.chatMetadata.dwm.initialized, true);
+        assert.equal((await host.storage.read(host.snapshot().chatId)).initialized, true);
     } finally { dispose?.(); globalThis.EjsTemplate = oldTemplate; }
 });
 
@@ -132,11 +132,11 @@ test('failed and stopped automatic scans persist a retry boundary across refresh
 });
 
 test('adapter readiness distinguishes unavailable books and offline model connections without generating', async () => {
-    const live = { onlineStatus: 'no_connection', generateRaw: () => { throw new Error('readiness must never generate'); } };
+    const live = { onlineStatus: 'no_connection', mainApi: 'openai', generateRaw: () => { throw new Error('readiness must never generate'); } };
     const host = await createSillyTavernHost({ context: () => live, script: {}, extensions: {}, worldInfo: { loadWorldInfo: async () => null } });
     assert.equal(host.auxiliaryReadiness().ready, false);
     live.onlineStatus = 'ready'; assert.equal(host.auxiliaryReadiness().ready, true);
-    delete live.generateRaw; assert.equal(host.auxiliaryReadiness().ready, false);
+    live.mainApi = 'koboldhorde'; assert.equal(host.auxiliaryReadiness().ready, false);
     await assert.rejects(host.loadWorldbook('missing'), /尚未加载/);
 });
 

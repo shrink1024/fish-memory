@@ -226,13 +226,13 @@ test('a superseded native preflight cannot install a late plan or offer stale fa
     }
 });
 
-test('native bypass keeps owned history visible through initialization, quiet, and original fallback', async () => {
+test('native bypass keeps owned history visible through initialization and original fallback while quiet keeps the foreground plan', async () => {
     let gate = null, failSelect = false;
     const messages = [msg('u1', '旧提问'), msg('a1', '旧回答', 'assistant'), msg('u2', '近提问'), msg('a2', '近回答', 'assistant')];
     messages[1].hidden = true; messages[1].hiddenBy = 'other-extension';
     const f = fixture({ messages, modelHandler: async request => {
         if (request.purpose === 'initialize') return gate ? gate.promise : classify(request.input);
-        if (request.purpose === 'maintain') return { operations: [] };
+        if (request.purpose === 'maintain') return { operations: [{ type: 'summary', text: '已保存的历史脉络' }] };
         if (request.purpose === 'select') { if (failSelect) throw new Error('selector failed'); return { ids: [] }; }
         return { operations: [] };
     } });
@@ -257,7 +257,7 @@ test('native bypass keeps owned history visible through initialization, quiet, a
     assert.equal(f.state.messages[0].hiddenBy, 'dynamic-world-memory');
 
     await c.generationBefore({ type: 'quiet' });
-    assert.equal(f.state.messages[0].hidden, false);
+    assert.equal(f.state.messages[0].hidden, true);
     assert.equal(f.state.messages[1].hiddenBy, 'other-extension');
     assert.equal(f.calls.some(call => call.purpose === 'select'), false);
     await c.generationEnded();
@@ -270,7 +270,7 @@ test('native bypass keeps owned history visible through initialization, quiet, a
     assert.equal(f.state.messages[1].hiddenBy, 'other-extension');
     assert.equal(f.plans.at(-1), null);
     assert.equal(f.stopped, 0);
-    assert.equal(f.windowActions.flat().filter(action => action.hidden === false && action.index === 0).length, 3);
+    assert.equal(f.windowActions.flat().filter(action => action.hidden === false && action.index === 0).length, 2);
     assert.equal(f.windowActions.flat().some(action => action.index === 1), false);
 });
 
@@ -396,7 +396,7 @@ test('cancelled initialization can restart while its stale finally remains pendi
     assert.equal(c.view().status, '存档扫描已完成，记忆已启用');
 });
 
-test('raw AgentClient path yields active maintenance and selects committed memory without waiting', async () => {
+test('raw AgentClient keeps active maintenance while selecting a stable committed snapshot', async () => {
     const gate = deferred();
     const f = fixture({ messages: [msg('base', '起点')] });
     const rawCalls = [];
@@ -416,12 +416,12 @@ test('raw AgentClient path yields active maintenance and selects committed memor
     const before = c.generationBefore({ type: 'normal' });
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(rawCalls.some(call => call.purpose === 'select'), true);
-    assert.equal((await maintaining).executed, false);
     gate.resolve(JSON.stringify({ operations: [{ type: 'summary', text: '维护后的脉络' }] }));
     await maintaining; await before;
     assert.equal(rawCalls.find(call => call.purpose === 'select').input.summary, '');
     assert.equal(f.plans.at(-1).summary, '');
-    assert.equal(c.view().save.processedCount, 1);
+    assert.equal(c.view().save.processedCount, 2);
+    assert.equal(c.store.state.data.summary, '维护后的脉络');
 });
 
 test('preflight waiting on old maintenance cancels when the chat changes before selection', async () => {
@@ -434,6 +434,7 @@ test('preflight waiting on old maintenance cancels when the chat changes before 
     const c = await ready(f);
     f.state.messages.push(msg('late', '旧聊天后续'));
     const oldMaintenance = c.maintain();
+    const cancelled = assert.rejects(oldMaintenance, /取消|切换/);
     await until(() => f.calls.some(call => call.purpose === 'maintain' && call.input.messages.some(item => item.key === 'late')));
     const oldPreflight = c.generationBefore({ type: 'normal' });
     f.state.chatId = 'chat-2'; f.state.messages = [msg('new', '新聊天起点')];
@@ -441,7 +442,7 @@ test('preflight waiting on old maintenance cancels when the chat changes before 
     await c.initialize(); // Make the new chat ready, so stale preflight could otherwise select for it.
     const newChatId = c.store.state.chatId;
     gate.resolve({ operations: [{ type: 'summary', text: '旧聊天脉络' }] });
-    assert.equal((await oldMaintenance).executed, false);
+    await cancelled;
     assert.deepEqual(await oldPreflight, { cancel: true });
     assert.equal(c.store.state.chatId, newChatId);
     assert.equal(c.store.state.chatId, 'chat-2');
@@ -504,7 +505,7 @@ test('failed inventory catch-up cannot inject stale inventory after reenable', a
     assert.equal((await c.previewPlan()).inventory, '');
 });
 
-test('preflight yields an uncommitted batch and keeps all remaining raw messages available', async () => {
+test('preflight uses uncommitted raw text while retained maintenance completes afterward', async () => {
     const gate = deferred();
     const f = fixture({ messages: [msg('base', '起点')], modelHandler: async request => {
         if (request.purpose === 'initialize') return classify(request.input);
@@ -517,8 +518,7 @@ test('preflight yields an uncommitted batch and keeps all remaining raw messages
     const work = c.maintain();
     await until(() => f.calls.some(call => call.purpose === 'maintain' && call.input.messages[0].key === 'one'));
     const sending = c.generationBefore({ type: 'normal' });
-    gate.resolve({ operations: [{ type: 'summary', text: '第一批已记住' }] });
-    await Promise.all([work, sending]);
+    await sending;
     assert.equal(c.view().save.processedCount, 1);
     assert.equal(c.view().diagnostics.pendingCount, 3);
     assert.equal(f.calls.some(call => call.purpose === 'maintain' && call.input.messages[0].key === 'two'), false);
@@ -526,7 +526,8 @@ test('preflight yields an uncommitted batch and keeps all remaining raw messages
     assert.deepEqual(selection.input.messages.map(m => m.key), ['one', 'two', 'three']);
     assert.equal(selection.input.summary, '');
     assert.equal(f.state.messages[2].hidden, false);
-    await c.maintain();
+    gate.resolve({ operations: [{ type: 'summary', text: '第一批已记住' }] });
+    await work;
     assert.equal(c.view().save.processedCount, 4);
 });
 

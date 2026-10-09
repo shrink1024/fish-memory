@@ -117,7 +117,7 @@ test('zero disables plugin timers but keeps cancellation and late-result isolati
     assert.equal(timers.length, 0);
 });
 
-test('zero long-task timeout still lets foreground selection yield maintenance and discard its late result', async t => {
+test('zero long-task timeout keeps in-flight maintenance across a foreground selection', async t => {
     const timers = controlledTimeouts(t), pending = gate();
     const f = fixture({ settings: { timeoutMs: 0, initializationTimeoutMs: 0 }, handler: request => {
         if (request.purpose === 'maintain' && request.input.messages.some(message => message.key === 'later')) return pending.promise;
@@ -127,10 +127,10 @@ test('zero long-task timeout still lets foreground selection yield maintenance a
     const maintaining = f.controller.maintain();
     await until(() => f.calls.some(call => call.purpose === 'maintain' && call.input.messages.some(message => message.key === 'later')));
     await f.controller.generationBefore({ type: 'normal' });
-    assert.equal((await maintaining).executed, false);
-    pending.resolve({ operations: [{ type: 'summary', text: '迟到结果不应采用' }] }); await tick();
-    assert.equal(f.controller.store.state.data.summary, '');
-    assert.equal(f.controller.store.state.processed.length, 2);
+    pending.resolve({ operations: [{ type: 'summary', text: '等待前置结束后保存' }] });
+    assert.equal((await maintaining).executed, true);
+    assert.equal(f.controller.store.state.data.summary, '等待前置结束后保存');
+    assert.equal(f.controller.store.state.processed.length, 3);
     assert.equal(timers.length, 0);
 });
 

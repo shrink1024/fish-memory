@@ -62,6 +62,6 @@ test('protected prose redaction leaves operation identities and source keys inta
     save.data.entries.fact = createEntry({ id: 'fact', title: 'fact', text: 'fact发生变化', evidence: ['fact'] });
     const entry = maintenanceView(save).entries[0];
     assert.equal(entry.id, 'fact'); assert.equal(entry.kind, 'fact'); assert.deepEqual(entry.evidence, ['fact']);
-    assert.equal(entry.title, '[受保护资料]');
-    assert.equal(entry.segments[0].text, '[受保护资料]发生变化');
+    assert.match(entry.title, /^⟦鱼忆引用:[^⟧]+⟧$/u);
+    assert.match(entry.segments[0].text, /^⟦鱼忆引用:[^⟧]+⟧发生变化$/u);
 });

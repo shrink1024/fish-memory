@@ -2,7 +2,7 @@ import { clone, isPrefix } from '../core/util.js';
 import { DEFAULT_SETTINGS, makeSourceEntry, entryText, normalizeScopeId, readableScopes, entryScope } from '../core/state.js';
 import { applyRules, compileRules, discoverRules } from '../rules/index.js';
 import { INITIALIZE, ALIGN_STRATEGY, MAINTAIN, SELECT, COMPACT } from '../agents/prompts.js';
-import { initializeRequest, selectRequest, maintainRequest, compactRequest, requestBatches, selectionMessages } from '../agents/requests.js';
+import { initializeRequest, selectRequest, maintainRequest, compactRequest, requestBatches, selectionMessages, INITIALIZATION_BATCH_ITEMS } from '../agents/requests.js';
 
 const AGENTS = {
     initialize: { id: 'fish-initialize', title: '鱼忆 · 初始化 Agent', description: '扫描主世界书、分类资料并统合记忆策略；分批扫描与策略统合属于同一职责。', identified: true },
@@ -68,7 +68,7 @@ export function buildPromptPreview({ snapshot, save = null, settings: suppliedSe
     let groups = null;
     if (Array.isArray(rawEntries) && context.bookName) {
         const entries = rawEntries.filter(entry => !rules.configEntryUids.includes(entry.uid)).map(entry => makeSourceEntry(context.bookName, entry));
-        groups = requestBatches(entries, settings.batchChars, entryText);
+        groups = requestBatches(entries, settings.batchChars, entryText, INITIALIZATION_BATCH_ITEMS);
         if (!groups.length) stages.push(stage(AGENTS.initialize, 'initialize', '扫描世界书', 'skipped', '主书没有需要分类的条目，本步不调用模型。', { system: INITIALIZE }));
         for (const [index, batch] of groups.entries()) stages.push(stage(AGENTS.initialize, `initialize-${index + 1}`, `扫描世界书 · ${index + 1}/${groups.length}`,
             initialized || busy.initializing ? 'conditional' : 'ready',

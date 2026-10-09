@@ -6,6 +6,47 @@ function anchor(sourceKeys) {
     return { anchorLength: sourceKeys.length, endKey: sourceKeys.length ? sourceKeys.at(-1) : null };
 }
 
+function textEdit(before, after) {
+    let start = 0, end = before.length, tail = after.length;
+    while (start < end && start < tail && before[start] === after[start]) start++;
+    while (end > start && tail > start && before[end - 1] === after[tail - 1]) { end--; tail--; }
+    return { start, end, text: after.slice(start, tail) };
+}
+function reapplyManualField(previous, edited, current, conflict) {
+    if (JSON.stringify(previous) === JSON.stringify(edited)) return clone(current);
+    if (JSON.stringify(previous) === JSON.stringify(current) || JSON.stringify(edited) === JSON.stringify(current)) return clone(edited);
+    if ([previous, edited, current].every(value => typeof value === 'string')) {
+        const manual = textEdit(previous, edited), branch = textEdit(previous, current);
+        const overlapping = !(manual.end <= branch.start || branch.end <= manual.start)
+            || manual.start === manual.end && branch.start === branch.end && manual.start === branch.start;
+        if (overlapping) { conflict(); return current; }
+        const offset = branch.end <= manual.start ? current.length - previous.length : 0;
+        return current.slice(0, manual.start + offset) + manual.text + current.slice(manual.end + offset);
+    }
+    return clone(edited);
+}
+
+function reapplyManualEntry(previous, edited, current) {
+    let needsReview = false;
+    const conflict = () => { needsReview = true; };
+    for (const key of ['title', 'kind', 'intro', 'retrieveWhen', 'important', 'needsReview', 'enabled']) {
+        current[key] = reapplyManualField(previous[key], edited[key], current[key], conflict);
+    }
+    const ids = segments => segments.map(segment => segment.id).join('\0');
+    if (ids(previous.segments) !== ids(edited.segments) || ids(previous.segments) !== ids(current.segments)) {
+        if (JSON.stringify(previous.segments) === JSON.stringify(current.segments)) current.segments = clone(edited.segments);
+        else if (JSON.stringify(previous.segments) !== JSON.stringify(edited.segments)) conflict();
+    } else {
+        for (let index = 0; index < current.segments.length; index++) {
+            for (const key of ['text', 'writable']) current.segments[index][key] = reapplyManualField(
+                previous.segments[index][key], edited.segments[index][key], current.segments[index][key], conflict);
+        }
+    }
+    current.needsReview ||= needsReview;
+    current.version++;
+    return createEntry(current);
+}
+
 function validateInitializationCheckpoint(checkpoint, save) {
     invariant(checkpoint?.version === 1 && ['classification', 'strategy', 'history'].includes(checkpoint.stage), '初始化断点格式无效');
     const identity = checkpoint.identity;
@@ -18,7 +59,8 @@ function validateInitializationCheckpoint(checkpoint, save) {
         invariant(checkpoint.classifiedBatches === checkpoint.totalBatches && !checkpoint.classification, '初始化历史断点无效');
         invariant(checkpoint.draft && !Object.hasOwn(checkpoint.draft, 'initializationCheckpoint'), '初始化草稿不能嵌套断点');
         validateSave(checkpoint.draft);
-        invariant(checkpoint.draft.initialized && checkpoint.draft.chatId === save.chatId && checkpoint.draft.bookName === save.bookName, '初始化草稿归属无效');
+        invariant(checkpoint.draft.initialized && checkpoint.draft.chatId === save.chatId
+            && checkpoint.draft.bookName === (checkpoint.targetBookName ?? save.bookName), '初始化草稿归属无效');
     } else {
         invariant(!checkpoint.draft && Array.isArray(checkpoint.classification?.entries)
             && Array.isArray(checkpoint.classification.strategies)
@@ -33,13 +75,42 @@ function validateInitializationCheckpoint(checkpoint, save) {
 function replayOnPath(state, sourceKeys) {
     const common = commonPrefix(state.storyKeys, sourceKeys);
     const next = clone(state);
-    let data = clone(next.base), processed = [], journal = [], inventoryDisabledAt = null;
+    let data = clone(next.base), originalData = clone(next.base), processed = [], journal = [], inventoryDisabledAt = null;
     for (const commit of next.journal) {
-        if (commit.anchorLength > common) break;
-        data = applyDataPatch(data, commit.patch);
-        if (commit.reason !== 'manual') processed = sourceKeys.slice(0, commit.anchorLength);
-        inventoryDisabledAt = commit.inventoryDisabledAt;
-        journal.push(commit);
+        const originalNext = applyDataPatch(originalData, commit.patch);
+        if (commit.anchorLength <= common) {
+            data = applyDataPatch(data, commit.patch);
+            if (commit.reason !== 'manual') processed = sourceKeys.slice(0, Math.max(processed.length, commit.anchorLength));
+            inventoryDisabledAt = commit.inventoryDisabledAt;
+            journal.push(commit);
+        } else if (commit.reason === 'manual') {
+            // An explicit player correction is not generated narrative. Replay
+            // only fields that player actually changed, on surviving entries;
+            // never resurrect an NPC/event belonging to the discarded reply.
+            const corrected = clone(data);
+            for (const [id, value] of Object.entries(commit.patch.entries)) {
+                const current = corrected.entries[id], previous = originalData.entries[id];
+                if (!current && !previous && value?.kind === 'npc' && !value.source && value.lineage?.length
+                    && value.lineage.every(parent => corrected.entries[parent])) {
+                    corrected.entries[id] = clone(value);
+                    corrected.entries[id].evidence = value.evidence.filter(key => sourceKeys.slice(0, common).includes(key));
+                    corrected.entries[id].lastEvidence = value.lastEvidence.filter(key => sourceKeys.slice(0, common).includes(key));
+                    continue;
+                }
+                if (!current || !previous || !value) continue;
+                corrected.entries[id] = reapplyManualEntry(previous, value, current);
+            }
+            if (Object.hasOwn(commit.patch, 'inventoryEnabled')) corrected.inventoryEnabled = commit.patch.inventoryEnabled;
+            const patch = diffData(data, corrected);
+            if (Object.keys(patch.entries).length || Object.hasOwn(patch, 'inventoryEnabled')) {
+                inventoryDisabledAt = corrected.inventoryEnabled ? inventoryDisabledAt : Math.min(commit.inventoryDisabledAt ?? processed.length, processed.length);
+                journal.push({ ...commit, ...anchor(sourceKeys.slice(0, common)), patch, inventoryDisabledAt });
+                data = corrected;
+            }
+        }
+        // Later commits can have shorter anchors (e.g. compaction), so an
+        // invalid earlier anchor must not truncate the rest of the journal.
+        originalData = originalNext;
     }
     // A regeneration may remove the exact floor where the card paused post
     // processing. Only that card may release its live, chat-local transaction.
@@ -51,11 +122,16 @@ function replayOnPath(state, sourceKeys) {
         .filter(key => state.data.messageScopes?.[key])
         .map(key => [key, state.data.messageScopes[key]]));
     next.data = data; next.processed = processed; next.journal = journal;
+    if (Array.isArray(state.rememberedKeys)) {
+        const retained = new Set(processed);
+        next.rememberedKeys = state.rememberedKeys.filter(key => retained.has(key));
+    }
     let retainedLength = processed.length;
     for (const commit of journal) retainedLength = Math.max(retainedLength, commit.anchorLength);
     next.storyKeys = sourceKeys.slice(0, retainedLength);
     next.inventoryDisabledAt = inventoryDisabledAt;
-    next.audit = [];
+    const manualReasons = new Set(['edit', 'reset', 'classify', 'promote', 'promote-from-pool']);
+    next.audit = state.audit.filter(item => manualReasons.has(item.reason) && data.entries[item.entryId]);
     return next;
 }
 
@@ -69,11 +145,11 @@ export class MemoryStore {
         invariant(this.state?.initialized, '请先初始化');
         return isPrefix(this.state.storyKeys, sourceKeys) ? this.snapshot() : replayOnPath(this.state, sourceKeys);
     }
-    async load(chatId, bookName, inherited = null) {
+    async load(chatId, bookName, inherited = null, { allowBookMismatch = false } = {}) {
         return this.#queue.run(async () => {
             const stored = inherited ?? await this.storage.read(chatId);
             const next = stored ? clone(validateSave(stored)) : createSave(chatId, bookName);
-            invariant(next.bookName === bookName, '当前主世界书与存档基准不同，请重新初始化');
+            invariant(allowBookMismatch || next.bookName === bookName, '当前主世界书与存档基准不同，请重新初始化');
             if (next.chatId !== chatId) {
                 next.parentId = next.id; next.id = uid('save'); next.chatId = chatId;
                 // Branch history is inherited; the source chat's live authority
@@ -85,11 +161,18 @@ export class MemoryStore {
             return this.snapshot();
         });
     }
-    async #persist(next) {
+    async #persist(next, { preserveClassification = false } = {}) {
         const previous = this.state;
         next.revision = previous.revision + 1;
         // Any formal save change invalidates the separate unfinished draft.
         delete next.initializationCheckpoint;
+        // Live card scope is not an input to worldbook classification. Retain
+        // accepted batches; the controller separately revalidates/restarts the
+        // history draft against the new scope before it can be committed.
+        if (preserveClassification && previous.initializationCheckpoint?.classificationFingerprint) {
+            next.initializationCheckpoint = clone(previous.initializationCheckpoint);
+            next.initializationCheckpoint.identity.revision = next.revision;
+        }
         await this.storage.write(next.chatId, clone(next), previous.revision);
         this.state = next;
         return this.snapshot();
@@ -126,7 +209,7 @@ export class MemoryStore {
                 return [entry.id, entry];
             })), strategy: plainText(strategy, '记忆策略', 10000), summary: '', inventory: [], inventoryEnabled: next.data.inventoryEnabled,
                 scopeSummaries: {}, scopeInventories: {}, scopeContext: clone(next.data.scopeContext ?? null), messageScopes: clone(next.data.messageScopes ?? {}) };
-            next.base = clone(next.data); next.processed = []; next.storyKeys = []; next.journal = []; next.audit = []; next.inventoryDisabledAt = null; next.initialized = true;
+            next.base = clone(next.data); next.processed = []; next.rememberedKeys = []; next.storyKeys = []; next.journal = []; next.audit = []; next.inventoryDisabledAt = null; next.initialized = true;
             return this.#persist(next);
         });
     }
@@ -147,16 +230,18 @@ export class MemoryStore {
             invariant(this.state.revision === expectedRevision, '存档已更新，拒绝提交旧结果');
             invariant(isPrefix(this.state.processed, sourceKeys), '当前剧情分支已变化');
             invariant(isPrefix(this.state.storyKeys, sourceKeys) || isPrefix(sourceKeys, this.state.storyKeys), '提交路径与当前剧情不符，请先同步分支');
+            const currentKeys = new Set(sourceKeys);
+            invariant(allowedEvidence.every(key => currentKeys.has(key)), '维护依据不属于当前剧情');
             const { next: data } = applyMaintenance(this.state.data, result, { allowedEvidence, maxChars, scopeId });
             data.messageScopes ??= {};
             if (reason === 'maintenance') for (const key of allowedEvidence) {
                 invariant(!data.messageScopes[key] || data.messageScopes[key] === scopeId, '本批正文混有其他范围的归属');
                 data.messageScopes[key] = normalizeScopeId(scopeId);
             }
-            return this.#commitData(data, sourceKeys, reason);
+            return this.#commitData(data, sourceKeys, reason, reason === 'maintenance' ? allowedEvidence : []);
         });
     }
-    async #commitData(data, sourceKeys, reason) {
+    async #commitData(data, sourceKeys, reason, rememberedKeys = []) {
         const next = this.snapshot();
         const at = new Date().toISOString();
         const patch = diffData(next.data, data);
@@ -166,6 +251,9 @@ export class MemoryStore {
         next.audit.push(...auditChanges(next.data, data, reason, at));
         next.audit = next.audit.slice(-this.auditLimit);
         next.data = data; next.processed = clone(sourceKeys);
+        // Progress can cross externally hidden floors. Only messages actually
+        // supplied to maintenance may be omitted after they become visible.
+        next.rememberedKeys = [...new Set([...(next.rememberedKeys ?? []), ...rememberedKeys])];
         return this.#persist(next);
     }
     async reconcile(sourceKeys) {
@@ -199,7 +287,9 @@ export class MemoryStore {
                 if (action.type === 'reset') {
                     invariant(action.confirmed === true && entry.source, '恢复原书需要确认且必须有原书来源');
                     entry.segments = clone(entry.source.baselineSegments ?? [{ id: 'body', text: entry.source.original, writable: false }]);
-                    entry.intro = ''; entry.retrieveWhen = ''; entry.evidence = []; entry.lastEvidence = []; entry.evidenceTrimmed = false;
+                    entry.intro = baseline.base.entries[entry.id]?.intro ?? '';
+                    entry.retrieveWhen = baseline.base.entries[entry.id]?.retrieveWhen ?? '';
+                    entry.evidence = []; entry.lastEvidence = []; entry.evidenceTrimmed = false;
                 } else if (action.type === 'edit') {
                     const replacement = createEntry({ ...entry, segments: action.segments ?? entry.segments, title: action.title ?? entry.title,
                         intro: action.intro ?? entry.intro, retrieveWhen: action.retrieveWhen ?? entry.retrieveWhen });
@@ -232,10 +322,10 @@ export class MemoryStore {
             if (sourceKeys.length > next.storyKeys.length) next.storyKeys = clone(sourceKeys);
             next.audit.push(...auditChanges(next.data, data, action.type, at));
             next.audit = next.audit.slice(-this.auditLimit);
-            if (action.type === 'inventory-toggle') next.inventoryDisabledAt = action.enabled ? next.inventoryDisabledAt : progress.length;
+            if (action.type === 'inventory-toggle' && !action.enabled && next.data.inventoryEnabled) next.inventoryDisabledAt = progress.length;
             next.journal.push({ id: uid('commit'), ...anchor(sourceKeys), patch: diffData(next.data, data), reason: 'manual', inventoryDisabledAt: next.inventoryDisabledAt });
             next.data = data;
-            return this.#persist(next);
+            return this.#persist(next, { preserveClassification: action.type === 'scope-context' });
         });
     }
     async commitInventoryCatchUp(inventories, expectedRevision) {

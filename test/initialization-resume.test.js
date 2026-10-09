@@ -39,6 +39,42 @@ function fixture({ handler, writeHandler, settings = {} } = {}) {
 }
 const histories = calls => calls.filter(call => call.purpose === 'maintain').flatMap(call => call.input.messages.map(message => message.key));
 
+test('scope commits keep accepted worldbook batches across stopping and reopening initialization', async () => {
+    const pending = gate(); let blocked = true;
+    const f = fixture({ handler: request => {
+        if (blocked && request.purpose === 'initialize' && request.input.entries[0].id.endsWith(':3')) return pending.promise;
+    } });
+    f.book.push({ uid: 3, comment: '第三批', content: '第三批世界书正文' });
+    await f.controller.start(); const scanning = f.controller.initialize(); scanning.catch(() => {});
+    for (let i = 0; i < 80 && f.calls.filter(call => call.purpose === 'initialize').length < 3; i++) await tick();
+    assert.equal(f.saved.get('old-chat').initializationCheckpoint.classifiedBatches, 2);
+    await f.controller.setContext({ owner: 'card', activeScopeId: 'new-scope', deferPost: true });
+    f.controller.cancel(); pending.resolve(); await assert.rejects(scanning);
+    assert.equal(f.saved.get('old-chat').initializationCheckpoint?.classifiedBatches, 2);
+    blocked = false; const before = f.calls.length, resumed = f.make(); await resumed.start();
+    await resumed.setContext({ owner: 'card', activeScopeId: 'new-scope', deferPost: false });
+    await resumed.initialize();
+    assert.deepEqual(f.calls.slice(before).filter(call => call.purpose === 'initialize').flatMap(call => call.input.entries.map(e => e.id)), ['source:main:3']);
+    assert.equal(resumed.store.state.initialized, true);
+});
+
+test('a changed scope replays the history draft but reuses its completed worldbook classification', async () => {
+    let fail = true;
+    const f = fixture({ handler: request => {
+        if (fail && request.purpose === 'maintain' && request.input.messages[0].key === 'floor-2') throw Error('暂停历史批次');
+    } });
+    await f.controller.start(); await assert.rejects(f.controller.initialize(), /暂停历史/);
+    assert.equal(f.saved.get('old-chat').initializationCheckpoint.stage, 'history');
+    await f.controller.setContext({ owner: 'card', activeScopeId: 'new-scope', deferPost: false });
+    const attribution = clone(f.controller.store.state.data.messageScopes);
+    const before = f.calls.length; fail = false; await f.controller.initialize();
+    const subsequent = f.calls.slice(before);
+    assert.equal(subsequent.some(call => call.purpose === 'initialize' || call.purpose === 'strategy'), false);
+    assert.deepEqual(histories(subsequent), ['floor-1', 'floor-2', 'floor-3']);
+    assert.ok(subsequent.filter(call => call.purpose === 'maintain').every(call => call.input.memory.scopeId === attribution[call.input.messages[0].key]));
+    assert.equal(f.controller.store.state.data.scopeContext.activeScopeId, 'new-scope');
+});
+
 test('a failed old-chat scan resumes after reload without changing formal memory before its atomic completion', async () => {
     let fail = true;
     const f = fixture({ handler: request => { if (fail && request.purpose === 'maintain' && request.input.messages[0].key === 'floor-2') throw Error('合成第二批失败'); } });

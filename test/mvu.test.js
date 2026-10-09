@@ -20,6 +20,15 @@ function fixture(data = { stat_data: { 角色: { 位置: '书店' } } }) {
 }
 function defer() { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; }
 
+test('MVU observation uses the persistent selected candidate identity after regeneration', async () => {
+    const f = fixture(), message = f.live.chat[0];
+    message.swipe_id = 1;
+    message.extra.dwmCandidateKey = 'new-candidate';
+    message.swipe_info = [{ dwmCandidateKey: 'old-candidate' }, { dwmCandidateKey: 'new-candidate' }];
+    const result = await f.read();
+    assert.equal(result.freshness.messageKey, 'new-candidate');
+});
+
 test('MVU disabled and absent never read or call mutations', async () => {
     const f = fixture();
     const disabled = await f.read({ settings: { mvuEnabled: false, mvuFields: selected } });

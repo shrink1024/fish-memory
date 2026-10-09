@@ -4,7 +4,7 @@ import { diffText } from './diff.js';
 import { createTraceViewer } from './trace-viewer.js';
 import { createPromptPreview } from './prompt-preview.js';
 import { createActivityIndicator } from './activity.js';
-import { DEFAULT_SETTINGS } from '../core/state.js';
+import { DEFAULT_SETTINGS, MAINTENANCE_EVERY_MAX } from '../core/state.js';
 
 const KIND_NAMES = { fact: '世界资料', rule: '规则', npc: '人物', npc_pool: '路人', event: '事件', inventory: '物品' };
 const TASK_NAMES = { initialize: '扫描世界书', strategy: '统合记忆策略', maintain: '维护记忆', select: '本轮选材', compact: '整理事件' };
@@ -214,6 +214,19 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         shell.append(content); root.append(shell); container.replaceChildren(root); restoreInteraction(interaction);
         traceViewer.setActive(tab === 'traces' && diagnosticsMode === 'actual');
     }
+    function renderWorldbookCheck(parent, view) {
+        const status = view.worldbook;
+        if (status?.primaryName) parent.append(h('p', 'dwm-muted', `当前角色主世界书：${status.primaryName}`));
+        if (status?.message) {
+            const text = h('p', ['ready', 'bound', 'empty'].includes(status.state) ? 'dwm-muted' : 'dwm-warning', status.message);
+            text.setAttribute('role', 'status'); parent.append(text);
+        }
+        if (status && typeof controller.checkWorldbook === 'function') {
+            parent.append(button(view.worldbookChecking ? '正在检查世界书…' : '重新检查世界书', () => call(() => controller.checkWorldbook()), {
+                disabled: view.readiness?.chat === false || view.readiness?.single === false || Boolean(view.worldbookChecking || view.progress || view.activity),
+            }), h('p', 'dwm-muted dwm-hint', '检查角色主绑定和文件读取，不调用辅助模型。仍无法识别时，可在“收发”中导出本次问题。'));
+        }
+    }
     function renderFirstRun(parent, view) {
         const panel = h('section', 'dwm-welcome'); panel.append(h('span', 'dwm-eyebrow', '从这个存档开始'), h('h3', '', '让世界记住，已经发生的故事。'));
         panel.append(h('p', '', '鱼忆会阅读角色主世界书与此存档保留的剧情，建立独立的动态资料。原世界书会作为对照保留。'));
@@ -225,6 +238,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         const checks = [['角色聊天', readiness.chat], ['角色绑定的主世界书', readiness.book], ['单角色聊天', readiness.single], ['ST-Prompt-Template 已启用', readiness.template]];
         const conditions = h('ul', 'dwm-readiness'); for (const [label, ready] of checks) conditions.append(h('li', ready ? 'dwm-muted' : 'dwm-warning', `${ready ? '✓' : '○'} ${label}`)); panel.append(conditions);
         if (readiness.template === false) panel.append(h('p', 'dwm-muted', '请在酒馆扩展中安装并启用 ST-Prompt-Template，再打开此存档。'));
+        renderWorldbookCheck(panel, view);
         if (view.initialization?.message) panel.append(h('p', view.initialization.retry ? 'dwm-warning' : 'dwm-muted', view.initialization.message));
         if (view.initializationResume) panel.append(h('p', 'dwm-notice', `已有扫描进度：世界书 ${view.initializationResume.classifiedBatches}/${view.initializationResume.totalBatches} 批，历史 ${view.initializationResume.processedCount} 条。再次扫描会先核对资料，继续仍有效的进度。`));
         if (view.preset?.available) panel.append(h('p', 'dwm-muted', '预设偏好可在设置中单独扫描，不影响建立记忆。'));
@@ -462,6 +476,11 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
             if (request.error) item.append(h('p', 'dwm-error', request.error)); requests.append(item);
         }
         if (!recent.length) requests.append(h('p', 'dwm-muted', '尚无请求记录。')); parent.append(requests);
+        if (view.warnings?.length) {
+            const warnings = details('兼容提示', 'compatibility-warnings');
+            for (const warning of view.warnings) warnings.append(h('p', 'dwm-muted', warning.message ?? String(warning)));
+            parent.append(warnings);
+        }
     }
     function renderSettings(parent, view) {
         const current = view.settings ?? {};
@@ -469,26 +488,43 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         usage.append(toggle('插件总开关（所有存档）', Boolean(current.enabled), '关闭时所有存档暂停选材与自动维护，已有资料保留。', value => call(() => controller.updateSettings({ enabled: value }))));
         if (view.save) usage.append(toggle('启用此存档的记忆', view.saveEnabled !== false, '仅影响当前存档。初始化完成且总开关开启后生效。', value => call(() => controller.setSaveEnabled(value))));
         usage.append(toggle('由鱼忆管理历史窗口', Boolean(current.windowEnabled), '只在当次发送中省略已记入且超出近期范围的原文，不写入持久隐藏。与其他自动隐藏工具请只启用一方。', value => call(() => controller.updateSettings({ windowEnabled: value }))));
+        if (view.window) usage.append(h('p', 'dwm-muted', `${Number.isInteger(view.window.omittedCount) ? `本轮已省略 ${view.window.omittedCount} 条旧原文。` : ''}${view.window.reason || ''}`));
         const rounds = field('保留最近几轮完整对话', recentTurnsDraft ?? current.recentTurns ?? 12, value => { recentTurnsDraft = value; }, { type: 'number' }); rounds.input.min = '1'; rounds.input.max = '1000';
         usage.append(row(rounds.wrap, button('保存轮数', () => call(async () => { await controller.updateSettings({ recentTurns: Number(rounds.input.value) }); recentTurnsDraft = null; }))));
         if (view.save?.initialized) usage.append(toggle('维护玩家物品清单', view.save.data.inventoryEnabled, '角色卡已有物品机制时可关闭；数据保留，停用期间不维护或发送。', value => call(() => controller.manual({ type: 'inventory-toggle', enabled: value }))));
         parent.append(usage);
-        const cadence = card('自动维护频率', '合并数轮后再更新记忆，减少重复读取世界书。待补记原文继续发送；达到一批的大小时会提前补记。');
-        const every = cadenceDraft ?? current.maintenanceEvery ?? DEFAULT_SETTINGS.maintenanceEvery;
-        const cadenceOptions = [[1, '每轮更新'], [3, '每 3 轮更新（默认）'], [5, '每 5 轮更新'], [10, '每 10 轮更新'], [20, '每 20 轮更新']].map(([value, label]) => [String(value), label]);
-        if (!cadenceOptions.some(([value]) => Number(value) === Number(every))) cadenceOptions.push([String(every), `每 ${every} 轮更新`]);
-        cadence.append(selectField('积累多少轮后自动补记', String(every), cadenceOptions, value => { cadenceDraft = value; }).wrap);
-        if (view.maintenance?.pendingReplies) cadence.append(h('p', 'dwm-muted', `当前有 ${view.maintenance.pendingReplies} 轮待补记，原文保留。`));
-        cadence.append(row(button('保存维护频率', () => call(async () => { await controller.updateSettings({ maintenanceEvery: Number(cadenceDraft ?? every) }); cadenceDraft = null; }, '维护频率已保存')),
+        const cadence = card('自动维护频率', '积累多次回复后一起更新动态世界书与记忆，减少后置调用。按 AI 回复楼计数，玩家发言不计入；前置选材仍在每次发送时执行。');
+        const savedEvery = current.maintenanceEvery ?? DEFAULT_SETTINGS.maintenanceEvery;
+        const every = cadenceDraft?.value ?? savedEvery;
+        const cadenceMode = cadenceDraft?.mode ?? ([1, 3, 5].includes(Number(savedEvery)) ? String(savedEvery) : 'custom');
+        cadence.append(h('p', 'dwm-muted', `当前生效：每 ${savedEvery} 次 AI 回复更新一次。此设置适用于所有存档。`));
+        cadence.append(selectField('世界书与记忆更新间隔', cadenceMode,
+            [['1', '每 1 次 AI 回复'], ['3', '每 3 次 AI 回复（默认）'], ['5', '每 5 次 AI 回复'], ['custom', '自定义']], value => {
+                cadenceDraft = { mode: value, value: value === 'custom' ? every : value }; render();
+            }).wrap);
+        if (cadenceMode === 'custom') {
+            const custom = field('自定义间隔（AI 回复楼数）', every, value => { cadenceDraft = { mode: 'custom', value }; },
+                { type: 'number', hint: `填写 1–${MAINTENANCE_EVERY_MAX} 的整数，点击“保存维护频率”后生效。` });
+            custom.input.min = '1'; custom.input.max = String(MAINTENANCE_EVERY_MAX); custom.input.step = '1'; custom.input.inputMode = 'numeric';
+            cadence.append(custom.wrap);
+        }
+        cadence.append(h('p', 'dwm-muted', `待补记原文会继续发送；积累到一批大小（当前 ${countOf(current.batchChars ?? DEFAULT_SETTINGS.batchChars)} 字符）时会提前补记。间隔越大，动态资料更新越晚。`));
+        if (view.maintenance?.pendingReplies) cadence.append(h('p', 'dwm-muted', `当前有 ${view.maintenance.pendingReplies} 次 AI 回复待补记，原文保留。`));
+        cadence.append(row(button('保存维护频率', () => call(async () => {
+            const value = Number(cadenceDraft?.value ?? savedEvery);
+            if (!Number.isInteger(value) || value < 1 || value > MAINTENANCE_EVERY_MAX) throw new Error(`维护间隔请填写 1–${MAINTENANCE_EVERY_MAX} 的整数（按 AI 回复楼计数）。`);
+            await controller.updateSettings({ maintenanceEvery: value }); cadenceDraft = null;
+        }, '维护频率已保存')),
             button('立即补记', () => call(() => controller.maintain(), '补记完成'), { disabled: !view.save?.initialized })));
         parent.append(cadence);
         renderTimeouts(parent, current);
         renderPreset(parent, view);
         renderConnection(parent, view);
         renderMvu(parent, view);
+        const binding = details('世界书检查', 'worldbook-check'); renderWorldbookCheck(binding, view); parent.append(binding);
         const rescan = details('重新扫描此存档', 'rescan');
         rescan.append(h('p', 'dwm-muted', '扫描角色主世界书和当前保留的完整剧情。成功后替换动态资料，失败保留原有结果。扫描期间发送走原生流程。'));
-        rescan.append(button(view.save?.initialized ? '重新扫描' : '初始化存档', () => initialize(view), { disabled: !view.save })); parent.append(rescan);
+        rescan.append(button(view.save?.initialized ? '重新扫描' : '初始化存档', () => initialize(view), { disabled: !view.save || Boolean(view.activity) })); parent.append(rescan);
         const author = details('作者规则工具', 'author-tools'); renderRuleEditor(author); parent.append(author);
     }
     function renderTimeouts(parent, current) {
@@ -537,15 +573,16 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         const panel = card('辅助模型连接', '用于扫描、选材与维护。单独连接仅在本次页面有效；刷新后恢复沿用酒馆连接。');
         if (view.connectionMode === 'test') { panel.append(h('p', 'dwm-notice', '演示模式 · 当前使用模拟模型，没有真实 API 请求。')); parent.append(panel); return; }
         const mode = connectionModeDraft ?? view.connectionMode?.mode ?? view.connectionMode ?? 'raw';
+        panel.append(h('p', 'dwm-muted', `当前生效：${view.connectionMode === 'compatible' ? `单独接口 · ${view.connection?.model || '未指定模型'}` : '沿用酒馆连接'}。下方修改在应用后生效。`));
         const modeField = selectField('连接方式', mode, [['raw', '沿用酒馆连接'], ['compatible', '单独的兼容接口']], value => { connectionModeDraft = value; render(); }); panel.append(modeField.wrap);
         if (mode === 'compatible') {
             panel.append(field('接口基础地址', connectionDraft.endpoint, value => { connectionDraft.endpoint = value; }, { placeholder: 'https://…/v1', hint: '鱼忆会在地址后添加 /chat/completions。' }).wrap,
                 field('模型名称', connectionDraft.model, value => { connectionDraft.model = value; }).wrap,
-                field('接口密钥', connectionDraft.apiKey, value => { connectionDraft.apiKey = value; }, { type: 'password', hint: '只用于本次连接，不写入存档。' }).wrap);
+                field('接口密钥', connectionDraft.apiKey, value => { connectionDraft.apiKey = value; }, { type: 'password', hint: view.connection?.hasApiKey ? '本页已有密钥；地址不变时留空可继续使用。更换地址需重新填写。' : '只用于本次连接，不写入存档。' }).wrap);
         }
         if (view.activity) panel.append(h('p', 'dwm-muted', '任务正在运行，请先停止或等待完成，再应用连接。'));
         panel.append(button('应用连接', () => call(async () => {
-            await controller.updateConnection({ mode, endpoint: connectionDraft.endpoint.trim(), model: connectionDraft.model.trim(), apiKey: connectionDraft.apiKey }); connectionDraft.apiKey = '';
+            await controller.updateConnection({ mode, endpoint: connectionDraft.endpoint.trim(), model: connectionDraft.model.trim(), apiKey: connectionDraft.apiKey }); connectionDraft.apiKey = ''; connectionModeDraft = null;
         }, '连接已应用；下一次辅助任务将使用此连接'), { disabled: Boolean(view.activity) })); parent.append(panel);
     }
     function renderMvuState(parent, state = {}) {

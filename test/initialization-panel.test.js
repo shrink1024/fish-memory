@@ -35,7 +35,8 @@ function fixture(extra = {}) {
         preset: { available: true, name: '可读取的合成预设', saved: null }, diagnostics: { pendingCount: 30 }, ...extra };
     const controller = { view: () => view, subscribe: listener => { listeners.add(listener); return () => listeners.delete(listener); },
         scanPreset: async () => { calls.preset++; throw Error('合成可选预设扫描格式错误'); },
-        initialize: async () => { calls.initialize++; return { executed: true, message: '合成建档完成' }; } };
+        initialize: async () => { calls.initialize++; return { executed: true, message: '合成建档完成' }; },
+        checkWorldbook: async () => ({ message: '检查已完成' }) };
     const panel = mountPanel(root, controller);
     const button = label => {
         const node = walk(root).find(node => node.tagName === 'BUTTON' && node.textContent === label);
@@ -73,4 +74,19 @@ test('a recovered checkpoint displays saved progress and the retry action initia
         assert.equal(f.view.save.initialized, false, 'the UI must not certify draft progress as formal initialized memory');
     } finally { f.panel.destroy(); }
     assert.equal(f.listeners.size, 0);
+});
+
+test('worldbook diagnosis and a separate check action are available before initialization', async t => {
+    const f = fixture({ save: null, readiness: { chat: true, book: false, single: true, template: true },
+        worldbook: { state: 'unbound', primaryName: null, message: '角色尚未绑定主世界书；只检测到附加书。' } });
+    t.after(() => f.panel.destroy());
+    assert.match(f.root.textContent, /只检测到附加书/);
+    assert.equal(f.button('建立此存档记忆').disabled, true);
+    assert.equal(f.button('重新检查世界书').disabled, false);
+    f.button('重新检查世界书').click(); await tick();
+    assert.equal(f.calls.initialize, 0);
+    assert.match(f.root.textContent, /检查已完成/);
+    f.view.worldbookChecking = true;
+    for (const listener of f.listeners) listener(f.view);
+    assert.equal(f.button('正在检查世界书…').disabled, true);
 });

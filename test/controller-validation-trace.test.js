@@ -178,3 +178,38 @@ test('concurrent captured completions attach validation failures only to their m
     assert.equal(records[1].processingError, undefined);
     assert.deepEqual(f.controller.diagnostics.requests.map(metric => [metric.task, metric.ok]), [['compact', true], ['select', false]]);
 });
+
+for (const corrected of [true, false]) test(`real AgentClient retries semantic maintenance once and commits atomically (corrected=${corrected})`, async () => {
+    const f = fixture(), inputs = [], systems = [];
+    f.host.rawGenerate = async request => {
+        const input = JSON.parse(request.input);
+        if (request.purpose === 'initialize') return JSON.stringify({ entries: input.entries.map(entry => ({
+            id: entry.id, kind: 'fact', intro: '分类', segments: [{ id: 'body', writable: true }],
+        })) });
+        assert.equal(request.purpose, 'maintain'); inputs.push(input); systems.push(request.system);
+        const evidence = input.messages.map(message => message.key);
+        assert.equal(f.controller.store.state.data.summary, '', 'an invalid batch must not partially commit its valid summary');
+        return JSON.stringify({ operations: [
+            { type: 'summary', text: '完整且有效的摘要', evidence },
+            ...(!corrected || inputs.length === 1 ? [{ type: 'delete', id: 'not-allowed' }] : []),
+        ] });
+    };
+    f.controller = new Controller(f.host, { traces: f.traces, settings: { compactEvery: 1000 } });
+    await f.controller.start(); await f.controller.initialize();
+    f.traces.clear();
+    f.snapshot.messages.push({ key: 'new-answer', role: 'assistant', content: '人物到达港口。' });
+    if (corrected) await f.controller.maintain();
+    else await assert.rejects(f.controller.maintain(), /不支持|未知|操作/);
+    assert.equal(inputs.length, 2);
+    assert.deepEqual(inputs[1], inputs[0], 'correction does not overwrite source data');
+    assert.match(systems[1], /程序格式校验/);
+    assert.deepEqual(f.controller.store.state.processed, corrected ? ['new-answer'] : []);
+    assert.equal(f.controller.store.state.data.summary, corrected ? '完整且有效的摘要' : '');
+    const records = f.traces.snapshot().records;
+    assert.equal(records.length, 2);
+    assert.equal(records[0].status, 'error');
+    assert.equal(records[1].status, corrected ? 'complete' : 'error');
+    assert.equal(records[0].responseBody.operations.length, 2);
+    const metric = f.controller.diagnostics.requests.at(-1);
+    assert.equal(metric.attempts, 2); assert.equal(metric.ok, corrected);
+});

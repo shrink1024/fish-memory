@@ -4,6 +4,8 @@ import { createSillyTavernHost } from '../src/adapters/sillytavern.js';
 import { Controller } from '../src/runtime/controller.js';
 import { makeSourceEntry } from '../src/core/state.js';
 
+const nativeOptions = (extra = {}) => ({ ...Object.fromEntries(['automatic_trigger', 'force_name2', 'quiet_prompt', 'quietToLoud', 'skipWIAN', 'force_chid', 'signal', 'quietImage'].map(key => [key, undefined])), ...extra });
+
 function fixture() {
     const raw = { entries: {
         1: { uid: 1, comment: 'blue', content: 'old blue', constant: true, disable: false, order: 9, position: 0 },
@@ -376,7 +378,7 @@ test('event bridge waits for preflight and explicitly cancels after a failed pre
         removeListener(name) { events.delete(name); },
     };
     const types = Object.fromEntries([
-        'GENERATION_AFTER_COMMANDS', 'WORLDINFO_ENTRIES_LOADED', 'MESSAGE_RECEIVED',
+        'GENERATION_STARTED', 'GENERATION_AFTER_COMMANDS', 'WORLDINFO_ENTRIES_LOADED', 'MESSAGE_RECEIVED',
         'GENERATION_STOPPED', 'GENERATION_ENDED', 'CHAT_CHANGED', 'MESSAGE_SWIPED',
         'MESSAGE_DELETED', 'MESSAGE_SWIPE_DELETED',
     ].map(name => [name, name]));
@@ -389,7 +391,8 @@ test('event bridge waits for preflight and explicitly cancels after a failed pre
         beforeDone = true;
         throw new Error('selector failed');
     } });
-    await events.get(types.GENERATION_AFTER_COMMANDS)('normal', {}, false);
+    await events.get(types.GENERATION_STARTED)('normal', nativeOptions(), false);
+    await events.get(types.GENERATION_AFTER_COMMANDS)('normal', nativeOptions(), false);
     assert.equal(beforeDone, true);
     assert.equal(stopped, 1);
     dispose();
@@ -400,12 +403,13 @@ test('controller cancel result invokes native stop and raw helper maps to genera
     const f = fixture();
     const events = new Map();
     const source = { on: (name, fn) => events.set(name, fn), removeListener: name => events.delete(name) };
-    const types = { GENERATION_AFTER_COMMANDS: 'before' };
+    const types = { GENERATION_STARTED: 'start', GENERATION_AFTER_COMMANDS: 'before' };
     let stopped = 0, rawArgs;
     const host = await createSillyTavernHost({ ...f.deps, eventSource: source, eventTypes: types,
         stopGeneration: () => { stopped++; }, rawGenerate: async args => { rawArgs = args; return '{"ok":true}'; } });
     const dispose = host.bindController({ generationBefore: async () => ({ cancel: true }) });
-    await events.get('before')('normal', {}, false);
+    await events.get('start')('normal', nativeOptions(), false);
+    await events.get('before')('normal', nativeOptions(), false);
     assert.equal(stopped, 1);
     const signal = new AbortController();
     assert.equal(await host.rawGenerate({ purpose: 'select', system: 'system text', input: '{"story":1}', signal: signal.signal }), '{"ok":true}');
@@ -420,14 +424,15 @@ test('event bridge does not stop twice when the controller already used the host
     let stopped = 0;
     const host = await createSillyTavernHost({ ...f.deps,
         eventSource: { on: (name, fn) => events.set(name, fn), removeListener: name => events.delete(name) },
-        eventTypes: { GENERATION_AFTER_COMMANDS: 'before' },
+        eventTypes: { GENERATION_STARTED: 'start', GENERATION_AFTER_COMMANDS: 'before' },
         stopGeneration: () => { stopped++; },
     });
     const dispose = host.bindController({ generationBefore: async () => {
         host.stopGeneration();
         return { cancel: true };
     } });
-    await events.get('before')('normal', {}, false);
+    await events.get('start')('normal', nativeOptions(), false);
+    await events.get('before')('normal', nativeOptions(), false);
     assert.equal(stopped, 1);
     dispose();
 });
@@ -458,16 +463,16 @@ test('activity stop through the real host bridge cancels once and leaves the nex
     await controller.start();
     await controller.store.initialize(Object.values(f.raw.entries).map(raw => makeSourceEntry('main', raw)), '记录事实');
     const dispose = host.bindController(controller);
-    await source.emit(types.GENERATION_STARTED, 'normal', {}, false);
-    const oldRun = source.emit(types.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+    await source.emit(types.GENERATION_STARTED, 'normal', nativeOptions(), false);
+    const oldRun = source.emit(types.GENERATION_AFTER_COMMANDS, 'normal', nativeOptions(), false);
     await entered.promise;
     const oldId = controller.view().activity.id;
     assert.deepEqual(await controller.requestStop(oldId), { stopped: true });
-    await oldRun;
+    await assert.rejects(oldRun, { name: 'AbortError' });
     assert.equal(stopped, 1);
     assert.equal(controller.view().activity, null);
-    await source.emit(types.GENERATION_STARTED, 'normal', {}, false);
-    await source.emit(types.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+    await source.emit(types.GENERATION_STARTED, 'normal', nativeOptions(), false);
+    await source.emit(types.GENERATION_AFTER_COMMANDS, 'normal', nativeOptions(), false);
     assert.equal(selections, 2);
     const currentPlan = controller.view().diagnostics.lastPlan;
     assert.ok(currentPlan);
@@ -488,13 +493,13 @@ test('cancelled native event is captured before an earlier card listener and can
     source.makeFirst(types.GENERATION_AFTER_COMMANDS, async (type, options) => {
         if (options.tag === 'old') { cardStarted.resolve(); await cardFinished.promise; }
     });
-    await source.emit(types.GENERATION_STARTED, 'normal', {}, false);
-    const oldEvent = source.emit(types.GENERATION_AFTER_COMMANDS, 'normal', { tag: 'old' }, false);
+    await source.emit(types.GENERATION_STARTED, 'normal', nativeOptions(), false);
+    const oldEvent = source.emit(types.GENERATION_AFTER_COMMANDS, 'normal', nativeOptions({ tag: 'old' }), false);
     await cardStarted.promise;
     await source.emit(types.GENERATION_STOPPED);
-    await source.emit(types.GENERATION_STARTED, 'normal', {}, false);
-    await source.emit(types.GENERATION_AFTER_COMMANDS, 'normal', { tag: 'new' }, false);
-    cardFinished.resolve(); await oldEvent;
+    await source.emit(types.GENERATION_STARTED, 'normal', nativeOptions(), false);
+    await source.emit(types.GENERATION_AFTER_COMMANDS, 'normal', nativeOptions({ tag: 'new' }), false);
+    cardFinished.resolve(); await assert.rejects(oldEvent, { name: 'AbortError' });
     assert.deepEqual(calls, ['new']);
     assert.equal(stopped, 0);
     dispose();
@@ -511,14 +516,14 @@ test('late cancelled or rejected preflight cannot stop a newer run or clear its 
             if (options.tag === 'old') { entered.resolve(); return result.promise; }
             host.setPlan({ chatId: host.snapshot().chatId, bookName: 'main', selectedIds: [], dynamicEntries: [], summary: 'new plan' });
         } });
-        await source.emit(types.GENERATION_STARTED, 'normal', {}, false);
-        const oldEvent = source.emit(types.GENERATION_AFTER_COMMANDS, 'normal', { tag: 'old' }, false);
+        await source.emit(types.GENERATION_STARTED, 'normal', nativeOptions(), false);
+        const oldEvent = source.emit(types.GENERATION_AFTER_COMMANDS, 'normal', nativeOptions({ tag: 'old' }), false);
         await entered.promise;
-        await source.emit(types.GENERATION_STARTED, 'normal', {}, false);
-        await source.emit(types.GENERATION_AFTER_COMMANDS, 'normal', { tag: 'new' }, false);
+        await source.emit(types.GENERATION_STARTED, 'normal', nativeOptions(), false);
+        await source.emit(types.GENERATION_AFTER_COMMANDS, 'normal', nativeOptions({ tag: 'new' }), false);
         if (outcome === 'reject') result.reject(new Error('old failure'));
         else result.resolve({ cancel: true });
-        await oldEvent;
+        await assert.rejects(oldEvent, { name: 'AbortError' });
         assert.equal(stopped, 0, outcome); assert.equal(fallback, 0, outcome);
         assert.equal(f.prompts.get('dwm:summary').value, 'new plan', outcome);
         dispose();
@@ -532,26 +537,26 @@ test('late fallback decision cannot stop the next native run', async () => {
     const host = await createSillyTavernHost({ ...f.deps, eventSource: source, eventTypes: types,
         stopGeneration: () => { stopped++; }, onPreflightFailure: async () => { shown.resolve(); return choice.promise; } });
     const dispose = host.bindController({ generationBefore: async ({ options }) => { if (options.tag === 'old') throw new Error('failed'); } });
-    await source.emit(types.GENERATION_STARTED, 'normal', {}, false);
-    const oldEvent = source.emit(types.GENERATION_AFTER_COMMANDS, 'normal', { tag: 'old' }, false);
+    await source.emit(types.GENERATION_STARTED, 'normal', nativeOptions(), false);
+    const oldEvent = source.emit(types.GENERATION_AFTER_COMMANDS, 'normal', nativeOptions({ tag: 'old' }), false);
     await shown.promise;
-    await source.emit(types.GENERATION_STARTED, 'normal', {}, false);
-    await source.emit(types.GENERATION_AFTER_COMMANDS, 'normal', { tag: 'new' }, false);
-    choice.resolve('cancel'); await oldEvent;
+    await source.emit(types.GENERATION_STARTED, 'normal', nativeOptions(), false);
+    await source.emit(types.GENERATION_AFTER_COMMANDS, 'normal', nativeOptions({ tag: 'new' }), false);
+    choice.resolve('cancel'); await assert.rejects(oldEvent, { name: 'AbortError' });
     assert.equal(stopped, 0);
     dispose();
 });
 
-test('direct AFTER_COMMANDS without START remains usable before and after a stopped native run', async () => {
+test('direct AFTER_COMMANDS remains usable without entering paid selection before or after a stopped native run', async () => {
     const f = fixture(), { source, types } = preflightEvents(), calls = [];
     const host = await createSillyTavernHost({ ...f.deps, eventSource: source, eventTypes: types });
     const dispose = host.bindController({ generationBefore: async ({ options }) => { calls.push(options.tag); } });
     await source.emit(types.GENERATION_AFTER_COMMANDS, 'normal', { tag: 'direct-before' }, false);
-    await source.emit(types.GENERATION_STARTED, 'normal', {}, false);
-    await source.emit(types.GENERATION_AFTER_COMMANDS, 'normal', { tag: 'native' }, false);
+    await source.emit(types.GENERATION_STARTED, 'normal', nativeOptions(), false);
+    await source.emit(types.GENERATION_AFTER_COMMANDS, 'normal', nativeOptions({ tag: 'native' }), false);
     await source.emit(types.GENERATION_STOPPED);
     await source.emit(types.GENERATION_AFTER_COMMANDS, 'normal', { tag: 'direct-after' }, false);
-    assert.deepEqual(calls, ['direct-before', 'native', 'direct-after']);
+    assert.deepEqual(calls, ['native']);
     dispose();
 });
 

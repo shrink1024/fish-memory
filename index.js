@@ -110,7 +110,7 @@ async function boot() {
     const problems = createProblemExporter({ controller, context: () => {
         const live = SillyTavern.getContext();
         return { chatId: live.getCurrentChatId?.() ?? live.chatId ?? '', character: live.name2 ?? '', memoryChatId: host.snapshot().chatId,
-            pluginVersion: '0.1.0-alpha.4', mainApi: live.mainApi, browser: navigator.userAgent };
+            pluginVersion: '0.1.0-alpha.5', mainApi: live.mainApi, browser: navigator.userAgent };
     } });
     const panel = mountPanel(mount, controller, { exportProblem: () => problems.export() });
     const renderManagerStatus = () => manager.render(controller.uiStatus());
@@ -120,7 +120,7 @@ async function boot() {
     host.bindController(controller);
     await controller.start();
     // Public handle is for explicit local diagnostics. Agent views are built separately.
-    globalThis.DynamicWorldMemory = Object.freeze({ version: '0.1.0-alpha.4', apiVersion: 1,
+    globalThis.DynamicWorldMemory = Object.freeze({ version: '0.1.0-alpha.5', apiVersion: 1,
         setContext: input => controller.setContext(input), clearContext: owner => controller.clearContext(owner),
         readScope: scopeId => controller.readScope(scopeId), whenIdle: () => controller.whenIdle(), whenCommitted: () => controller.whenCommitted(),
         ui: Object.freeze({ status: () => controller.uiStatus(), subscribe: fn => controller.subscribe(() => fn(controller.uiStatus())),

@@ -3,6 +3,7 @@ import { clone, invariant, plainText, uid } from './util.js';
 // Development format v2 stores one story path and compact journal anchors.
 export const SCHEMA_VERSION = 2;
 export const KINDS = ['fact', 'rule', 'npc', 'npc_pool', 'event', 'inventory'];
+export const MAINTENANCE_EVERY_MAX = 1000;
 export const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
     inventoryEnabled: true,
@@ -101,7 +102,7 @@ export function createSave(chatId, bookName) {
     return {
         schema: SCHEMA_VERSION, id: uid('save'), chatId, bookName,
         revision: 0, initialized: false, preferences: { enabled: true }, base: clone(data), data,
-        processed: [], storyKeys: [], journal: [], audit: [], inventoryDisabledAt: null,
+        processed: [], rememberedKeys: [], storyKeys: [], journal: [], audit: [], inventoryDisabledAt: null,
         parentId: null, createdAt: new Date().toISOString(),
     };
 }
@@ -111,6 +112,10 @@ export function validateSave(save) {
     invariant(typeof save.id === 'string' && Number.isInteger(save.revision), '存档身份无效');
     invariant(Array.isArray(save.processed) && Array.isArray(save.storyKeys) && Array.isArray(save.journal) && Array.isArray(save.audit), '存档进度无效');
     invariant(save.processed.length <= save.storyKeys.length && save.processed.every((key, i) => key === save.storyKeys[i]), '已处理进度与剧情路径不符');
+    if (save.rememberedKeys !== undefined) {
+        const processed = new Set(save.processed);
+        invariant(Array.isArray(save.rememberedKeys) && save.rememberedKeys.every(key => typeof key === 'string' && processed.has(key)), '已阅读楼层记录无效');
+    }
     for (const commit of save.journal) {
         invariant(Number.isInteger(commit.anchorLength) && commit.anchorLength >= 0 && commit.anchorLength <= save.storyKeys.length, '提交锚点无效');
         invariant(commit.endKey === (commit.anchorLength ? save.storyKeys[commit.anchorLength - 1] : null), '提交末端与剧情路径不符');

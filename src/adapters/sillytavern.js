@@ -1,5 +1,7 @@
 /** SillyTavern boundary. All persistent state belongs to the current chat. */
 import { readMvuProjection } from './mvu.js';
+import { generateAuxiliary } from './auxiliary-transport.js';
+import { encodeSave, decodeSave } from '../core/storage-codec.js';
 const OWNER = 'dynamic-world-memory';
 const META_KEY = 'dwm';
 const LORE_BUCKETS = ['characterLore', 'globalLore', 'personaLore', 'chatLore'];
@@ -57,6 +59,11 @@ function currentIdentity(ctx) {
     return `character:${character?.avatar ?? ctx.characterId ?? ctx.this_chid ?? 'unknown'}:${file}`;
 }
 
+function primaryBookName(character) {
+    const name = character?.data?.extensions?.world;
+    return typeof name === 'string' && name.trim() ? name : null;
+}
+
 function messageKey(message, index, readOnly = false) {
     // Preview uses the same identity rules without changing the live chat.
     if (readOnly) message = { ...message, extra: { ...message.extra },
@@ -101,6 +108,7 @@ export async function createSillyTavernHost(deps = {}) {
     const script = deps.script ?? await import('/script.js');
     const worldInfo = deps.worldInfo ?? await import('/scripts/world-info.js');
     const extensions = deps.extensions ?? await import('/scripts/extensions.js');
+    const powerUser = deps.powerUser ?? (deps.script ? null : await import('/scripts/power-user.js'));
     const contextProvider = deps.getContext ?? (typeof deps.context === 'function' ? deps.context : () => deps.context ?? globalThis.SillyTavern?.getContext?.());
     const ctx = () => {
         const value = contextProvider();
@@ -174,6 +182,7 @@ export async function createSillyTavernHost(deps = {}) {
     // this extension is disabled, uninstalled, or absent on another client.
     let windowChatId = null;
     const windowKeys = new Set();
+    let outgoingWindow = { omittedCount: 0, reason: '本轮尚未裁剪历史' };
     let nativeAudit = null;
     let generationType = null;
     let replacement = null;
@@ -182,9 +191,16 @@ export async function createSillyTavernHost(deps = {}) {
     const messageTimers = new Set();
     const warnings = [];
     const eligibilityWarned = new Set();
+    const warningKeys = new Set();
+    let checkedWorldbook = null;
+    let worldbookCheckSerial = 0;
 
     function warn(code, message, extra = {}) {
         const notice = { code, message, chatId: currentIdentity(ctx()), requestId: nativeAudit?.requestId ?? null, ...extra };
+        const key = `${notice.chatId}\0${code}\0${message}`;
+        if (warningKeys.has(key)) return;
+        warningKeys.add(key);
+        if (warningKeys.size > 300) warningKeys.delete(warningKeys.values().next().value);
         warnings.push(notice);
         if (warnings.length > 100) warnings.shift();
         try {
@@ -211,7 +227,7 @@ export async function createSillyTavernHost(deps = {}) {
     function snapshot(readOnly = false) {
         const live = ctx();
         const character = live.characters?.[live.characterId ?? live.this_chid];
-        const bookName = character?.data?.extensions?.world ?? null;
+        const bookName = primaryBookName(character);
         const chatId = currentIdentity(live);
         const messages = (live.chat ?? []).map((message, index) => ({
             key: messageKey(message, index, readOnly),
@@ -264,16 +280,172 @@ export async function createSillyTavernHost(deps = {}) {
         return pending ? { ...at, messages: at.messages.slice(0, pending.prefixKeys.length), userInput: '' } : at;
     }
 
-    async function loadWorldbook(bookName = snapshot().bookName) {
-        if (!bookName) return [];
+    const worldbookMessages = {
+        'no-chat': '请先打开单角色聊天',
+        group: '鱼忆目前只接管单角色聊天的主世界书',
+        'character-unavailable': '当前角色资料尚未加载，请稍后重新检测',
+        unbound: '当前角色没有主世界书绑定；内嵌资料、附加书和聊天书不会自动作为主书接管',
+        bound: '已识别主世界书绑定，尚未核验是否可读取',
+        ready: '主世界书可读取',
+        empty: '主世界书存在，但目前没有条目',
+        missing: '当前角色绑定的主世界书文件不存在，请在酒馆导入对应世界书或核对主绑定',
+        'read-failed': '角色绑定的主世界书尚未加载，读取失败；请检查酒馆连接或世界书文件后重试',
+        'check-failed': '无法确认主世界书是否存在，请检查酒馆连接后重新检测',
+    };
+
+    function worldbookContext() {
+        const live = ctx(), chatId = currentIdentity(live);
+        const character = live.characters?.[live.characterId ?? live.this_chid];
+        const primaryName = primaryBookName(character);
+        const file = typeof character?.avatar === 'string' ? character.avatar.replace(/\.[^/.]+$/, '') : null;
+        const additional = file ? worldInfo.world_info?.charLore?.find(item => item.name === file)?.extraBooks : null;
+        const state = !chatId ? 'no-chat' : (live.groupId ?? live.selected_group) ? 'group'
+            : !character?.data ? 'character-unavailable' : !primaryName ? 'unbound' : 'bound';
+        return { chatId, primaryName, state, message: worldbookMessages[state],
+            embeddedBook: Boolean(character?.data?.character_book),
+            additionalBookCount: Array.isArray(additional) ? additional.filter(name => typeof name === 'string' && name.trim()).length : 0,
+            chatBook: Boolean(live.chatMetadata?.[worldInfo.METADATA_KEY ?? 'world_info']),
+            listed: primaryName && Array.isArray(worldInfo.world_names) ? worldInfo.world_names.includes(primaryName) : null,
+            entryCount: null, checkedAt: null };
+    }
+
+    function sameWorldbook(a, b) {
+        return a.chatId === b.chatId && a.primaryName === b.primaryName;
+    }
+
+    function worldbookStatus() {
+        const current = worldbookContext();
+        return current.state === 'bound' && checkedWorldbook && sameWorldbook(current, checkedWorldbook)
+            ? { ...current, state: checkedWorldbook.state, message: checkedWorldbook.message,
+                listed: checkedWorldbook.listed, entryCount: checkedWorldbook.entryCount, checkedAt: checkedWorldbook.checkedAt }
+            : current;
+    }
+
+    function assertWorldbookCurrent(target, serial) {
+        if (!sameWorldbook(target, worldbookContext()) || (serial !== undefined && serial !== worldbookCheckSerial)) {
+            const error = new Error('聊天或主世界书已切换，请重新检测');
+            error.name = 'AbortError';
+            throw error;
+        }
+    }
+
+    function recordWorldbook(target, state, detail = {}, serial) {
+        assertWorldbookCurrent(target, serial);
+        checkedWorldbook = { ...target, state, message: worldbookMessages[state], checkedAt: new Date().toISOString(), ...detail };
+        return worldbookStatus();
+    }
+
+    async function primaryFileExists(target, serial) {
+        assertWorldbookCurrent(target, serial);
+        // Injected hosts must supply their own HTTP boundary. This also keeps
+        // existing offline fixtures from accidentally using Node's global fetch.
+        const request = deps.fetch ?? (deps.script ? null : globalThis.fetch);
+        const live = ctx(), headers = live.getRequestHeaders?.() ?? script.getRequestHeaders?.();
+        if (typeof request !== 'function' || !headers) {
+            if (deps.script) return null;
+            throw new Error(worldbookMessages['check-failed']);
+        }
+        const response = await request('/api/settings/get', { method: 'POST', headers, cache: 'no-cache', body: '{}',
+            signal: globalThis.AbortSignal?.timeout?.(15000) });
+        assertWorldbookCurrent(target, serial);
+        if (!response?.ok) throw new Error(worldbookMessages['check-failed']);
+        // Only retain membership. Settings may contain credentials and must not
+        // enter a status object, diagnostic export, log, or model request.
+        const settings = await response.json();
+        assertWorldbookCurrent(target, serial);
+        if (!Array.isArray(settings?.world_names) || settings.world_names.some(name => typeof name !== 'string')) throw new Error(worldbookMessages['check-failed']);
+        return settings.world_names.includes(target.primaryName);
+    }
+
+    async function readBookEntries(bookName, target, serial) {
         const loaded = await worldInfo.loadWorldInfo(bookName);
-        if (!loaded || typeof loaded.entries !== 'object' || loaded.entries === null) throw new Error('角色绑定的主世界书尚未加载');
-        return Object.values(copy(loaded?.entries ?? {}));
+        assertWorldbookCurrent(target, serial);
+        if (!loaded || typeof loaded.entries !== 'object' || loaded.entries === null) throw new Error(worldbookMessages['read-failed']);
+        return Object.values(copy(loaded.entries));
+    }
+
+    async function withinWorldbookDeadline(promise, deadline) {
+        let timer;
+        try {
+            return await Promise.race([promise, new Promise((_resolve, reject) => {
+                timer = setTimeout(() => {
+                    const error = new Error('主世界书检查超时，请稍后重试');
+                    error.name = 'TimeoutError';
+                    reject(error);
+                }, Math.max(1, deadline - Date.now()));
+            })]);
+        } finally { clearTimeout(timer); }
+    }
+
+    async function checkWorldbook() {
+        const target = worldbookContext(), serial = ++worldbookCheckSerial;
+        if (target.state !== 'bound') return target;
+        const deadline = Date.now() + 15000;
+        let listed = null, stage = 'check-failed';
+        try {
+            listed = await withinWorldbookDeadline(primaryFileExists(target, serial), deadline);
+            assertWorldbookCurrent(target, serial);
+            if (listed === null) return recordWorldbook(target, 'check-failed', { listed: null }, serial);
+            // ST caches its 200/empty placeholder for a missing file. Refresh
+            // just this primary book so a later import can be observed.
+            worldInfo.worldInfoCache?.delete?.(target.primaryName);
+            if (!listed) return recordWorldbook(target, 'missing', { listed: false }, serial);
+            stage = 'read-failed';
+            const entries = await withinWorldbookDeadline(readBookEntries(target.primaryName, target, serial), deadline);
+            assertWorldbookCurrent(target, serial);
+            return recordWorldbook(target, entries.length ? 'ready' : 'empty', { listed: true, entryCount: entries.length }, serial);
+        } catch (error) {
+            assertWorldbookCurrent(target, serial);
+            return recordWorldbook(target, stage, { listed,
+                ...(error?.name === 'TimeoutError' ? { message: '主世界书检查超时，请稍后重试' } : {}) }, serial);
+        }
+    }
+
+    async function loadWorldbook(bookName = worldbookContext().primaryName) {
+        if (!bookName) return [];
+        const target = worldbookContext(), serial = worldbookCheckSerial;
+        const primary = target.state === 'bound' && target.primaryName === bookName;
+        let entries;
+        try { entries = await readBookEntries(bookName, target); }
+        catch (error) {
+            assertWorldbookCurrent(target);
+            if (primary && serial === worldbookCheckSerial) recordWorldbook(target, 'read-failed');
+            throw new Error(worldbookMessages['read-failed']);
+        }
+        if (primary && !entries.length) {
+            let listed;
+            try { listed = await primaryFileExists(target); }
+            catch (error) {
+                assertWorldbookCurrent(target);
+                if (serial === worldbookCheckSerial) recordWorldbook(target, 'check-failed', { listed: null });
+                throw new Error(worldbookMessages['check-failed']);
+            }
+            assertWorldbookCurrent(target);
+            if (listed === null) {
+                // Legacy injected hosts may expose only loadWorldInfo. Do not
+                // invent a missing-file diagnosis or perform an unmocked fetch.
+                if (serial === worldbookCheckSerial) recordWorldbook(target, 'check-failed', { listed: null });
+                return entries;
+            }
+            if (!listed) {
+                if (serial === worldbookCheckSerial) recordWorldbook(target, 'missing', { listed: false });
+                throw new Error(worldbookMessages.missing);
+            }
+            worldInfo.worldInfoCache?.delete?.(bookName);
+            try { entries = await readBookEntries(bookName, target); }
+            catch (error) {
+                assertWorldbookCurrent(target);
+                if (serial === worldbookCheckSerial) recordWorldbook(target, 'read-failed', { listed: true });
+                throw new Error(worldbookMessages['read-failed']);
+            }
+            if (serial === worldbookCheckSerial) recordWorldbook(target, entries.length ? 'ready' : 'empty', { listed: true, entryCount: entries.length });
+        } else if (primary && serial === worldbookCheckSerial) recordWorldbook(target, 'ready', { entryCount: entries.length });
+        return entries;
     }
 
     function auxiliaryReadiness() {
         const live = ctx();
-        if (typeof (deps.rawGenerate ?? live.generateRaw) !== 'function') return { ready: false, reason: '酒馆辅助生成接口尚未就绪' };
+        if (!deps.rawGenerate && !['openai', 'textgenerationwebui'].includes(live.mainApi ?? script.main_api)) return { ready: false, reason: '此酒馆后端请配置单独辅助连接（沿用连接支持聊天补全与文本补全）' };
         const status = live.onlineStatus ?? script.online_status;
         if (!status || status === 'no_connection' || status === 'Not connected') return { ready: false, reason: '辅助模型尚未连接；连接就绪后自动建立新档记忆' };
         return { ready: true };
@@ -349,7 +521,16 @@ export async function createSillyTavernHost(deps = {}) {
     const storage = {
         async read(chatId) {
             if (currentIdentity(ctx()) !== chatId) throw new Error('存档已经切换');
-            return copy(ctx().chatMetadata?.[META_KEY] ?? null);
+            const stored = ctx().chatMetadata?.[META_KEY] ?? null;
+            if (stored?.schema === 2) {
+                // Saves persisted as schema 2 come from alpha.4 or earlier, which
+                // sent every processed message to maintenance unfiltered: their
+                // processed prefix was actually read. Schema 3 stays conservative.
+                const save = decodeSave(stored);
+                if (save && save.rememberedKeys === undefined && Array.isArray(save.processed)) save.rememberedKeys = [...save.processed];
+                return save;
+            }
+            return stored?.schema === 3 ? decodeSave(stored) : copy(stored);
         },
         async write(chatId, value, expectedRevision) {
             const live = ctx();
@@ -359,13 +540,14 @@ export async function createSillyTavernHost(deps = {}) {
             const previous = copy(metadata[META_KEY]);
             const actualRevision = previous?.revision ?? 0;
             if (actualRevision !== expectedRevision) throw new Error('存档版本已经变化');
-            metadata[META_KEY] = copy(value);
+            const written = value?.schema === 2 ? encodeSave(value) : copy(value);
+            metadata[META_KEY] = written;
             try {
                 await save(expectedRevision);
                 if (currentIdentity(ctx()) !== chatId) throw new Error('保存期间存档已经切换');
             } catch (error) {
                 // Do not roll back over another writer's replacement.
-                if (JSON.stringify(metadata[META_KEY]) === JSON.stringify(value)) {
+                if (JSON.stringify(metadata[META_KEY]) === JSON.stringify(written)) {
                     if (previous === undefined) delete metadata[META_KEY];
                     else metadata[META_KEY] = previous;
                 }
@@ -381,6 +563,7 @@ export async function createSillyTavernHost(deps = {}) {
     function clearPlan() {
         plan = null;
         nativeAudit = null;
+        outgoingWindow = { omittedCount: 0, reason: '本轮尚未裁剪历史' };
         for (const key of Object.values(SLOT_KEYS)) putSlot(key, '', 0);
     }
 
@@ -432,6 +615,14 @@ export async function createSillyTavernHost(deps = {}) {
                 if (active.configuration.has(original.uid) || active.configuration.has(sourceId(active.bookName, original.uid))) continue;
                 const dynamic = active.entries.get(`${active.bookName}\0${original.uid}`);
                 if (!dynamic) { nextItems.push(original); continue; } // Prior template removals are never re-added.
+                // ST hashes every native field for sticky/cooldown continuity.
+                // Even changing constant/disable for semantic selection breaks
+                // that identity. Timed entries retain the entire native record.
+                if (original.sticky || original.cooldown || original.delay) {
+                    nextItems.push(original);
+                    warn('native-timed-entry-preserved', '带粘性、冷却或延迟条件的条目保持原生正文和触发方式，鱼忆本轮不覆盖，以维持原生计时。');
+                    continue;
+                }
                 const green = !original.constant;
                 const selected = active.selected.has(dynamic.id) || active.selected.has(original.uid) || active.selected.has(sourceId(active.bookName, original.uid));
                 if (!green && !original.disable && dynamic.enabled !== false) {
@@ -509,13 +700,39 @@ export async function createSillyTavernHost(deps = {}) {
 
     // ST calls this on its assembled coreChat copies, before worldbook scanning.
     // Never mutate messages/extra: ST shallow-copies those objects.
-    function filterOutgoingHistory(chat, _contextSize, _abort, type) {
-        if (!Array.isArray(chat) || !plan || ['quiet', 'impersonate'].includes(type)
+    async function filterOutgoingHistory(chat, _contextSize, _abort, type) {
+        if (!['quiet', 'impersonate'].includes(type)) outgoingWindow = { omittedCount: 0, reason: '本轮保留完整历史' };
+        if (!Array.isArray(chat) || !plan || !windowKeys.size || ['quiet', 'impersonate'].includes(type)
             || plan.chatId !== currentIdentity(ctx()) || windowChatId !== plan.chatId
             || plan.bookName !== snapshot(true).bookName) return;
-        for (let index = chat.length - 1; index >= 0; index--) {
-            if (windowKeys.has(messageKey(chat[index], index, true))) chat.splice(index, 1);
+        const expected = plan;
+        // Native timed effects use this exact chat length. Read raw books only:
+        // getSortedEntries would execute template hooks twice in the same turn.
+        const live = ctx(), character = live.characters?.[live.characterId ?? live.this_chid];
+        const file = character?.avatar?.replace(/\.[^/.]+$/, '');
+        const extra = worldInfo.world_info?.charLore?.find(item => item.name === file)?.extraBooks ?? [];
+        const books = new Set([snapshot(true).bookName, ...extra, ...(worldInfo.selected_world_info ?? []),
+            live.chatMetadata?.[worldInfo.METADATA_KEY ?? 'world_info'],
+            (live.powerUserSettings ?? powerUser?.power_user)?.persona_description_lorebook].filter(Boolean));
+        try {
+            const loaded = await Promise.all([...books].map(name => worldInfo.loadWorldInfo(name)));
+            if (plan !== expected || plan.chatId !== currentIdentity(ctx())) return;
+            if (loaded.some(book => !book?.entries || Object.values(book.entries).some(entry => !entry.disable && (entry.sticky || entry.cooldown || entry.delay)))) {
+                outgoingWindow = { omittedCount: 0, reason: '原生世界书含时间条件或未完整加载，保留完整历史' };
+                warn('native-timed-window-preserved', '本轮世界书包含粘性、冷却或延迟条件（或尚未完整加载），鱼忆保留完整原文，以维持原生世界书计时。');
+                return;
+            }
+        } catch {
+            if (plan !== expected || plan.chatId !== currentIdentity(ctx())) return;
+            outgoingWindow = { omittedCount: 0, reason: '世界书时间条件核验失败，保留完整历史' };
+            warn('native-timed-window-preserved', '本轮无法核验世界书时间条件，鱼忆暂时保留完整原文。');
+            return;
         }
+        if (plan !== expected || plan.chatId !== currentIdentity(ctx())) return;
+        for (let index = chat.length - 1; index >= 0; index--) {
+            if (windowKeys.has(messageKey(chat[index], index, true))) { chat.splice(index, 1); outgoingWindow.omittedCount++; }
+        }
+        outgoingWindow.reason = outgoingWindow.omittedCount ? '本轮已省略有记忆覆盖的旧原文' : '本轮无需省略原文';
     }
 
     /** Listener callbacks are awaited by ST, but ST itself swallows their errors. */
@@ -525,69 +742,237 @@ export async function createSillyTavernHost(deps = {}) {
         const source = deps.eventSource ?? ctx().eventSource ?? script.eventSource;
         const types = deps.eventTypes ?? ctx().eventTypes ?? script.event_types;
         let active = true, currentRun = null, pendingStart = null;
+        let lockedRun = null;
         const preflights = new WeakMap();
         const foreground = (type, dryRun) => !dryRun && !['quiet', 'impersonate'].includes(type);
+        // ST 1.19 copies these same fields into two distinct event payloads.
+        // TH 4.11 emits AFTER_COMMANDS with {} and no START. Merely seeing an
+        // earlier START would let TH steal it while native slash commands await.
+        const nativeFields = ['automatic_trigger', 'force_name2', 'quiet_prompt', 'quietToLoud', 'skipWIAN', 'force_chid', 'signal', 'quietImage'];
+        const nativeOptions = options => options && nativeFields.every(key => Object.hasOwn(options, key));
+        const normalInput = run => run && [undefined, 'normal'].includes(run.type);
+        const removeInputGuard = run => {
+            if (run?.inputGuard) run.inputElement?.removeEventListener?.('input', run.inputGuard, true);
+            if (run) run.inputGuard = null;
+        };
+        const releaseInput = run => {
+            if (run?.inputElement?.readOnly === true) run.inputElement.readOnly = run.inputWasReadOnly;
+        };
+        const guardReleasedInput = run => {
+            if (!normalInput(run) || run.inputConsumed || run.inputGuard) return;
+            run.inputGuard = event => {
+                if (run !== currentRun || run.cancelled || run.inputConsumed || run.inputFallback) return;
+                const value = snapshot().userInput;
+                // Native ST dispatches a synthetic input event when it clears
+                // the consumed textarea, before MESSAGE_SENT. A real user
+                // deletion remains observable through its trusted input event.
+                if (value === run.input || (event.isTrusted === false && value === '')) return;
+                run.inputFallback = true;
+                clearPlan();
+                warn('native-input-changed', '选材后输入发生变化，本轮改按原世界书和完整历史发送；请核对本轮输入。');
+            };
+            run.inputElement?.addEventListener?.('input', run.inputGuard, true);
+        };
+        const enforceLock = run => {
+            if (run !== lockedRun || run.cancelled) return;
+            script.setSendButtonState?.(true);
+            script.deactivateSendButtons?.();
+        };
+        const releaseLock = (run, cancelled = false) => {
+            if (lockedRun !== run) return;
+            lockedRun = null;
+            removeInputGuard(run);
+            releaseInput(run);
+            if (cancelled) {
+                script.setSendButtonState?.(false);
+                script.activateSendButtons?.();
+            }
+        };
+        const acquireLock = run => {
+            if (!run || lockedRun === run) return;
+            if (lockedRun) releaseLock(lockedRun, true);
+            run.chatId = currentIdentity(ctx());
+            const at = snapshot();
+            run.input = at.userInput;
+            run.sentIndex = at.messages.length;
+            run.replyIndex = run.replacement?.prefixKeys.length ?? (['continue', 'append', 'appendFinal'].includes(run.type)
+                ? Math.max(0, at.messages.length - 1) : at.messages.length);
+            run.inputElement = globalThis.document?.querySelector?.('#send_textarea');
+            run.inputWasReadOnly = run.inputElement?.readOnly ?? false;
+            if (run.inputElement) run.inputElement.readOnly = true;
+            lockedRun = run;
+            enforceLock(run);
+        };
         const capturePreflight = (type, options, dryRun) => {
             if (!foreground(type, dryRun)) return null;
             const canBind = options !== null && typeof options === 'object';
             if (canBind && preflights.has(options)) return preflights.get(options);
-            // A direct AFTER_COMMANDS caller (such as TH) need not emit START.
-            const run = pendingStart ?? { cancelled: false, replacement: captureReplacement(type) };
+            // Never claim a foreign event, even while a native START is pending.
+            const run = pendingStart;
+            if (!run || run.type !== type || !nativeOptions(options)
+                || !nativeFields.every(key => Object.is(options[key], run.options[key]))) return null;
             pendingStart = null;
+            run.phase = 'preflight';
             currentRun = run;
             replacement = run.replacement;
             if (canBind) preflights.set(options, run);
             return run;
         };
         const cancelRun = (retainReplacement = false) => {
-            if (currentRun) currentRun.cancelled = true;
+            if (currentRun) {
+                currentRun.cancelled = true; currentRun.abort.abort();
+                removeInputGuard(currentRun);
+                // Only preflight UI belongs to Fish. Once ST resumed Generate,
+                // its own completion/error/stop path owns the send buttons.
+                releaseLock(currentRun, currentRun.phase === 'preflight');
+            }
             // A card's cancellation cleanup may run before ST restores the old
             // candidate. Preserve its memory until that transient gap closes.
             replacement = retainReplacement && replacement && !replacement.received
                 ? { ...replacement, cancelled: true } : null;
         };
+        const beginRun = (type, options, dryRun) => {
+            if (!foreground(type, dryRun) || !nativeOptions(options)) return;
+            cancelRun(true);
+            clearPlan();
+            currentRun = pendingStart = { type, options: { ...options }, phase: 'pending', cancelled: false,
+                abort: new AbortController(), replacement: captureReplacement(type) };
+            replacement = currentRun.replacement;
+        };
+        const checkReadiness = () => { if (active) Promise.resolve(controller.readinessChanged?.()).catch(console.error); };
+        const observeEnd = (run, phase) => {
+            if (!active || !run || run !== currentRun || run.cancelled) return;
+            // ENDED is global (quiet / TH / previous turn / even our own unlock).
+            // It is not evidence that this awaited preflight was cancelled.
+            if (run.phase === 'preflight') { if (phase === 'preflight') enforceLock(run); return; }
+            if (phase !== 'native' || run.phase !== 'native') return;
+            // A native ping/error can exit before MESSAGE_SENT. Return only our
+            // textarea restriction so that path stays recoverable; preserve the
+            // possibly in-flight prompt and never alter native button state.
+            guardReleasedInput(run);
+            releaseInput(run);
+        };
+        const consumeInput = index => {
+            const run = currentRun, message = ctx().chat?.[index];
+            if (!run || run.phase !== 'native' || run.cancelled || run.chatId !== currentIdentity(ctx())
+                || index !== run.sentIndex || !message?.is_user) return;
+            run.inputConsumed = true; run.replyIndex = index + 1;
+            removeInputGuard(run);
+            releaseInput(run);
+        };
+        const retireUsedPlan = (index, type, message) => {
+            const run = currentRun;
+            if (!run || run.phase !== 'native' || run.cancelled || run.chatId !== currentIdentity(ctx())
+                || index !== run.replyIndex || message?.is_user || !String(message?.mes ?? '').trim()) return;
+            const matchingType = ['continue', 'append', 'appendFinal'].includes(run.type)
+                ? ['continue', 'append', 'appendFinal'].includes(type)
+                : run.type === 'swipe' ? type === 'swipe' : ['normal', 'regenerate'].includes(type);
+            if (!matchingType) return;
+            run.phase = 'complete'; removeInputGuard(run); releaseLock(run);
+            currentRun = null; pendingStart = null; generationType = null;
+            clearPlan();
+            Promise.resolve(controller.generationEnded?.()).catch(console.error);
+        };
+        const stopRun = (...args) => {
+            // ST's own stopGeneration emits without arguments. TavernHelper
+            // stopGenerationById/stopAllGeneration pass its generation id; those
+            // stops belong to that tool's request, not to the player's send.
+            if (args.length && args[0] !== undefined) return;
+            cancelRun(true); pendingStart = null; cancelMessageTimers(); clearPlan();
+            generationType = null; controller.generationStopped?.();
+        };
         disposers.push(() => { active = false; cancelRun(); });
+        // ST's event emitter catches listener failures and resumes Generate.
+        // Guard the awaited emit boundary itself: a stale preflight must reject
+        // before native Generate reads/clears input or mutates the current chat.
+        // The check is request-scoped; it never calls the global stop function.
+        if (typeof source.emit === 'function' && types.GENERATION_AFTER_COMMANDS) {
+            const originalEmit = source.emit;
+            const guardedEmit = async function (event, ...args) {
+                if (!active) return originalEmit.call(this, event, ...args);
+                if (event === types.GENERATION_STARTED) beginRun(...args);
+                if (event === types.GENERATION_STOPPED) stopRun(...args);
+                // Input is already in chat here. Disarm before awaited card
+                // listeners can start composing the next draft.
+                if (event === types.MESSAGE_SENT) consumeInput(args[0]);
+                if (event === types.GENERATION_ENDED) {
+                    // Capture before the first awaited listener: a delayed old
+                    // event must never acquire ownership of a newer send.
+                    const endedRun = currentRun, phase = endedRun?.phase;
+                    if (phase === 'preflight') enforceLock(endedRun);
+                    const result = await originalEmit.call(this, event, ...args);
+                    observeEnd(endedRun, phase);
+                    checkReadiness();
+                    return result;
+                }
+                if (event !== types.GENERATION_AFTER_COMMANDS || !foreground(args[0], args[2])) return originalEmit.call(this, event, ...args);
+                const run = capturePreflight(...args);
+                if (!run) return originalEmit.call(this, event, ...args);
+                acquireLock(run);
+                try {
+                    const result = await originalEmit.call(this, event, ...args);
+                    const changedInput = run.input !== snapshot().userInput;
+                    const disconnected = (ctx().onlineStatus ?? script.online_status) === 'no_connection';
+                    if (!active || run.cancelled || run !== currentRun || run.chatId !== currentIdentity(ctx()) || changedInput || disconnected) {
+                        if (changedInput && run === currentRun && !run.cancelled) warn('preflight-input-changed', '选材期间输入发生变化，本次发送已取消；请核对输入后重新发送。');
+                        releaseLock(run, true);
+                        throw new DOMException(disconnected ? '酒馆正文连接尚未就绪，本次发送已取消。' : '鱼忆已取消本次发送；聊天或输入已变化。', 'AbortError');
+                    }
+                    run.phase = 'native';
+                    // ST takes over the send button after this boundary. Typing
+                    // during regenerate/swipe/continue is safe again now.
+                    if (!normalInput(run)) releaseInput(run);
+                    return result;
+                } catch (error) {
+                    run.cancelled = true; run.abort.abort();
+                    releaseLock(run, true);
+                    throw error;
+                }
+            };
+            source.emit = guardedEmit;
+            disposers.push(() => { if (source.emit === guardedEmit) source.emit = originalEmit; });
+        }
         const listen = (type, fn) => {
             if (!type) return;
             source.on(type, fn);
             disposers.push(() => source.removeListener(type, fn));
         };
-        if (types.GENERATION_AFTER_COMMANDS && typeof source.makeFirst === 'function') {
-            disposers.push(() => source.removeListener(types.GENERATION_AFTER_COMMANDS, capturePreflight));
+        // A fallback for injected minimal event sources. Production ST uses
+        // guardedEmit above so capture precedes all awaited card listeners.
+        if (typeof source.emit !== 'function') {
+            listen(types.GENERATION_STARTED, beginRun);
+            listen(types.GENERATION_ENDED, () => { observeEnd(currentRun, currentRun?.phase); checkReadiness(); });
+            listen(types.GENERATION_STOPPED, stopRun);
         }
-        listen(types.GENERATION_STARTED, (type, options, dryRun) => {
-            if (!foreground(type, dryRun)) return;
-            currentRun = pendingStart = { cancelled: false, replacement: captureReplacement(type) };
-            replacement = currentRun.replacement;
-            // Cards may install makeFirst after us. Capture this event's options
-            // before an awaited card preflight can be stopped and later resume.
-            // ST supplies no shared request ID between START and AFTER_COMMANDS.
-            if (types.GENERATION_AFTER_COMMANDS && typeof source.makeFirst === 'function') {
-                source.makeFirst(types.GENERATION_AFTER_COMMANDS, capturePreflight);
-            }
-        });
         listen(types.GENERATION_AFTER_COMMANDS, async (type, options, dryRun) => {
-            if (dryRun) return;
+            if (!foreground(type, dryRun)) return;
             const run = capturePreflight(type, options, dryRun);
-            const isCurrent = () => active && (!run || (run === currentRun && !run.cancelled));
+            if (!run) return;
+            const isCurrent = () => active && run === currentRun && !run.cancelled;
             if (!isCurrent()) return;
             generationType = type;
-            eligibilityWarned.clear();
             const stopBefore = nativeStopSerial;
             try {
-                const result = await controller.generationBefore?.({ type, options, dryRun, isCurrent });
+                const result = await controller.generationBefore?.({ type, options, dryRun, isCurrent, signal: run.abort.signal });
                 if (run && isCurrent() && !result?.cancel) run.prepared = true;
-                if (isCurrent() && result?.cancel && nativeStopSerial === stopBefore) stopGeneration();
+                if (isCurrent() && result?.cancel) {
+                    if (run) run.cancelled = true;
+                    if (nativeStopSerial === stopBefore) stopGeneration();
+                }
             } catch (error) {
                 if (!isCurrent()) return;
                 clearPlan();
+                warn('preflight-error', '鱼忆前置处理未完成，请查看辅助模型连接和收发记录；未选择原书回退时，本次发送会取消。');
                 // The ST emitter catches listener exceptions, so an exception alone
                 // cannot stop the native request. Let the player choose fallback.
                 let decision = 'cancel';
                 try {
                     decision = await (deps.onPreflightFailure ?? controller.onPreflightFailure)?.(error) ?? 'cancel';
                 } catch { decision = 'cancel'; }
-                if (isCurrent() && decision !== 'fallback' && nativeStopSerial === stopBefore) stopGeneration();
+                if (isCurrent() && decision !== 'fallback') {
+                    if (run) run.cancelled = true;
+                    if (nativeStopSerial === stopBefore) stopGeneration();
+                }
             }
         });
         listen(types.WORLDINFO_ENTRIES_LOADED, data => applyWorldInfoEntries(data));
@@ -608,6 +993,7 @@ export async function createSillyTavernHost(deps = {}) {
             // ST omits WORLD_INFO_ACTIVATED when zero entries activate. A real
             // received reply is the safe fallback point to report that case.
             if (nativeAudit && !nativeAudit.reported) reportNativeOmissions([]);
+            retireUsedPlan(index, type, received);
             // saveReply emits before swipe_info is finalized. A macrotask lets
             // its synchronous finalization finish without blocking ST's event.
             const timer = setTimeout(() => {
@@ -620,9 +1006,7 @@ export async function createSillyTavernHost(deps = {}) {
             }, 0);
             messageTimers.add(timer);
         });
-        listen(types.GENERATION_STOPPED, () => { cancelRun(true); cancelMessageTimers(); clearPlan(); generationType = null; controller.generationStopped?.(); });
-        const checkReadiness = () => { if (active) Promise.resolve(controller.readinessChanged?.()).catch(console.error); };
-        listen(types.GENERATION_ENDED, () => { cancelRun(true); pendingStart = null; clearPlan(); generationType = null; controller.generationEnded?.(); checkReadiness(); });
+        listen(types.MESSAGE_SENT, consumeInput);
         listen(types.CHAT_CHANGED, async () => {
             cancelRun(); cancelMessageTimers(); clearPlan(); generationType = null; eligibilityWarned.clear();
             await controller.chatChanged?.(); checkReadiness();
@@ -637,21 +1021,22 @@ export async function createSillyTavernHost(deps = {}) {
             const message = ctx().chat?.[index];
             if (message?.swipes?.[message.swipe_id ?? 0] === undefined) return;
             cancelRun();
-            return controller.messageSwiped?.({ index });
+            Promise.resolve(controller.messageSwiped?.({ index })).catch(console.error);
         });
         listen(types.MESSAGE_DELETED, index => {
             const expected = currentRun?.replacement;
-            if (currentRun?.prepared && !currentRun.cancelled && expected?.type === 'regenerate' && !expected.deleted
+            if (currentRun?.prepared && !currentRun.cancelled && script.isGenerating?.() !== false && expected?.type === 'regenerate' && !expected.deleted
                 && !expected.received && expected.chatId === currentIdentity(ctx()) && index === expected.prefixKeys.length
                 && JSON.stringify(snapshot().messages.map(m => m.key)) === JSON.stringify(expected.prefixKeys)) {
-                // Generate removes exactly this captured tail after preflight.
-                // It is part of the same send, not a new user deletion.
+                // Generate removes this captured tail while its native send
+                // state is active. Once ST is idle, the same-position user
+                // deletion must be reconciled even if a prior run failed.
                 expected.deleted = true;
                 return;
             }
             replacement = null;
             if (currentRun) { currentRun.replacement = null; currentRun.prepared = false; }
-            return controller.messageDeleted?.({ index });
+            Promise.resolve(controller.messageDeleted?.({ index })).catch(console.error);
         });
         listen(types.MESSAGE_SWIPE_DELETED, data => {
             const message = ctx().chat?.[data?.messageId];
@@ -663,19 +1048,28 @@ export async function createSillyTavernHost(deps = {}) {
                 cancelRun(); controller.cancel?.();
                 return;
             }
-            return controller.messageSwipeDeleted?.(data);
+            Promise.resolve(controller.messageSwipeDeleted?.(data)).catch(console.error);
         });
         return () => { for (const dispose of disposers) dispose(); disposers = []; cancelMessageTimers(); clearPlan(); };
     }
 
     async function rawGenerate(params) {
-        const generate = deps.rawGenerate ?? ctx().generateRaw;
-        if (typeof generate !== 'function') throw new Error('SillyTavern generateRaw unavailable');
+        // Explicit dependency injection is kept for deterministic adapter tests.
+        // Production never enters ST generateRaw's template/cleanup pipeline.
+        const generate = deps.rawGenerate;
         params?.signal?.throwIfAborted?.();
+        if (typeof generate !== 'function') {
+            const api = ctx().mainApi ?? script.main_api;
+            return generateAuxiliary({ params, context: ctx(), script,
+                openai: api === 'openai' ? deps.openai ?? await import('/scripts/openai.js') : null,
+                textgen: api === 'textgenerationwebui' ? deps.textgen ?? await import('/scripts/textgen-settings.js') : null,
+                instruct: api === 'textgenerationwebui' ? deps.instruct ?? await import('/scripts/instruct-mode.js') : null,
+                fetchImpl: deps.fetch ?? globalThis.fetch });
+        }
         const result = await generate({ prompt: [
             { role: 'system', content: String(params.system ?? '') },
             { role: 'user', content: String(params.input ?? '') },
-        ], trimNames: false });
+        ], trimNames: false, responseLength: params.responseLength });
         params?.signal?.throwIfAborted?.();
         return result;
     }
@@ -688,7 +1082,7 @@ export async function createSillyTavernHost(deps = {}) {
         return result;
     }
 
-    return { snapshot, generationSnapshot, pendingReplacement, previewSnapshot: () => snapshot(true), previewEligible: entry => eligible(entry, { silent: true, type: 'normal' }), loadWorldbook, eligible, storage, setPlan, clearPlan, applyWorldInfoEntries, applyWindow, restoreLegacyWindow, filterOutgoingHistory, bindController, rawGenerate, stopGeneration, auxiliaryReadiness,
+    return { snapshot, generationSnapshot, pendingReplacement, previewSnapshot: () => snapshot(true), previewEligible: entry => eligible(entry, { silent: true, type: 'normal' }), loadWorldbook, worldbookStatus, checkWorldbook, eligible, storage, setPlan, clearPlan, applyWorldInfoEntries, applyWindow, restoreLegacyWindow, filterOutgoingHistory, bindController, rawGenerate, stopGeneration, auxiliaryReadiness,
         readMvu: settings => readMvuProjection({ context: ctx, settings, globals: deps.globals ?? globalThis }),
-        getWarnings: () => copy(warnings) };
+        getWarnings: () => copy(warnings), windowStatus: () => copy(outgoingWindow) };
 }

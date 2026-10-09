@@ -1,10 +1,10 @@
-const SENSITIVE_KEYS = new Set(['headers', 'header', 'authorization', 'proxyauthorization', 'apikey', 'token', 'accesstoken', 'refreshtoken', 'password', 'passwd', 'secret', 'clientsecret', 'cookie', 'setcookie', 'credentials', 'customincludebody', 'customexcludebody']);
-const ADDRESS_KEYS = new Set(['url', 'uri', 'endpoint', 'baseurl', 'apiurl', 'reverseproxy', 'proxy']);
+const SENSITIVE_KEYS = new Set(['headers', 'header', 'authorization', 'proxyauthorization', 'apikey', 'accesskey', 'secretkey', 'key', 'auth', 'bearer', 'session', 'token', 'accesstoken', 'refreshtoken', 'password', 'passwd', 'secret', 'clientsecret', 'cookie', 'setcookie', 'credentials', 'customincludebody', 'customexcludebody']);
+const ADDRESS_KEYS = new Set(['url', 'uri', 'endpoint', 'baseurl', 'apiurl', 'apiserver', 'serverurl', 'reverseproxy', 'proxy']);
 const CONTENT_KEYS = new Set(['content', 'text', 'input', 'system', 'prompt', 'arguments', 'responseraw', 'responsebody']);
 const RESERVED_KEYS = new Set(['id', 'startedAt', 'endedAt', 'status', 'truncated', 'truncatedFields']);
 const STATUSES = new Set(['pending', 'complete', 'error', 'aborted']);
 const normalizeKey = key => key.replace(/[^a-z0-9]/gi, '').toLowerCase();
-const isSensitive = key => SENSITIVE_KEYS.has(key) || /(?:password|passwd|apikey|secret|token|headers)$/.test(key);
+const isSensitive = key => SENSITIVE_KEYS.has(key) || /(?:password|passwd|apikey|accesskey|secret|token|headers)$/.test(key) || key.startsWith('apikey');
 const isAddress = key => ADDRESS_KEYS.has(key) || /(?:url|endpoint)$/.test(key);
 const limit = (value, fallback) => Number.isSafeInteger(value) && value >= 0 ? value : fallback;
 const own = (object, key, value) => Object.defineProperty(object, key, { value, writable: true, enumerable: true, configurable: true });
