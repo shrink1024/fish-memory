@@ -69,7 +69,8 @@ function observe(context) {
     }
     return { chatId, chat: live.chat, message, messageId, swipeId, messageCount: live.chat.length,
         text: message.mes ?? message.content,
-        messageKey: typeof message.extra?.dwmKey === 'string' ? `${message.extra.dwmKey}:swipe:${swipeId}` : null };
+        messageKey: message.swipe_info?.[swipeId]?.dwmCandidateKey ?? message.extra?.dwmCandidateKey
+            ?? (typeof message.extra?.dwmKey === 'string' ? `${message.extra.dwmKey}:swipe:${swipeId}` : null) };
 }
 
 function sameObservation(before, after) {
