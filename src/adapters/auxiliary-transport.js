@@ -1,3 +1,4 @@
+import { throwIfAborted } from '../platform/abort.js';
 import { auxiliaryResponseLength, assertCompleteModelResponse, boundedResponseLength, modelApiError } from '../agents/client.js';
 
 /** Dedicated auxiliary transport using ST's connection parameter builders only.
@@ -5,7 +6,7 @@ import { auxiliaryResponseLength, assertCompleteModelResponse, boundedResponseLe
 export async function generateAuxiliary({ params, context, script, openai, textgen, instruct, fetchImpl }) {
     const api = context.mainApi ?? script.main_api;
     const signal = params.signal;
-    signal?.throwIfAborted();
+    throwIfAborted(signal);
     const requestedLength = params.responseLength ?? auxiliaryResponseLength(params.purpose, params.input);
     const messages = [{ role: 'system', content: String(params.system ?? '') }, { role: 'user', content: String(params.input ?? '') }];
     let data, url, templateStops = [];
@@ -50,19 +51,19 @@ export async function generateAuxiliary({ params, context, script, openai, textg
     if (typeof data.n === 'number') data.n = 1;
     else delete data.n;
     if (templateStops.length) { data.stop = templateStops; data.stopping_strings = templateStops; }
-    signal?.throwIfAborted();
+    throwIfAborted(signal);
     const response = await fetchImpl(url, { method: 'POST', headers: context.getRequestHeaders?.() ?? script.getRequestHeaders?.(),
         body: JSON.stringify(data), signal });
-    signal?.throwIfAborted();
+    throwIfAborted(signal);
     if ([401, 403].includes(response.status)) throw modelApiError(null, response.status);
     let payload;
     try { payload = await response.json(); }
     catch {
-        signal?.throwIfAborted();
+        throwIfAborted(signal);
         if (!response.ok) throw modelApiError(null, response.status);
         throw new Error('酒馆辅助接口未返回有效的 JSON 响应，本次未采用。请检查收发记录与连接后重试。');
     }
-    signal?.throwIfAborted();
+    throwIfAborted(signal);
     if (!response.ok || payload?.error) throw modelApiError(payload, response.ok ? undefined : response.status);
     assertCompleteModelResponse(payload);
     return script.extractMessageFromData(payload, api);

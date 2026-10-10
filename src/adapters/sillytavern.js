@@ -1,4 +1,6 @@
 /** SillyTavern boundary. All persistent state belongs to the current chat. */
+import { tauriPersistence } from './tauritavern.js';
+import { lukerPersistence } from './luker.js';
 import { readMvuProjection } from './mvu.js';
 import { generateAuxiliary } from './auxiliary-transport.js';
 import { encodeSave, decodeSave } from '../core/storage-codec.js';
@@ -67,7 +69,7 @@ function primaryBookName(character) {
 function messageKey(message, index, readOnly = false) {
     // Preview uses the same identity rules without changing the live chat.
     if (readOnly) message = { ...message, extra: { ...message.extra },
-        swipe_info: message.swipe_info?.map(info => ({ ...info, extra: { ...info?.extra } })) };
+        swipe_info: message.swipe_info?.map(info => info == null ? info : ({ ...info, extra: { ...info.extra } })) };
     message.extra ??= {};
     const fresh = () => globalThis.crypto?.randomUUID?.() ?? `dwm-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     message.extra.dwmKey ??= readOnly ? `preview-message-${index}` : fresh();
@@ -79,7 +81,7 @@ function messageKey(message, index, readOnly = false) {
     const reserved = new Set(message.swipe_info.map(info => info?.dwmCandidateKey).filter(Boolean));
     const used = new Set();
     for (let swipe = 0; swipe < message.swipes.length; swipe++) {
-        if (message.swipes[swipe] === undefined) continue;
+        if (message.swipes[swipe] == null || (message.tt_swipe_cold && message.swipe_info[swipe] === null)) continue;
         const info = message.swipe_info[swipe] ??= {};
         const mirrored = info.extra?.dwmCandidateKey;
         let key = info.dwmCandidateKey ?? mirrored ?? legacy(swipe);
@@ -95,7 +97,7 @@ function messageKey(message, index, readOnly = false) {
     // An overswipe has no reply yet. Do not overwrite the previous extra while
     // ST still exposes it; receipt is checked again after saveReply finalizes.
     const key = message.swipe_info[selected]?.dwmCandidateKey;
-    if (message.swipes[selected] === undefined || !key) return `${message.extra.dwmKey}:pending:${selected}`;
+    if (message.swipes[selected] == null || !key) return `${message.extra.dwmKey}:pending:${selected}`;
     if (message.mes === message.swipes[selected]) message.extra.dwmCandidateKey = key;
     return key;
 }
@@ -115,6 +117,8 @@ export async function createSillyTavernHost(deps = {}) {
         if (!value) throw new Error('SillyTavern context unavailable');
         return value;
     };
+    const persistence = await tauriPersistence(deps, script) ?? lukerPersistence(deps, script);
+    const enqueueSave = task => persistence ? persistence.enqueue(task) : task();
     const save = deps.save ?? (async expectedRevision => {
         const live = ctx();
         const savingChatId = currentIdentity(live);
@@ -129,6 +133,7 @@ export async function createSillyTavernHost(deps = {}) {
         if (typeof request !== 'function') throw new Error('Fetch unavailable');
         const headers = live.getRequestHeaders?.() ?? script.getRequestHeaders?.();
         if (!headers) throw new Error('SillyTavern request headers unavailable');
+        const target = { is_group: false, avatar_url: character.avatar, file_name: fileName, char_name: character.name };
         const remote = await request('/api/chats/get', {
             method: 'POST', headers, cache: 'no-cache',
             body: JSON.stringify({ ch_name: character.name, file_name: fileName, avatar_url: character.avatar }),
@@ -151,7 +156,10 @@ export async function createSillyTavernHost(deps = {}) {
         // Retry from the live object, never replay a captured variables snapshot.
         // This is bounded single-client reconciliation, not cross-client CAS.
         for (let attempt = 0; attempt < 3; attempt++) {
-            const serialized = readLive(), chat = JSON.parse(serialized);
+            let serialized = readLive();
+            const chat = JSON.parse(serialized);
+            const expectedMessages = persistence ? await persistence.expectedMessages(chat.slice(1)) : chat.slice(1);
+            if (readLive() !== serialized) continue;
             const response = await request('/api/chats/save', {
                 method: 'POST', headers, cache: 'no-cache',
                 body: JSON.stringify({ ch_name: character.name, file_name: fileName, chat, avatar_url: character.avatar, force: false }),
@@ -162,14 +170,20 @@ export async function createSillyTavernHost(deps = {}) {
             }
             const result = await response.json();
             if (result?.ok !== true) throw new Error('Chat save was not acknowledged');
+            if (persistence?.acknowledge) {
+                persistence.acknowledge(result, chat, target);
+                serialized = JSON.stringify(chat);
+            }
             if (readLive() !== serialized) continue;
             const verify = await request('/api/chats/get', { method: 'POST', headers, cache: 'no-cache',
                 body: JSON.stringify({ ch_name: character.name, file_name: fileName, avatar_url: character.avatar }) });
             if (!verify?.ok) throw new Error('保存后的聊天核验失败，记忆进度未确认');
             const saved = await verify.json();
             if (readLive() !== serialized) continue;
-            if (!Array.isArray(saved) || JSON.stringify(saved[0]?.chat_metadata) !== JSON.stringify(chat[0].chat_metadata)
-                || JSON.stringify(saved.slice(1)) !== JSON.stringify(chat.slice(1))) throw new Error('聊天保存结果与提交不符，请重新载入后核对');
+            const equal = persistence?.equal ?? ((left, right) => JSON.stringify(left) === JSON.stringify(right));
+            if (!Array.isArray(saved) || !equal(saved[0]?.chat_metadata, chat[0].chat_metadata)
+                || !equal(saved.slice(1), expectedMessages)) throw new Error('聊天保存结果与提交不符，请重新载入后核对');
+            persistence?.verified?.(saved, target);
             return;
         }
         throw new Error('其他工具仍在更新聊天，本次保存未能确认，请稍后重新载入核对');
@@ -533,26 +547,28 @@ export async function createSillyTavernHost(deps = {}) {
             return stored?.schema === 3 ? decodeSave(stored) : copy(stored);
         },
         async write(chatId, value, expectedRevision) {
-            const live = ctx();
-            if (currentIdentity(live) !== chatId) throw new Error('存档已经切换');
-            const metadata = live.chatMetadata;
-            if (!metadata || typeof metadata !== 'object') throw new Error('聊天 metadata 不可写');
-            const previous = copy(metadata[META_KEY]);
-            const actualRevision = previous?.revision ?? 0;
-            if (actualRevision !== expectedRevision) throw new Error('存档版本已经变化');
-            const written = value?.schema === 2 ? encodeSave(value) : copy(value);
-            metadata[META_KEY] = written;
-            try {
-                await save(expectedRevision);
-                if (currentIdentity(ctx()) !== chatId) throw new Error('保存期间存档已经切换');
-            } catch (error) {
-                // Do not roll back over another writer's replacement.
-                if (JSON.stringify(metadata[META_KEY]) === JSON.stringify(written)) {
-                    if (previous === undefined) delete metadata[META_KEY];
-                    else metadata[META_KEY] = previous;
+            return enqueueSave(async () => {
+                const live = ctx();
+                if (currentIdentity(live) !== chatId) throw new Error('存档已经切换');
+                const metadata = live.chatMetadata;
+                if (!metadata || typeof metadata !== 'object') throw new Error('聊天 metadata 不可写');
+                const previous = copy(metadata[META_KEY]);
+                const actualRevision = previous?.revision ?? 0;
+                if (actualRevision !== expectedRevision) throw new Error('存档版本已经变化');
+                const written = value?.schema === 2 ? encodeSave(value) : copy(value);
+                metadata[META_KEY] = written;
+                try {
+                    await save(expectedRevision);
+                    if (currentIdentity(ctx()) !== chatId) throw new Error('保存期间存档已经切换');
+                } catch (error) {
+                    // Do not roll back over another writer's replacement.
+                    if (JSON.stringify(metadata[META_KEY]) === JSON.stringify(written)) {
+                        if (previous === undefined) delete metadata[META_KEY];
+                        else metadata[META_KEY] = previous;
+                    }
+                    throw error;
                 }
-                throw error;
-            }
+            });
         },
     };
 
@@ -651,35 +667,39 @@ export async function createSillyTavernHost(deps = {}) {
     }
 
     async function restoreLegacyWindow() {
-        const live = ctx(), chatId = currentIdentity(live), changes = [];
-        for (const message of live.chat ?? []) {
-            if (message.extra?.dwmHidden?.owner === OWNER) {
-                changes.push({ object: message, isSystem: message.is_system, extra: copy(message.extra) });
-                message.is_system = false;
-                delete message.extra.dwmHidden;
-            }
-            for (const info of message.swipe_info ?? []) if (info?.extra?.dwmHidden?.owner === OWNER) {
-                changes.push({ object: info, extra: copy(info.extra) });
-                delete info.extra.dwmHidden;
-            }
-        }
-        if (!changes.length) return 0;
-        try {
-            await save();
-            if (currentIdentity(ctx()) !== chatId) throw new Error('保存期间存档已经切换');
-        } catch (error) {
-            for (const change of changes) {
-                // Restore only our mutation; another extension may have updated
-                // this shared object while the save was awaiting a response.
-                if (!change.object.extra?.dwmHidden && (!('isSystem' in change) || change.object.is_system === false)) {
-                    change.object.extra ??= {};
-                    change.object.extra.dwmHidden = copy(change.extra.dwmHidden);
-                    if ('isSystem' in change) change.object.is_system = change.isSystem;
+        const target = currentIdentity(ctx());
+        return enqueueSave(async () => {
+            if (currentIdentity(ctx()) !== target) throw new Error('存档已经切换');
+            const live = ctx(), chatId = currentIdentity(live), changes = [];
+            for (const message of live.chat ?? []) {
+                if (message.extra?.dwmHidden?.owner === OWNER) {
+                    changes.push({ object: message, isSystem: message.is_system, extra: copy(message.extra) });
+                    message.is_system = false;
+                    delete message.extra.dwmHidden;
+                }
+                for (const info of message.swipe_info ?? []) if (info?.extra?.dwmHidden?.owner === OWNER) {
+                    changes.push({ object: info, extra: copy(info.extra) });
+                    delete info.extra.dwmHidden;
                 }
             }
-            throw new Error(`旧版鱼忆隐藏状态恢复未保存，请重试或使用离线恢复工具：${error.message}`);
-        }
-        return changes.length;
+            if (!changes.length) return 0;
+            try {
+                await save();
+                if (currentIdentity(ctx()) !== chatId) throw new Error('保存期间存档已经切换');
+            } catch (error) {
+                for (const change of changes) {
+                    // Restore only our mutation; another extension may have updated
+                    // this shared object while the save was awaiting a response.
+                    if (!change.object.extra?.dwmHidden && (!('isSystem' in change) || change.object.is_system === false)) {
+                        change.object.extra ??= {};
+                        change.object.extra.dwmHidden = copy(change.extra.dwmHidden);
+                        if ('isSystem' in change) change.object.is_system = change.isSystem;
+                    }
+                }
+                throw new Error(`旧版鱼忆隐藏状态恢复未保存，请重试或使用离线恢复工具：${error.message}`);
+            }
+            return changes.length;
+        });
     }
 
     async function applyWindow(actions) {

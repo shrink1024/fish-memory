@@ -33,8 +33,8 @@ class Element extends Target {
     releasePointerCapture() {}
     querySelector() { return null; }
 }
-function fixture({ saved, storageError = false } = {}) {
-    const win = new Target(); win.innerWidth = 375; win.innerHeight = 812;
+function fixture({ saved, storageError = false, tauriHost } = {}) {
+    const win = new Target(); win.__TAURITAVERN__ = tauriHost; win.innerWidth = 375; win.innerHeight = 812;
     win.visualViewport = new Target(); Object.assign(win.visualViewport, { width: 375, height: 812, offsetLeft: 0, offsetTop: 0 });
     win.getComputedStyle = () => ({ paddingTop: '20px', paddingRight: '8px', paddingBottom: '24px', paddingLeft: '8px' });
     const doc = new Target(); doc.defaultView = win; doc.createElement = tag => new Element(tag, doc); doc.createElementNS = (_, tag) => new Element(tag, doc);
@@ -123,4 +123,70 @@ test('destroy removes every viewport, pointer and entry listener and is idempote
     assert.ok(f.win.listenerCount > 0); f.ui.destroy(); f.ui.destroy();
     assert.equal(f.win.listenerCount, 0); assert.equal(f.win.visualViewport.listenerCount, 0); assert.equal(f.doc.listenerCount, 0);
     assert.equal(entry.listenerCount, 0); assert.equal(f.ui.element.isConnected, false); entry.fire('click');
+});
+
+function ttLayout() {
+    let listener, disposed = 0;
+    const snapshot = { viewport: { left: 0, top: 0, width: 375, height: 812 },
+        safeInsets: { top: 44, right: 12, bottom: 34, left: 12 }, ime: { keyboardOffset: 0 } };
+    const host = { ready: Promise.resolve(), api: { layout: { subscribe: handler => { listener = handler; handler(snapshot); return () => { disposed++; }; } } } };
+    return { host, snapshot, emit() { listener(snapshot); }, get disposed() { return disposed; } };
+}
+const settleLayout = async () => { for (let i = 0; i < 5; i++) await Promise.resolve(); };
+
+test('TT native keyboard inset shrinks the reachable surface without changing dock preference', async () => {
+    const tt = ttLayout(), f = fixture({ tauriHost: tt.host, saved: JSON.stringify({ edge: 'right', fraction: 1 }) });
+    await settleLayout();
+    assert.equal(f.ui.panel.dataset.ttMobileSurface, 'free-window');
+    assert.equal(f.ui.bubble.dataset.ttMobileSurface, 'free-window');
+    assert.equal(f.ui.element.dataset.ttMobileSurface, 'none');
+    tt.snapshot.ime.keyboardOffset = 286; tt.emit();
+    assert.equal(f.win.visualViewport.height, 812);
+    assert.equal(f.ui.element.style.height, '526px');
+    assert.ok(parseFloat(f.ui.bubble.style.top) >= 44);
+    assert.ok(parseFloat(f.ui.bubble.style.top) + 58 < 526 - 34);
+    assert.equal(f.writes.length, 0);
+    tt.snapshot.ime.keyboardOffset = 0; tt.emit();
+    assert.equal(f.ui.element.style.height, '812px');
+    f.ui.destroy(); assert.equal(tt.disposed, 1);
+});
+
+test('TT layout supports landscape safe areas and viewport pan without double keyboard subtraction', async () => {
+    const tt = ttLayout(), f = fixture({ tauriHost: tt.host }); await settleLayout();
+    Object.assign(tt.snapshot.viewport, { width: 812, height: 220, left: 5, top: 90 });
+    Object.assign(tt.snapshot.safeInsets, { top: 0, left: 44, right: 44, bottom: 21 });
+    tt.emit();
+    assert.equal(f.ui.element.style.height, '220px'); assert.equal(f.ui.element.style.top, '90px');
+    assert.equal(f.ui.bubble.style.left, '656px');
+    f.ui.destroy();
+});
+
+test('TT late subscription cleanup cannot revive a destroyed floating manager', async () => {
+    let resolve, release, disposed = 0;
+    const ready = new Promise(done => { resolve = done; });
+    const subscription = new Promise(done => { release = done; });
+    const tt = ttLayout(); tt.host.ready = ready;
+    tt.host.api.layout.subscribe = handler => { handler(tt.snapshot); return subscription; };
+    const f = fixture({ tauriHost: tt.host }); resolve(); await settleLayout();
+    f.ui.destroy(); release(() => { disposed++; }); await settleLayout();
+    assert.equal(disposed, 1); assert.equal(f.ui.element.isConnected, false);
+});
+
+test('destroying before TT readiness prevents subscription and native ST remains unmarked', async () => {
+    let resolve, subscribed = 0;
+    const ready = new Promise(done => { resolve = done; });
+    const f = fixture({ tauriHost: { ready, api: { layout: { subscribe() { subscribed++; } } } } });
+    f.ui.destroy(); resolve(); await settleLayout(); assert.equal(subscribed, 0);
+    const st = fixture(); assert.equal(st.ui.panel.dataset.ttMobileSurface, undefined); st.ui.destroy();
+});
+
+test('TT keyboard layout scrolls only the manager body to reveal its focused field', async () => {
+    const tt = ttLayout(), f = fixture({ tauriHost: tt.host }); await settleLayout(); f.ui.open();
+    const field = f.doc.createElement('input'); f.ui.body.append(field); field.focus();
+    f.ui.body.scrollTop = 0; f.ui.body.rect = { top: 100, bottom: 450 };
+    field.rect = { top: 480, bottom: 520 };
+    tt.snapshot.ime.keyboardOffset = 286; tt.emit();
+    assert.equal(f.ui.body.scrollTop, 82);
+    assert.equal(f.doc.body.scrollTop, undefined);
+    f.ui.destroy();
 });

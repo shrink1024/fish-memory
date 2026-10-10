@@ -641,3 +641,32 @@ test('disabling dynamic memory during selection cannot install a late plan', asy
     await c.updateSettings({ enabled: false }); gate.resolve({ ids: [] }); await sending;
     assert.equal(f.plans.some(Boolean), false);
 });
+
+test('initialization and retry work without modern AbortSignal methods', async () => {
+    const descriptors = [
+        [AbortSignal, 'any'], [AbortSignal, 'timeout'], [AbortSignal.prototype, 'throwIfAborted'],
+    ].map(([target, key]) => [target, key, Object.getOwnPropertyDescriptor(target, key)]);
+    try {
+        for (const [target, key] of descriptors) Object.defineProperty(target, key, { configurable: true, value: undefined });
+        const f = fixture({ messages: [msg('old', '此前已发生的剧情')] });
+        const c = new Controller(f.host, { model: f.model, settings: { enabled: false } });
+        await c.start();
+        await c.initialize();
+        assert.equal(c.store.state.initialized, true);
+        await c.initialize();
+    } finally {
+        for (const [target, key, descriptor] of descriptors) Object.defineProperty(target, key, descriptor);
+    }
+});
+
+test('initialization setup errors release the busy flag for a manual retry', async () => {
+    const f = fixture({ messages: [msg('old', '此前已发生的剧情')] });
+    const c = new Controller(f.host, { model: f.model, settings: { enabled: false } });
+    await c.start();
+    const clearPlan = f.host.clearPlan;
+    f.host.clearPlan = () => { throw new Error('setup failed'); };
+    await assert.rejects(c.initialize(), /setup failed/);
+    f.host.clearPlan = clearPlan;
+    await c.initialize();
+    assert.equal(c.store.state.initialized, true);
+});

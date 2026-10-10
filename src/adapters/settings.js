@@ -1,3 +1,5 @@
+import { timeoutSignal } from '../platform/abort.js';
+
 function canonical(value) {
     if (Array.isArray(value)) return value.map(canonical);
     if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])]));
@@ -14,9 +16,10 @@ export function createSettingsPersistence({ extensionSettings, saveSettings, get
         extensionSettings.dwm = target;
         try {
             await saveSettings();
+            const deadline = timeoutSignal(10000);
             try {
                 const response = await request('/api/settings/get', { method: 'POST', headers: getRequestHeaders(),
-                    body: '{}', cache: 'no-cache', signal: AbortSignal.timeout(10000) });
+                    body: '{}', cache: 'no-cache', signal: deadline.signal });
                 if (!response?.ok) throw new Error('Settings readback failed');
                 // ST 1.19 returns the stored settings file as a JSON string.
                 const result = await response.json();
@@ -27,7 +30,7 @@ export function createSettingsPersistence({ extensionSettings, saveSettings, get
                 }
             } catch {
                 throw new Error('鱼忆设置尚未确认保存。请检查酒馆连接，等待当前辅助生成结束后重试；确认前请勿刷新或退出。');
-            }
+            } finally { deadline.dispose(); }
         }
         catch (error) {
             // A queued native writer reads this restored value later. If another
