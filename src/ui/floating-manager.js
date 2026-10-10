@@ -14,6 +14,8 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
         if (className) svg.setAttribute('class', className);
         const shape = doc.createElementNS('http://www.w3.org/2000/svg', 'path'); shape.setAttribute('d', path); svg.append(shape); return svg;
     };
+    const ttHost = win?.__TAURITAVERN__;
+    let ttSnapshot = null, releaseTt = null;
     const element = make('div', 'dwm-floating-root');
     const bubble = make('button', 'dwm-floating-bubble'); bubble.type = 'button'; bubble.id = 'dwm-floating-entry';
     const bubbleCopy = make('span', 'dwm-bubble-copy');
@@ -21,6 +23,11 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
     bubbleCopy.append(make('strong', 'dwm-bubble-name', '鱼忆'), status);
     bubble.append(icon('M4 12C7 5 15 5 19 12C15 19 7 19 4 12Zm0 0L1 8v8l3-4Zm11-1h.01M9 7l2-3 3 3M9 17l2 3 3-3', 'dwm-bubble-fish'), bubbleCopy);
     const panel = make('section', 'dwm-management'); panel.id = 'dwm-management-dialog'; panel.hidden = true;
+    if (ttHost) {
+        element.dataset.ttMobileSurface = 'none';
+        panel.dataset.ttMobileSurface = 'free-window';
+        bubble.dataset.ttMobileSurface = 'free-window';
+    }
     panel.setAttribute('role', 'dialog'); panel.setAttribute('aria-label', '鱼忆管理窗口'); panel.setAttribute('aria-modal', 'false');
     const chrome = make('header', 'dwm-management-chrome');
     const heading = make('div', 'dwm-management-heading');
@@ -51,13 +58,19 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
     };
     const save = () => { try { storage?.setItem(storageKey, JSON.stringify(dock)); } catch { /* Position memory is optional. */ } };
     const viewport = () => {
+        if (ttSnapshot) {
+            const { viewport: v, ime } = ttSnapshot;
+            // Android TT reports IME separately; iOS reports a reduced viewport
+            // and zero extra offset. Safe-area padding is consumed only once.
+            return { width: v.width, height: Math.max(1, v.height - ime.keyboardOffset), left: v.left, top: v.top };
+        }
         const v = win?.visualViewport;
         return { width: v?.width || win?.innerWidth || 375, height: v?.height || win?.innerHeight || 812,
             left: v?.offsetLeft || 0, top: v?.offsetTop || 0 };
     };
     const measure = () => {
         const v = viewport(), css = win?.getComputedStyle?.(element);
-        const inset = side => parseFloat(css?.[`padding${side}`]) || 8;
+        const inset = side => ttSnapshot ? Math.max(12, ttSnapshot.safeInsets[side.toLowerCase()]) : parseFloat(css?.[`padding${side}`]) || 8;
         const size = bubble.getBoundingClientRect(), width = size.width || 132, height = size.height || 58;
         const minX = inset('Left'), maxX = Math.max(minX, v.width - inset('Right') - width);
         const minY = inset('Top');
@@ -185,11 +198,35 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
         layout();
     };
     reflectDock(); render({ initialized: true });
+    if (ttHost) {
+        const report = error => win?.console?.warn?.('鱼忆：TT 布局订阅不可用，继续使用浏览器视口。', error);
+        const release = fn => { try { Promise.resolve(fn?.()).catch(report); } catch (error) { report(error); } };
+        Promise.resolve(ttHost.ready).then(async () => {
+            if (destroyed) return;
+            const api = ttHost.api?.layout;
+            if (typeof api?.subscribe !== 'function') throw new Error('TT layout API unavailable');
+            const unsubscribe = await api.subscribe(snapshot => {
+                if (destroyed) return;
+                const v = snapshot?.viewport, insets = snapshot?.safeInsets, ime = snapshot?.ime;
+                if (!v || !insets || !ime || !['width', 'height', 'left', 'top'].every(key => Number.isFinite(v[key]))
+                    || v.width <= 0 || v.height <= 0 || !['top', 'right', 'bottom', 'left'].every(key => Number.isFinite(insets[key]) && insets[key] >= 0)
+                    || !Number.isFinite(ime.keyboardOffset) || ime.keyboardOffset < 0) {
+                    report(new Error('Invalid TT layout snapshot')); return;
+                }
+                ttSnapshot = { viewport: { ...v }, safeInsets: { ...insets }, ime: { keyboardOffset: ime.keyboardOffset } };
+                for (const side of ['top', 'right', 'bottom', 'left']) element.style.setProperty(`--dwm-safe-${side}`, `${insets[side]}px`);
+                layout();
+            });
+            if (destroyed) release(unsubscribe);
+            else releaseTt = () => release(unsubscribe);
+        }).catch(report);
+    }
     return { element, panel, body, bubble, bindEntry, open, close, toggle: () => opened ? close() : open(), render,
         destroy() {
             if (destroyed) return;
             if (opened && element.contains(doc.activeElement)) close();
-            destroyed = true; for (const remove of listeners) remove(); observer?.disconnect();
+            destroyed = true; releaseTt?.(); releaseTt = null;
+            for (const remove of listeners) remove(); observer?.disconnect();
             for (const entry of entries) entry.setAttribute('aria-expanded', 'false');
             entries.clear(); drag = null; element.remove();
         } };
