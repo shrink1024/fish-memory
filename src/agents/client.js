@@ -1,3 +1,4 @@
+import { throwIfAborted, combineSignals, timeoutSignal } from '../platform/abort.js';
 import { invariant, plainText } from '../core/util.js';
 import { DEFAULT_SETTINGS, validTimeout } from '../core/state.js';
 
@@ -11,7 +12,7 @@ export async function untilAborted(operation, signal) {
             signal.addEventListener('abort', onAbort, { once: true });
             if (signal.aborted) onAbort();
         })]);
-        signal.throwIfAborted();
+        throwIfAborted(signal);
         return result;
     } finally { signal.removeEventListener('abort', onAbort); }
 }
@@ -176,43 +177,44 @@ export class AgentClient {
     }
     async completeValidated(request, validate) { return this.complete({ ...request, validate }); }
     async complete({ purpose, system, input, signal, validate = result => result, onAttempt }) {
-        signal?.throwIfAborted();
+        throwIfAborted(signal);
         // Read settings once for this request. Saving new limits does not alter work already in flight.
         const current = this.getTimeouts?.();
         const longTask = ['initialize', 'strategy', 'maintain', 'compact'].includes(purpose);
         const timeoutMs = longTask ? current?.initializationTimeoutMs ?? this.initializationTimeoutMs : current?.timeoutMs ?? this.timeoutMs;
         invariant(validTimeout(timeoutMs), '辅助模型等待时间应为 0（关闭插件限时）或 1000–86400000 毫秒的整数');
-        const timeout = timeoutMs === 0 ? null : AbortSignal.timeout(timeoutMs);
-        const combined = signal && timeout ? AbortSignal.any([signal, timeout]) : signal ?? timeout;
+        const deadline = timeoutSignal(timeoutMs);
+        const combinedScope = combineSignals([signal, deadline.signal]);
+        const combined = combinedScope.signal;
         try {
-            combined?.throwIfAborted();
+            throwIfAborted(combined);
             let correction;
             for (let attempt = 0; attempt < 2; attempt++) {
-                combined?.throwIfAborted();
+                throwIfAborted(combined);
                 const request = { purpose, system: correction ? `${system ?? ''}\n\n${correction}` : system, input: serializeAgentInput(input),
                     signal: combined, responseLength: auxiliaryResponseLength(purpose, input) };
                 const started = onAttempt?.({ ...request, attempt });
                 if (started && typeof started.then === 'function') await started;
-                combined?.throwIfAborted();
+                throwIfAborted(combined);
                 // Transport/length failures are outside the correction boundary.
                 const result = await untilAborted(this.generate(request), combined);
-                combined?.throwIfAborted();
+                throwIfAborted(combined);
                 try {
                     const accepted = await untilAborted(Promise.resolve().then(() => validate(parseObject(result))), combined);
-                    combined?.throwIfAborted();
+                    throwIfAborted(combined);
                     return accepted;
                 } catch (error) {
-                    combined?.throwIfAborted();
+                    throwIfAborted(combined);
                     if (attempt || !error.dwmResponseInvalid) throw error;
                     correction = '上一次结果未通过程序格式校验，未写入任何资料。请依据同一批原始输入重新返回符合本任务字段的完整 JSON 对象。不要解释或省略条目，不要把未完成的处理替换为空结果。';
                 }
             }
         } catch (error) {
             // A host may throw its own AbortError; preserve the caller's cancellation first.
-            signal?.throwIfAborted();
-            if (timeout?.aborted) throw new DOMException(`辅助模型请求已等待 ${timeoutMs / 1000} 秒，现已超时，迟到结果不会采用。可在“设置 → 辅助模型等待时间”提高上限或关闭插件限时后重试。`, 'TimeoutError');
+            throwIfAborted(signal);
+            if (deadline.signal?.aborted) throw new DOMException(`辅助模型请求已等待 ${timeoutMs / 1000} 秒，现已超时，迟到结果不会采用。可在“设置 → 辅助模型等待时间”提高上限或关闭插件限时后重试。`, 'TimeoutError');
             throw error;
-        }
+        } finally { combinedScope.dispose(); deadline.dispose(); }
     }
 }
 
@@ -235,16 +237,16 @@ export function compatibleConnection({ endpoint, model, apiKey = '', fetchImpl =
             body: JSON.stringify({ model, messages: [{ role: 'system', content: system }, { role: 'user', content: input }], stream: false,
                 ...(omitLength ? {} : { [lengthParameter]: boundedResponseLength(responseLength, null, { max_output_tokens: maxOutputTokens }) }) }), signal,
         });
-        signal?.throwIfAborted();
+        throwIfAborted(signal);
         if ([401, 403].includes(response.status)) throw modelApiError(null, response.status);
         let payload;
         try { payload = await response.json(); }
         catch {
-            signal?.throwIfAborted();
+            throwIfAborted(signal);
             if (!response.ok) throw modelApiError(null, response.status);
             throw new Error('辅助模型接口未返回有效的 JSON 响应。请检查辅助连接地址是否为兼容接口，再重试。');
         }
-        signal?.throwIfAborted();
+        throwIfAborted(signal);
         if (!response.ok || payload?.error) throw modelApiError(payload, response.ok ? undefined : response.status);
         assertCompleteModelResponse(payload);
         return payload?.choices?.[0]?.message?.content ?? '';
