@@ -1,3 +1,4 @@
+import { throwIfAborted, combineSignals } from '../platform/abort.js';
 import { sourceBookChanges } from '../core/source-book.js';
 import { presetSnapshot, PREFERENCE_SCAN, validatePreferenceCandidates, selectedPreferences, applyAuxiliaryPreferences } from '../agents/preset-preferences.js';
 import { MemoryStore } from '../core/store.js';
@@ -85,7 +86,7 @@ export class Controller {
             const metric = { task: request.purpose, at: new Date(start).toISOString(),
                 inputChars: request.system.length + serializedInput.length, outputChars: 0, ok: false };
             try {
-                request.signal?.throwIfAborted();
+                throwIfAborted(request.signal);
                 const validate = async result => {
                     metric.outputChars = JSON.stringify(result).length;
                     if (fallbackId) this.traces.update(fallbackId, { responseBody: result });
@@ -129,11 +130,13 @@ export class Controller {
     }
     #beginActivity(kind, label, { isCurrent = () => true, signal } = {}) {
         const abort = new AbortController();
+        const chatId = this.host.snapshot().chatId;
+        const cancellation = combineSignals([this.#abort.signal, abort.signal, signal]);
         const activity = { id: uid('activity'), kind, label, startedAt: Date.now(), phase: 'running', cancellable: true,
             stopLabel: kind === 'select' ? '停止本轮' : kind === 'maintain' || kind === 'compact' ? '停止整理' : '停止等待',
             hint: kind === 'select' ? '停止将结束本轮发送；已有记忆保留。' : this.#backgroundHint(),
-            abort, signal: AbortSignal.any([this.#abort.signal, abort.signal, ...(signal ? [signal] : [])]), isCurrent,
-            epoch: this.#epoch, chatId: this.host.snapshot().chatId };
+            abort, signal: cancellation.signal, dispose: cancellation.dispose, isCurrent,
+            epoch: this.#epoch, chatId };
         this.#activities.set(activity.id, activity); this.#notify();
         return activity;
     }
@@ -157,12 +160,14 @@ export class Controller {
         Object.assign(activity, patch); this.#notify();
     }
     #endActivity(activity) {
+        if (!activity) return;
+        activity?.dispose();
         if (this.#activities.get(activity?.id) !== activity) return;
         this.#activities.delete(activity.id); this.#notify();
     }
     #assertActivity(activity) {
         this.#assertCurrent(activity.epoch, activity.chatId);
-        activity.signal.throwIfAborted();
+        throwIfAborted(activity.signal);
         invariant(activity.isCurrent(), '本轮已停止或被新的发送替代');
     }
     async #saveActivity(activity, operation) {
@@ -404,7 +409,7 @@ export class Controller {
             ? this.#loading.promise : !matches(this.#loadedTarget) ? this.chatChanged() : null;
         if (loading) await loading;
         invariant(matches(this.host.snapshot()) && matches(this.#loadedTarget) && this.store?.state.chatId === target.chatId, '存档已切换或尚未载入，本次处理已作废');
-        this.#abort.signal.throwIfAborted();
+        throwIfAborted(this.#abort.signal);
         return { epoch: this.#epoch, signal: this.#abort.signal };
     }
     async whenCommitted() {
@@ -576,7 +581,7 @@ export class Controller {
     #state(status, error = '') { this.status = status; this.error = error; this.#notify(); }
     #assertCurrent(epoch, chatId) {
         invariant(epoch === this.#epoch && this.host.snapshot().chatId === chatId, '存档已切换，本次处理已作废');
-        this.#abort.signal.throwIfAborted();
+        throwIfAborted(this.#abort.signal);
     }
     async start() { await this.chatChanged(); return this; }
     async checkWorldbook() {
@@ -633,7 +638,7 @@ export class Controller {
         return loading.promise;
     }
     async #loadChat(loading) {
-        loading.abort.signal.throwIfAborted();
+        throwIfAborted(loading.abort.signal);
         invariant(this.#loading === loading && this.host.snapshot().chatId === loading.target.chatId
             && this.host.snapshot().bookName === loading.target.bookName, '存档已切换，本次载入已作废');
         this.store = null;
@@ -692,7 +697,7 @@ export class Controller {
     async #loadRules(epoch = this.#epoch, chatId = this.host.snapshot().chatId, signal = this.#abort.signal) {
         const raw = await untilAborted(this.host.loadWorldbook(), signal);
         this.#assertCurrent(epoch, chatId);
-        signal.throwIfAborted();
+        throwIfAborted(signal);
         this.rules = discoverRules(raw);
         this.compiledRules = compileRules(this.rules.script);
         this.sourceChanges = sourceBookChanges(this.store?.state, raw, this.rules.configEntryUids);
@@ -713,6 +718,7 @@ export class Controller {
         this.#abort = new AbortController();
         this.#epoch++;
         this.#initializing = false; this.#maintenance = null; this.#compacting = false; this.#nativeBypass = false;
+        for (const activity of this.#activities.values()) activity.dispose();
         this.#activities.clear();
         for (const release of this.#selectionWaiters) release();
         this.host.clearPlan();
@@ -851,14 +857,16 @@ export class Controller {
         const context = this.host.snapshot();
         invariant(context.templateEnabled, '请启用 ST-Prompt-Template');
         invariant(!this.store.state.data.scopeContext?.deferPost && !context.generating, '请等待本轮正文与状态保存完成，再开始初始化');
-        this.#initializing = true; this.host.clearPlan();
-        this.#autoPostPaused = false;
-        const activity = this.#beginActivity('initialize', '正在读取角色世界书');
-        const epoch = this.#epoch, signal = activity.signal;
-        const targetStore = this.store;
-        this.#initializationNotice('running', automatic ? '正在自动建立新档记忆' : '正在建立存档记忆');
-        this.#state('初始化中；继续发送将使用原生流程');
+        const epoch = this.#epoch, targetStore = this.store;
+        let activity, signal;
+        this.#initializing = true;
         try {
+            this.host.clearPlan();
+            this.#autoPostPaused = false;
+            activity = this.#beginActivity('initialize', '正在读取角色世界书');
+            signal = activity.signal;
+            this.#initializationNotice('running', automatic ? '正在自动建立新档记忆' : '正在建立存档记忆');
+            this.#state('初始化中；继续发送将使用原生流程');
             if (automatic && !targetStore.state.preferences?.autoInitialization) {
                 // Mark the first automatic attempt before spending a model call.
                 // Manual retries retain this marker and the already saved checkpoint.
@@ -1002,8 +1010,8 @@ export class Controller {
             return { executed: true, message: this.status };
         } catch (error) {
             if (epoch === this.#epoch) {
-                if (!signal.aborted) this.#state('初始化未完成，保留原资料', error.message);
-                this.#initializationNotice('retry', signal.aborted ? '初始化已停止，原资料保留；可手动重试' : `初始化未完成：${error.message}；可手动重试`, true);
+                if (!signal?.aborted) this.#state('初始化未完成，保留原资料', error.message);
+                this.#initializationNotice('retry', signal?.aborted ? '初始化已停止，原资料保留；可手动重试' : `初始化未完成：${error.message}；可手动重试`, true);
             }
             throw error;
         }
