@@ -1,11 +1,11 @@
 # 鱼忆安装、更新与恢复
 
-适用版本：0.1.0-alpha.5，实验性公测。此前已在隔离酒馆验证dev.11旧档／分支恢复、停用／卸载、本地Git重装和更新、成对备份回退，以及离线恢复工具。所有宿主响应均为本地合成，未使用真实模型或公网GitHub仓库。详细证据范围见 [变更说明](docs/public/CHANGELOG.md)。
+适用版本：0.1.0-alpha.6，实验性公测。此前已在隔离酒馆验证dev.11旧档／分支恢复、停用／卸载、本地Git重装和更新、成对备份回退，以及离线恢复工具。所有宿主响应均为本地合成，未使用真实模型或公网GitHub仓库。详细证据范围见 [变更说明](docs/public/CHANGELOG.md)。
 
 ## 准备
 
 1. 备份酒馆中要使用的角色、主绑定世界书及完整聊天。聊天可导出为原生 JSONL；只保存一段可见正文不能备份聊天元数据里的鱼忆记忆。重要存档同时保留酒馆数据目录备份。
-2. 安装并启用 [ST-Prompt-Template](https://github.com/zonde306/ST-Prompt-Template)，并确认其模板功能启用。已核对的隔离验证组合为 SillyTavern 1.19.0、ST-Prompt-Template 1.17.9。
+2. 安装并启用 [ST-Prompt-Template](https://github.com/zonde306/ST-Prompt-Template)，并确认其模板功能启用。已核对 SillyTavern 1.19.0、TT 2.3.0 macOS 和 Luker 2.8.0 的普通单角色聊天与聊天补全，均配合 ST-Prompt-Template 1.17.9。手机原生应用与 Agent 模式尚未验证。
 3. 确认辅助模型连接与费用。总开关、新存档默认启用，新开场档在资料与模型就绪后会自动调用模型初始化。已有剧情的旧档需要手动扫描。
 
 ## 离线安装候选包

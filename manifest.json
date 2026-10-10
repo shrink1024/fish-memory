@@ -6,7 +6,7 @@
   "js": "index.js",
   "css": "style.css",
   "author": "shrink1024",
-  "version": "0.1.0-alpha.5",
+  "version": "0.1.0-alpha.6",
   "homePage": "https://github.com/shrink1024/fish-memory",
   "generate_interceptor": "dwmFilterOutgoingHistory"
 }
