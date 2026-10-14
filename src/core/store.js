@@ -256,6 +256,26 @@ export class MemoryStore {
         next.rememberedKeys = [...new Set([...(next.rememberedKeys ?? []), ...rememberedKeys])];
         return this.#persist(next);
     }
+    /** Incremental source sync: replace changed baseline entries and record the
+     * live result as a commit at the current progress, so branches and
+     * rollbacks replay it like any other memory change. */
+    async syncSource({ base = {}, data = {}, removed = [] }, { expectedRevision }) {
+        return this.#queue.run(async () => {
+            invariant(this.state?.initialized, '请先完成初始化');
+            invariant(this.state.revision === expectedRevision, '资料在同步期间已变化，请重新同步');
+            const next = this.snapshot(), at = new Date().toISOString();
+            const nextData = clone(next.data);
+            for (const id of removed) { delete nextData.entries[id]; delete next.base.entries[id]; }
+            for (const [id, entry] of Object.entries(base)) next.base.entries[id] = createEntry(entry);
+            for (const [id, entry] of Object.entries(data)) nextData.entries[id] = createEntry(entry);
+            const sourceKeys = clone(next.processed);
+            next.journal.push({ id: uid('commit'), ...anchor(sourceKeys), patch: diffData(next.data, nextData), reason: 'source-sync', inventoryDisabledAt: next.inventoryDisabledAt });
+            next.audit.push(...auditChanges(next.data, nextData, 'source-sync', at));
+            next.audit = next.audit.slice(-this.auditLimit);
+            next.data = nextData;
+            return this.#persist(next);
+        });
+    }
     async reconcile(sourceKeys) {
         return this.#queue.run(async () => {
             invariant(this.state?.initialized, '请先初始化');
