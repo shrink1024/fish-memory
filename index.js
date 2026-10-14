@@ -44,8 +44,13 @@ async function boot() {
     };
     const extensionSettings = context.extensionSettings ?? (await import('/scripts/extensions.js')).extension_settings;
     const settings = extensionSettings.dwm ?? {};
+    const connectionStore = {
+        key: 'dwm:auxiliary-connection',
+        load() { return JSON.parse(globalThis.localStorage?.getItem(this.key) ?? 'null'); },
+        save(value) { if (value) globalThis.localStorage?.setItem(this.key, JSON.stringify(value)); else globalThis.localStorage?.removeItem(this.key); },
+    };
     const controller = new Controller(host, {
-        settings, traces,
+        settings, traces, connectionStore,
         persistSettings: createSettingsPersistence({ extensionSettings,
             saveSettings: async () => (await import('/script.js')).saveSettings(),
             getRequestHeaders: () => SillyTavern.getContext().getRequestHeaders(),

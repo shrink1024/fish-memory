@@ -60,6 +60,11 @@
 .dwm-bubble-status { font-size: 12px; line-height: 1.5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--dwm-float-muted); }
 .dwm-floating-bubble[data-state='busy'] { border-color: var(--dwm-float-accent); }
 .dwm-floating-bubble[data-state='attention'] .dwm-bubble-status { text-decoration: underline dotted; text-underline-offset: 3px; }
+.dwm-floating-root[data-bubble-size='compact'] .dwm-floating-bubble { width: 44px; height: 44px; min-width: 0; min-height: 0; padding: 0; justify-content: center; border-radius: 50%; }
+.dwm-floating-root[data-bubble-size='compact'] .dwm-bubble-copy { display: none; }
+.dwm-floating-root[data-bubble-size='compact'] .dwm-bubble-fish { flex-basis: 24px; width: 24px; height: 24px; }
+.dwm-floating-root[data-bubble-size='compact'] .dwm-floating-bubble[data-state='busy']::after,
+.dwm-floating-root[data-bubble-size='compact'] .dwm-floating-bubble[data-state='attention']::after { content: ''; position: absolute; top: 3px; right: 3px; width: 9px; height: 9px; border-radius: 50%; background: var(--dwm-float-accent); box-shadow: 0 0 0 2px var(--dwm-float-bg); }
 
 @media (max-width: 480px) {
     .dwm-management-chrome { padding-left: 12px; }
