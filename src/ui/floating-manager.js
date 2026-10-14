@@ -41,16 +41,25 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
         }
     }
     positionLabel.append(positionSelect);
+    // Players run several floating tools; the default bubble is a small icon.
+    const sizeLabel = make('label', 'dwm-bubble-position-label');
+    sizeLabel.append(make('span', 'dwm-visually-hidden', '收起后的气泡大小'));
+    const sizeSelect = make('select', 'dwm-bubble-position');
+    for (const [value, name] of [['compact', '气泡 · 小图标'], ['full', '气泡 · 带文字']]) {
+        const option = make('option', '', name); option.value = value; sizeSelect.append(option);
+    }
+    sizeLabel.append(sizeSelect);
     const closeButton = make('button', 'dwm-management-close'); closeButton.type = 'button';
     closeButton.setAttribute('aria-label', '收起鱼忆管理窗口'); closeButton.title = '收起，保留当前页面与草稿';
     closeButton.append(icon('M5 12h14'), make('span', '', '收起'));
-    chrome.append(heading, positionLabel, closeButton);
+    chrome.append(heading, positionLabel, sizeLabel, closeButton);
     const body = make('div', 'dwm-management-body'); panel.append(chrome, body); element.append(panel, bubble); doc.body.append(element);
 
     let opened = false, destroyed = false, opener = null, drag = null, suppressClick = false, observedComposer = null;
-    let dock = { edge: 'right', fraction: 0.65 };
+    let dock = { edge: 'right', fraction: 0.65, size: 'compact' };
     try { storage ??= win?.localStorage; const saved = JSON.parse(storage?.getItem(storageKey) ?? 'null');
-        if (['left', 'right'].includes(saved?.edge) && Number.isFinite(saved.fraction)) dock = { edge: saved.edge, fraction: clamp(saved.fraction, 0, 1) };
+        if (['left', 'right'].includes(saved?.edge) && Number.isFinite(saved.fraction)) dock = { ...dock, edge: saved.edge, fraction: clamp(saved.fraction, 0, 1) };
+        if (['compact', 'full'].includes(saved?.size)) dock.size = saved.size;
     } catch { /* Browser storage may be blocked; the manager remains usable. */ }
     const listeners = [], entries = new Set();
     const listen = (target, type, fn, options) => {
@@ -95,7 +104,7 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
             bubble.style.left = `${dock.edge === 'left' ? bounds.minX : bounds.maxX}px`;
             bubble.style.top = `${bounds.minY + dock.fraction * (bounds.maxY - bounds.minY)}px`;
         }
-        element.dataset.edge = dock.edge;
+        element.dataset.edge = dock.edge; element.dataset.bubbleSize = dock.size; sizeSelect.value = dock.size;
         // Scroll only our inner surface when a keyboard covers its focused field.
         const active = doc.activeElement;
         if (opened && active && body.contains(active)) {
@@ -141,7 +150,10 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
     listen(positionSelect, 'change', () => {
         const [edge, fraction] = positionSelect.value.split(':');
         if (!['left', 'right'].includes(edge) || !Number.isFinite(Number(fraction))) return;
-        dock = { edge, fraction: clamp(Number(fraction), 0, 1) }; save(); layout();
+        dock = { ...dock, edge, fraction: clamp(Number(fraction), 0, 1) }; save(); layout();
+    });
+    listen(sizeSelect, 'change', () => {
+        dock = { ...dock, size: sizeSelect.value === 'full' ? 'full' : 'compact' }; save(); layout();
     });
     listen(bubble, 'keydown', event => {
         if (!event.shiftKey || !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return;

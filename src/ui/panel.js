@@ -4,7 +4,7 @@ import { diffText } from './diff.js';
 import { createTraceViewer } from './trace-viewer.js';
 import { createPromptPreview } from './prompt-preview.js';
 import { createActivityIndicator } from './activity.js';
-import { DEFAULT_SETTINGS, MAINTENANCE_EVERY_MAX } from '../core/state.js';
+import { DEFAULT_SETTINGS, MAINTENANCE_EVERY_MAX, templateHint } from '../core/state.js';
 
 const KIND_NAMES = { fact: '世界资料', rule: '规则', npc: '人物', npc_pool: '路人', event: '事件', inventory: '物品' };
 const TASK_NAMES = { initialize: '扫描世界书', strategy: '统合记忆策略', maintain: '维护记忆', select: '本轮选材', compact: '整理事件' };
@@ -194,8 +194,8 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         if (notice) { const success = h('p', 'dwm-notice', notice); success.setAttribute('role', 'status'); feedback.append(success); }
         if (view.sourceChanges?.changed) {
             const changes = view.sourceChanges;
-            const warning = h('p', 'dwm-warning', `主世界书已变化：新增 ${changes.added.length} 条、修改 ${changes.updated.length} 条、删除 ${changes.removed.length} 条。当前动态资料仍以本档初始化时的旧书为基准。请先用酒馆导出聊天 JSONL 备份，再到设置重新扫描；成功前保留旧资料，选材失败时可明确选择按原书发送。`);
-            warning.setAttribute('role', 'status'); feedback.append(warning, button('查看重新扫描入口', () => navigate('settings'), { navigation: true }));
+            const warning = h('p', 'dwm-warning', `主世界书已变化：新增 ${changes.added.length} 条、修改 ${changes.updated.length} 条、删除 ${changes.removed.length} 条。当前动态资料仍以旧书为基准。点“只同步变化的条目”只扫描这些条目：剧情改过的条目会把新旧原书和当前版本一起交给模型合并，只调用少量模型；也可以备份后在设置里整本重新扫描。`);
+            warning.setAttribute('role', 'status'); feedback.append(warning, button('只同步变化的条目', () => call(() => controller.syncSourceChanges(), '原书变化已同步'), { primary: true, disabled: Boolean(view.activity) || !view.save?.initialized }), button('查看重新扫描入口', () => navigate('settings'), { navigation: true }));
         }
         shell.append(feedback);
         const content = h('div', 'dwm-content'); content.id = `${panelId}-content`; content.setAttribute('role', 'tabpanel'); content.setAttribute('aria-labelledby', `${panelId}-tab-${tab}`);
@@ -237,7 +237,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         const readiness = view.readiness ?? {};
         const checks = [['角色聊天', readiness.chat], ['角色绑定的主世界书', readiness.book], ['单角色聊天', readiness.single], ['ST-Prompt-Template 已启用', readiness.template]];
         const conditions = h('ul', 'dwm-readiness'); for (const [label, ready] of checks) conditions.append(h('li', ready ? 'dwm-muted' : 'dwm-warning', `${ready ? '✓' : '○'} ${label}`)); panel.append(conditions);
-        if (readiness.template === false) panel.append(h('p', 'dwm-muted', '请在酒馆扩展中安装并启用 ST-Prompt-Template，再打开此存档。'));
+        if (readiness.template === false) panel.append(h('p', 'dwm-warning', `${templateHint(readiness.templateStatus)}。`));
         renderWorldbookCheck(panel, view);
         if (view.initialization?.message) panel.append(h('p', view.initialization.retry ? 'dwm-warning' : 'dwm-muted', view.initialization.message));
         if (view.initializationResume) panel.append(h('p', 'dwm-notice', `已有扫描进度：世界书 ${view.initializationResume.classifiedBatches}/${view.initializationResume.totalBatches} 批，历史 ${view.initializationResume.processedCount} 条。再次扫描会先核对资料，继续仍有效的进度。`));
@@ -487,6 +487,12 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         const usage = card('日常使用');
         usage.append(toggle('插件总开关（所有存档）', Boolean(current.enabled), '关闭时所有存档暂停选材与自动维护，已有资料保留。', value => call(() => controller.updateSettings({ enabled: value }))));
         if (view.save) usage.append(toggle('启用此存档的记忆', view.saveEnabled !== false, '仅影响当前存档。初始化完成且总开关开启后生效。', value => call(() => controller.setSaveEnabled(value))));
+        const modeChoice = selectField('记忆范围', current.memoryMode === 'worldbook' ? 'worldbook' : 'full',
+            [['full', '完整记忆（世界书 + 故事脉络 + 事件 + 物品）'], ['worldbook', '仅动态世界书（只更新条目与按需选材）']],
+            value => call(() => controller.updateSettings({ memoryMode: value }), value === 'worldbook' ? '已切换为仅动态世界书' : '已切换为完整记忆'));
+        usage.append(modeChoice.wrap, h('p', 'dwm-muted', current.memoryMode === 'worldbook'
+            ? '仅动态世界书：只更新已有条目，不新增条目或晋升人物；不再维护和发送故事脉络、事件与物品，历史窗口不省略原文；已有资料保留，切回完整记忆即可继续使用。'
+            : '想只用动态世界书、关掉脉络与事件记忆时，可在这里切换。'));
         usage.append(toggle('由鱼忆管理历史窗口', Boolean(current.windowEnabled), '只在当次发送中省略已记入且超出近期范围的原文，不写入持久隐藏。与其他自动隐藏工具请只启用一方。', value => call(() => controller.updateSettings({ windowEnabled: value }))));
         if (view.window) usage.append(h('p', 'dwm-muted', `${Number.isInteger(view.window.omittedCount) ? `本轮已省略 ${view.window.omittedCount} 条旧原文。` : ''}${view.window.reason || ''}`));
         const rounds = field('保留最近几轮完整对话', recentTurnsDraft ?? current.recentTurns ?? 12, value => { recentTurnsDraft = value; }, { type: 'number' }); rounds.input.min = '1'; rounds.input.max = '1000';
@@ -517,6 +523,11 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         }, '维护频率已保存')),
             button('立即补记', () => call(() => controller.maintain(), '补记完成'), { disabled: !view.save?.initialized })));
         parent.append(cadence);
+        const concurrency = card('扫描速度', '建立记忆时，世界书分批扫描；同时发出几批会更快，但更容易触发接口的频率限制。遇到限流报错时可调回 1。');
+        concurrency.append(selectField('同时扫描的批数', String(current.scanConcurrency ?? DEFAULT_SETTINGS.scanConcurrency),
+            [['1', '1 批（逐批）'], ['2', '2 批'], ['3', '3 批（默认）'], ['4', '4 批'], ['6', '6 批']],
+            value => call(() => controller.updateSettings({ scanConcurrency: Number(value) }), '扫描速度已保存')).wrap);
+        parent.append(concurrency);
         renderTimeouts(parent, current);
         renderPreset(parent, view);
         renderConnection(parent, view);
@@ -570,7 +581,9 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         parent.append(panel);
     }
     function renderConnection(parent, view) {
-        const panel = card('辅助模型连接', '用于扫描、选材与维护。单独连接仅在本次页面有效；刷新后恢复沿用酒馆连接。');
+        const panel = card('辅助模型连接', '用于扫描、选材与维护。单独连接（含密钥）会保存在本浏览器，刷新后继续使用；换浏览器或清除站点数据后需重新填写。');
+        if (!connectionDraft.endpoint && view.connection?.endpoint) connectionDraft.endpoint = view.connection.endpoint;
+        if (!connectionDraft.model && view.connection?.model) connectionDraft.model = view.connection.model;
         if (view.connectionMode === 'test') { panel.append(h('p', 'dwm-notice', '演示模式 · 当前使用模拟模型，没有真实 API 请求。')); parent.append(panel); return; }
         const mode = connectionModeDraft ?? view.connectionMode?.mode ?? view.connectionMode ?? 'raw';
         panel.append(h('p', 'dwm-muted', `当前生效：${view.connectionMode === 'compatible' ? `单独接口 · ${view.connection?.model || '未指定模型'}` : '沿用酒馆连接'}。下方修改在应用后生效。`));
@@ -578,7 +591,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         if (mode === 'compatible') {
             panel.append(field('接口基础地址', connectionDraft.endpoint, value => { connectionDraft.endpoint = value; }, { placeholder: 'https://…/v1', hint: '鱼忆会在地址后添加 /chat/completions。' }).wrap,
                 field('模型名称', connectionDraft.model, value => { connectionDraft.model = value; }).wrap,
-                field('接口密钥', connectionDraft.apiKey, value => { connectionDraft.apiKey = value; }, { type: 'password', hint: view.connection?.hasApiKey ? '本页已有密钥；地址不变时留空可继续使用。更换地址需重新填写。' : '只用于本次连接，不写入存档。' }).wrap);
+                field('接口密钥', connectionDraft.apiKey, value => { connectionDraft.apiKey = value; }, { type: 'password', hint: view.connection?.hasApiKey ? '已保存密钥；地址不变时留空可继续使用。更换地址需重新填写。' : '只用于本次连接，不写入存档。' }).wrap);
         }
         if (view.activity) panel.append(h('p', 'dwm-muted', '任务正在运行，请先停止或等待完成，再应用连接。'));
         panel.append(button('应用连接', () => call(async () => {
