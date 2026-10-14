@@ -64,7 +64,7 @@ contentChars是整条正文长度，recentEvidenceCount是来源与近期原文�
 ${TASK_COMPLETION}`;
 
 export const COMPACT = `${COMMON}
-任务：整理已发生事件，缩短过长的常驻脉络与重复事件说明。按叙事影响取舍，保留仍有效的约定、关系形成原因、来源和历史身份。
+任务：整理已发生事件，缩短过长的常驻脉络与重复事件说明。常驻脉络超过 8000 字时，压缩到 6000 字以内。按叙事影响取舍，保留仍有效的约定、关系形成原因、来源和历史身份。
 仅在给定可写事件/资料内进行修改，不安排新剧情，不删除当前有效事实。可以将同一段事件的细节写得紧凑，但不得把历史写成当前状态。
 只返回一个JSON对象 {"operations":[...]}，无变化时返回 {"operations":[]}。每项允许以下三种格式，不得输出其他类型：
 {"type":"summary","text":"完整更新后的常驻脉络"}
@@ -73,4 +73,10 @@ update必须保留至少一个输入给出的evidence，expectedVersion等于该
 第三种是将同一阶段的至少两个自建事件整合为一个的mergeEvents。
 mergeEvents格式：{"type":"mergeEvents","sources":[{"id":"旧事件id","expectedVersion":1},{"id":"另一旧事件id","expectedVersion":2}],"targetId":"可选，必须为sources中的id","title":"合并后标题","intro":"一句话目录","retrieveWhen":"何时回查","text":"保留因果、重要约定和关系来历的紧凑详情","evidence":["来源key"]}。
 合并成功后原目录项收拢为一项；不要合并不相关事件，不丢仍有效承诺。只能合并mergeable=true的自建可写事件，不得合并原书来源条目。本次evidence只能使用输入给出的来源key，expectedVersion必须匹配。
+${TASK_COMPLETION}`;
+
+export const SOURCE_MERGE = `${COMMON}
+任务：角色卡作者更新了原世界书中的这些条目，而本存档的动态版本此前已根据剧情改写过。每条给出 oldSource（作者旧原文）、newSource（作者新原文，只给出可写片段；受保护片段不提供给你，由程序原样保留）与 current（本存档当前的动态正文）。
+请为每条重写 newSource 中 writable=true 的片段：以作者新原文为设定基础，保留 current 里由剧情造成、在新原文下仍然成立的变化；新原文改写或否定的设定以新原文为准；无法判断时以新原文为准并在 note 里说明。不得编造双方都没有的内容，不得改动 writable=false 片段。
+只返回一个JSON对象 {"entries":[{"id":"条目id","segments":[{"id":"可写片段id","text":"合并后的片段全文"}],"note":"可选，一句话说明取舍"}]}，每个输入条目各返回一项，segments 必须且只能包含该条目全部 writable=true 片段。
 ${TASK_COMPLETION}`;

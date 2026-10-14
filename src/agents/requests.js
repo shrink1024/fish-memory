@@ -22,11 +22,13 @@ export function strategyRequest(strategies, entries, naturalLanguage) {
 function referenceInstructions(memory) {
     return hasProtectedReferences(memory) ? { protectedReferences: '⟦鱼忆引用:…⟧ 是当前字段中已有文字的保留引用。继续使用该文字时原样保留编号；不要猜测内容、新造编号或移到其他字段。事件合并仅能在对应字段中沿用列明来源事件的引用。程序会在校验前还原。' } : {};
 }
+/** Player chose "仅动态世界书": keep the worldbook current, nothing else. */
+export const WORLDBOOK_ONLY_NOTE = '本存档使用“仅动态世界书”模式：只用 update 更新已有条目；不要新增条目或晋升人物，不要返回 create、promote、summary、inventory 或 mergeEvents。';
 export function maintainRequest(save, messages, scopeId = GLOBAL_SCOPE, observedState = null) {
     const memory = maintenanceView(save, scopeId, { includeProvenance: false });
     // Keep this projection's private reference capability for task validation;
     // serialized requests and diagnostics contain only the masked plain data.
-    return { purpose: 'maintain', system: MAINTAIN,
+    return { purpose: 'maintain', system: save.worldbookOnly ? `${MAINTAIN}\n${WORLDBOOK_ONLY_NOTE}` : MAINTAIN,
         input: { memory, ...referenceInstructions(memory), ...(observedState ? { observedState: clone(observedState) } : {}),
             messages: messages.filter(isReadableMessage).map(({ key, role, content }) => ({ key, role, content, scopeId })) } };
 }
