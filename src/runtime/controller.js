@@ -3,13 +3,13 @@ import { sourceBookChanges } from '../core/source-book.js';
 import { presetSnapshot, PREFERENCE_SCAN, validatePreferenceCandidates, selectedPreferences, applyAuxiliaryPreferences } from '../agents/preset-preferences.js';
 import { MemoryStore } from '../core/store.js';
 import { sha256Fingerprint } from '../core/fingerprint.js';
-import { DEFAULT_SETTINGS, MAINTENANCE_EVERY_MAX, normalizeTimeoutSettings, validTimeout, makeSourceEntry, entryText, normalizeScopeId, entryScope, scopeSummary, scopeInventory, readableScopes, GLOBAL_SCOPE } from '../core/state.js';
+import { DEFAULT_SETTINGS, MAINTENANCE_EVERY_MAX, templateHint, normalizeTimeoutSettings, validTimeout, makeSourceEntry, createEntry, sourceId, entryText, normalizeScopeId, entryScope, scopeSummary, scopeInventory, readableScopes, GLOBAL_SCOPE } from '../core/state.js';
 import { playerView, scopeRead, memoryMetrics } from '../core/views.js';
 import { clone, invariant, uid, isPrefix, SerialQueue } from '../core/util.js';
 import { planWindow } from '../core/window.js';
 import { applyMaintenance } from '../core/operations.js';
 import { AgentClient, compatibleConnection, untilAborted, serializeAgentInput } from '../agents/client.js';
-import { classifyEntries, alignStrategy, maintain, select, compact } from '../agents/tasks.js';
+import { classifyEntries, alignStrategy, maintain, select, compact, mergeSourceUpdates } from '../agents/tasks.js';
 import { discoverRules, compileRules, applyRules, evaluateRules } from '../rules/index.js';
 import { createTraceStore } from '../diagnostics/trace-store.js';
 import { buildPromptPreview } from '../diagnostics/prompt-preview.js';
@@ -21,6 +21,8 @@ export const batches = requestBatches;
 async function initializationFingerprint(value) {
     return sha256Fingerprint(JSON.stringify(value));
 }
+
+const SUMMARY_COMPACT_CHARS = 8000;
 
 export class Controller {
     #listeners = new Set();
@@ -52,7 +54,7 @@ export class Controller {
     #initializationContextFingerprint = '';
     #initializationClassificationFingerprint = '';
     #connectionConfig = null;
-    constructor(host, { model, traces = createTraceStore(), settings = {}, persistSettings = async () => {}, chooseFallback = async () => 'cancel' } = {}) {
+    constructor(host, { model, traces = createTraceStore(), settings = {}, persistSettings = async () => {}, chooseFallback = async () => 'cancel', connectionStore = null } = {}) {
         this.host = host; this.settings = { ...DEFAULT_SETTINGS, ...settings, ...normalizeTimeoutSettings(settings) };
         if (!Number.isInteger(this.settings.maintenanceEvery) || this.settings.maintenanceEvery < 1 || this.settings.maintenanceEvery > MAINTENANCE_EVERY_MAX) this.settings.maintenanceEvery = DEFAULT_SETTINGS.maintenanceEvery;
         // Player-only, page-lifetime diagnostics. Never include this in view/save/agent data.
@@ -66,6 +68,22 @@ export class Controller {
         this.diagnostics = { lastPlan: null, lastPreview: null, requests: [] };
         this.mvu = { enabled: false, available: false, status: 'disabled', fields: [], reason: '未启用只读协作' };
         this.client = model ? this.#instrument(model) : this.#client(request => host.rawGenerate(request));
+        // The player chose to keep the separate connection (key included) in
+        // this browser. A broken stored value falls back to ST's connection.
+        this.connectionStore = connectionStore;
+        if (!model) {
+            try {
+                const saved = connectionStore?.load?.();
+                if (saved?.mode === 'compatible' && saved.endpoint && saved.model) this.#applyConnection('compatible', saved);
+            } catch { /* Keep the ST connection when the stored value is unusable. */ }
+        }
+    }
+    #applyConnection(mode, { endpoint, model, apiKey = '' } = {}) {
+        const config = { endpoint: String(endpoint ?? '').trim().replace(/\/$/, ''), model: String(model ?? '').trim(), apiKey: String(apiKey ?? '') };
+        const client = this.#client(['raw', 'tavern'].includes(mode) ? request => this.host.rawGenerate(request) : compatibleConnection(config));
+        this.#connectionConfig = ['raw', 'tavern'].includes(mode) ? null : config;
+        this.connectionMode = mode; this.client = client;
+        return config;
     }
     #client(generate) {
         return this.#instrument(new AgentClient(generate, { getTimeouts: () => this.settings }));
@@ -77,7 +95,7 @@ export class Controller {
             const epoch = this.#epoch, start = Date.now();
             const serializedInput = serializeAgentInput(request.input);
             let trace = this.host.traceCapture?.register({ ...request, input: serializedInput });
-            const startFallback = input => this.traces.start({ source: '鱼忆', label: ({ initialize: '扫描世界书', strategy: '统合记忆策略', select: '前置选材', maintain: '后置维护', compact: '整理事件', preferences: '扫描预设偏好' })[request.purpose] ?? request.purpose,
+            const startFallback = input => this.traces.start({ source: '鱼忆', label: ({ initialize: '扫描世界书', strategy: '统合记忆策略', select: '前置选材', maintain: '后置维护', compact: '整理事件', preferences: '扫描预设偏好', sourceMerge: '合并原书更新' })[request.purpose] ?? request.purpose,
                 transport: this.connectionMode === 'test' ? 'test' : 'agent-boundary',
                 context: { chatId: this.host.snapshot().chatId },
                 request: { messages: [{ role: 'system', content: request.system }, { role: 'user', content: input }] },
@@ -261,6 +279,17 @@ export class Controller {
         return { source: 'MVU read-only observation', messageKey: latest.key,
             persistence: 'unverified', fields: clone(projection.fields) };
     }
+    #worldbookOnly() { return this.settings.memoryMode === 'worldbook'; }
+    /** Worldbook-only mode: agents and injection see no summary, events or
+     * inventory. Stored data is kept, so switching back restores them. */
+    #taskView(save) {
+        if (!this.#worldbookOnly() || !save) return save;
+        const view = clone(save);
+        view.worldbookOnly = true;
+        view.data.summary = ''; view.data.scopeSummaries = {}; view.data.inventoryEnabled = false;
+        for (const entry of Object.values(view.data.entries)) if (entry.kind === 'event') entry.enabled = false;
+        return view;
+    }
     #guarded(save) {
         const copy = clone(save);
         copy.data.entries = Object.fromEntries(applyRules(Object.values(copy.data.entries), this.compiledRules).entries.map(e => [e.id, e]));
@@ -361,7 +390,7 @@ export class Controller {
             if (!story.length || !String(story[0].content ?? '').trim()) {
                 this.#initializationNotice('waiting', '自动建档等待开场内容就绪'); return;
             }
-            if (!snapshot.templateEnabled) { this.#initializationNotice('waiting', '请启用 ST-Prompt-Template；就绪后自动建立新档记忆'); return; }
+            if (!snapshot.templateEnabled) { this.#initializationNotice('waiting', `${templateHint(snapshot.templateStatus)}；就绪后自动建立新档记忆`); return; }
             if (snapshot.generating || save.data.scopeContext?.deferPost) {
                 this.#initializationNotice('waiting', '本轮正在生成或保存，结束后检查新档初始化'); return;
             }
@@ -567,12 +596,12 @@ export class Controller {
             preset: { name: preset.name, available: Boolean(preset.entries.length),
                 stale: Boolean(this.store?.state.preferences?.preset && this.store.state.preferences.preset.fingerprint !== preset.fingerprint),
                 saved: clone(this.store?.state.preferences?.preset ?? null), draft: clone(this.#presetDraft) },
-            readiness: { chat: Boolean(snapshot.chatId), book: Boolean(snapshot.bookName), template: Boolean(snapshot.templateEnabled), single: !snapshot.group },
+            readiness: { chat: Boolean(snapshot.chatId), book: Boolean(snapshot.bookName), template: Boolean(snapshot.templateEnabled), templateStatus: snapshot.templateStatus ?? null, single: !snapshot.group },
             worldbook: this.host.worldbookStatus?.() ?? null,
             worldbookChecking: Boolean(this.#worldbookCheck && this.#worldbookCheck.target.chatId === snapshot.chatId && this.#worldbookCheck.target.bookName === snapshot.bookName),
             save: this.store?.state ? playerView(this.store.state) : null,
             sourceBook: this.store?.state?.bookName ?? '', connectionMode: this.connectionMode,
-            connection: { mode: this.connectionMode, model: this.#connectionConfig?.model ?? '', hasApiKey: Boolean(this.#connectionConfig?.apiKey) },
+            connection: { mode: this.connectionMode, endpoint: this.#connectionConfig?.endpoint ?? '', model: this.#connectionConfig?.model ?? '', hasApiKey: Boolean(this.#connectionConfig?.apiKey) },
             mvu: clone(this.mvu), diagnostics: { ...clone(this.diagnostics), memory: memoryMetrics(this.store?.state),
                 pendingCount: Math.max(0, this.host.snapshot().messages.length - (this.store?.state.processed.length ?? 0)) } };
     }
@@ -674,8 +703,9 @@ export class Controller {
             this.#initializationNotice('retry', '主世界书绑定已改变，请备份后重新扫描；成功前保留旧资料', true);
             return;
         }
+        let raw;
         try {
-            const raw = await this.#loadRules(epoch, snapshot.chatId);
+            raw = await this.#loadRules(epoch, snapshot.chatId);
             if (store.initializationCheckpoint()) {
                 this.#initializationSourceFingerprint = await initializationFingerprint({ raw, rules: this.rules });
                 this.#initializationContextFingerprint = await initializationFingerprint(this.#initializationInputs(store));
@@ -690,6 +720,8 @@ export class Controller {
         }
         if (store.state.initialized) await store.reconcile(snapshot.messages.map(m => m.key));
         this.#assertCurrent(epoch, snapshot.chatId);
+        // Replay can cross an incremental source sync; recheck before the window decides.
+        if (raw) this.sourceChanges = sourceBookChanges(store.state, raw, this.rules.configEntryUids);
         await this.#syncWindow();
         this.#state(store.state.initialized ? '可用' : '未初始化');
         if (this.settings.mvuEnabled) await this.refreshMvu();
@@ -709,7 +741,7 @@ export class Controller {
     async #assertSourceCurrent(activity) {
         await this.#loadRules(activity.epoch, activity.chatId, activity.signal);
         this.#assertActivity(activity);
-        invariant(!this.sourceChanges.changed, '原书已变化：请先导出聊天 JSONL 备份，再重新扫描；旧资料保留，旧处理结果不再采用。');
+        invariant(!this.sourceChanges.changed, '原书已变化：请在“资料”页点“只同步变化的条目”，或备份后重新扫描；旧资料保留，旧处理结果不再采用。');
     }
     cancel(reason = '本轮已取消，记忆未变', { keepLoading = false } = {}) {
         const cancelledInitialization = this.#initializing;
@@ -734,11 +766,9 @@ export class Controller {
         // forward an existing credential when changing to a different server.
         const normalizedEndpoint = endpoint?.trim().replace(/\/$/, '');
         const retainedKey = normalizedEndpoint && normalizedEndpoint === this.#connectionConfig?.endpoint ? this.#connectionConfig.apiKey : '';
-        const config = { endpoint: normalizedEndpoint, model, apiKey: apiKey || retainedKey };
-        const client = this.#client(['raw', 'tavern'].includes(mode) ? request => this.host.rawGenerate(request)
-            : compatibleConnection(config));
-        this.#connectionConfig = ['raw', 'tavern'].includes(mode) ? null : config;
-        this.connectionMode = mode; this.client = client;
+        const config = this.#applyConnection(mode, { endpoint: normalizedEndpoint, model, apiKey: apiKey || retainedKey });
+        try { this.connectionStore?.save?.(['raw', 'tavern'].includes(mode) ? null : { mode: 'compatible', ...config }); }
+        catch { this.#state('连接已更新；本机保存失败，刷新后需重新填写'); this.readinessChanged(); return; }
         this.#state('连接已更新');
         this.readinessChanged();
     }
@@ -760,6 +790,8 @@ export class Controller {
         const next = { ...this.settings, ...patch, timeoutSettingsVersion: 1 };
         if ('mvuFields' in patch) next.mvuBookName = this.host.snapshot().bookName;
         invariant(Number.isInteger(next.recentTurns) && next.recentTurns >= 1 && next.recentTurns <= 1000, '保留轮数应为 1–1000');
+        invariant(['full', 'worldbook'].includes(next.memoryMode), '记忆范围只能是完整记忆或仅动态世界书');
+        invariant(Number.isInteger(next.scanConcurrency) && next.scanConcurrency >= 1 && next.scanConcurrency <= 6, '扫描并发数应为 1–6');
         invariant(Number.isInteger(next.maintenanceEvery) && next.maintenanceEvery >= 1 && next.maintenanceEvery <= MAINTENANCE_EVERY_MAX, `自动维护间隔应为 1–${MAINTENANCE_EVERY_MAX} 次 AI 回复`);
         for (const key of ['timeoutMs', 'initializationTimeoutMs']) {
             invariant(validTimeout(next[key]), '辅助模型等待时间应为 0（关闭插件限时）或 1000–86400000 毫秒的整数');
@@ -787,7 +819,7 @@ export class Controller {
         if ((this.#initializing && !duringInitialization) || this.#nativeBypass || snapshot.chatId !== this.store?.state?.chatId) return;
         const remembered = new Set(this.store.state.rememberedKeys ?? []);
         const actions = planWindow(snapshot.messages, this.store.state.processed, {
-            enabled: this.#enabled() && !this.sourceChanges.changed && this.settings.windowEnabled && this.#hasNarrativeMemory(this.store.state), recentTurns: this.settings.recentTurns,
+            enabled: this.#enabled() && !this.sourceChanges.changed && this.settings.windowEnabled && !this.#worldbookOnly() && this.#hasNarrativeMemory(this.store.state), recentTurns: this.settings.recentTurns,
             canOmit: message => this.#scopeRemembered(this.store.state, message, remembered),
         });
         if (actions.length) await this.host.applyWindow(actions);
@@ -855,7 +887,7 @@ export class Controller {
         invariant(this.store, '请先打开角色聊天');
         invariant(!this.#initializing && !this.#maintenance, '已有处理正在运行');
         const context = this.host.snapshot();
-        invariant(context.templateEnabled, '请启用 ST-Prompt-Template');
+        invariant(context.templateEnabled, templateHint(context.templateStatus));
         invariant(!this.store.state.data.scopeContext?.deferPost && !context.generating, '请等待本轮正文与状态保存完成，再开始初始化');
         const epoch = this.#epoch, targetStore = this.store;
         let activity, signal;
@@ -923,15 +955,31 @@ export class Controller {
                 }));
                 this.#initializationContextFingerprint = inputFingerprint;
             };
+            // Book batches are independent: keep a few in flight, but accept and
+            // checkpoint them strictly in order so progress stays a contiguous
+            // prefix and one slow batch never holds back saving finished ones.
+            const wave = Math.max(1, Math.min(6, Number.isInteger(this.settings.scanConcurrency) ? this.settings.scanConcurrency : 1));
+            const inFlight = new Map();
+            let nextBatch = checkpoint.classifiedBatches;
+            const launch = () => {
+                while (nextBatch < groups.length && inFlight.size < wave) {
+                    const index = nextBatch++;
+                    const request = classifyEntries(this.client, groups[index], this.rules.naturalLanguage, signal);
+                    request.catch(() => {}); // Observed in order below; never an unhandled rejection.
+                    inFlight.set(index, request);
+                }
+            };
+            launch();
             for (let i = checkpoint.classifiedBatches; i < groups.length; i++) {
                 this.progress = { stage: '扫描世界书', done: i, total: groups.length }; this.#notify();
                 this.#updateActivity(activity, { label: `扫描世界书 ${i + 1}/${groups.length}` });
-                const result = await classifyEntries(this.client, groups[i], this.rules.naturalLanguage, signal);
+                const result = await inFlight.get(i); inFlight.delete(i);
                 this.#assertActivity(activity); assertSettings();
                 classified.push(...result.entries); strategies.push(result.strategy);
                 checkpoint = { ...checkpoint, stage: i + 1 === groups.length ? 'strategy' : 'classification',
                     classifiedBatches: i + 1, classification: { entries: classified, strategies } };
                 await saveClassification();
+                launch();
             }
             const ruled = applyRules(classified, this.compiledRules);
             this.constraints = ruled.constraints;
@@ -1048,7 +1096,7 @@ export class Controller {
                 observedState = this.#observedState(projection, this.host.snapshot(), batch);
             }
             const readable = batch.filter(isReadableMessage);
-            const result = readable.length ? await maintain(this.client, this.#guarded(before), readable, signal, scopeId, observedState,
+            const result = readable.length ? await maintain(this.client, this.#taskView(this.#guarded(before)), readable, signal, scopeId, observedState,
                 candidate => this.#validateGuarded(before, candidate, readable.map(m => m.key), scopeId)) : { operations: [] };
             this.#assertActivity(activity);
             if (store === this.store) await this.#afterSelection(activity);
@@ -1097,7 +1145,7 @@ export class Controller {
             this.#state('正在维护');
             try {
                 await this.#loadRules(epoch, store.state.chatId, signal);
-                invariant(!this.sourceChanges.changed, '原书已变化：请先导出聊天备份，再在设置中重新扫描；旧动态资料保留。');
+                invariant(!this.sourceChanges.changed, '原书已变化：请在“资料”页点“只同步变化的条目”，或备份后在设置中重新扫描；旧动态资料保留。');
                 const messages = this.host.snapshot().messages;
                 await this.#saveActivity(activity, () => store.reconcile(messages.map(m => m.key)));
                 await this.#processBatches(store, messages, signal, activity);
@@ -1240,7 +1288,7 @@ export class Controller {
     async #buildPlan(activity, { readSnapshot = () => this.host.snapshot(), project = false } = {}) {
         invariant(this.store?.state.initialized, '请先完成初始化');
         this.#assertActivity(activity);
-        invariant(!this.sourceChanges.changed, '原书已变化：请先导出聊天备份并重新扫描，或选择本轮按原世界书发送。');
+        invariant(!this.sourceChanges.changed, '原书已变化：请先在“资料”页同步变化的条目，或选择本轮按原世界书发送。');
         const snapshot = readSnapshot(), save = project ? this.store.project(snapshot.messages.map(m => m.key)) : this.store.snapshot();
         const scopes = readableScopes(save.data.scopeContext);
         const eligible = entry => scopes.has(entryScope(entry)) && (this.host.eligible ? this.host.eligible(entry, snapshot) : entry.enabled);
@@ -1248,14 +1296,14 @@ export class Controller {
         const projection = this.settings.mvuEnabled ? await untilAborted(this.refreshMvu(), activity.signal) : null;
         this.#assertActivity(activity);
         const observedState = this.#observedState(projection, snapshot, recent);
-        const ids = await select(this.client, save, recent, { eligible, selectionLimit: this.settings.selectionLimit,
+        const ids = await select(this.client, this.#taskView(save), recent, { eligible, selectionLimit: this.settings.selectionLimit,
             selectionChars: this.settings.selectionChars, observedState, signal: activity.signal });
         this.#assertActivity(activity);
         await this.#assertSourceCurrent(activity);
         invariant(save.revision === this.store.state.revision, '选材期间资料更新，请重试本轮');
         invariant(JSON.stringify(snapshot.messages.map(m => m.key)) === JSON.stringify(readSnapshot().messages.map(m => m.key)), '选材期间剧情候选已变化，请重试本轮');
         return { requestId: uid('request'), chatId: snapshot.chatId, mvu: observedState,
-            ...assemblePromptPlan(save, ids, { eligible, compiledRules: this.compiledRules, configEntryUids: this.rules.configEntryUids }) };
+            ...assemblePromptPlan(this.#taskView(save), ids, { eligible, compiledRules: this.compiledRules, configEntryUids: this.rules.configEntryUids }) };
     }
 
     async generationBefore({ type, dryRun, isCurrent = () => true, signal } = {}) {
@@ -1293,7 +1341,7 @@ export class Controller {
                     // Restore that text when the projected summary no longer
                     // certifies it, before ST builds the outgoing history.
                     const actions = planWindow(snapshot.messages, projected.processed, {
-                        enabled: this.settings.windowEnabled && this.#hasNarrativeMemory(projected), recentTurns: this.settings.recentTurns,
+                        enabled: this.settings.windowEnabled && !this.#worldbookOnly() && this.#hasNarrativeMemory(projected), recentTurns: this.settings.recentTurns,
                         canOmit: message => this.#scopeRemembered(projected, message, remembered),
                     });
                     if (actions.length) await this.#saveActivity(activity, () => this.host.applyWindow(actions));
@@ -1326,7 +1374,7 @@ export class Controller {
         const prepare = type === 'continue' || type === 'append' || type === 'appendFinal'
             ? this.store.reconcile(this.host.snapshot().messages.slice(0, -1).map(m => m.key)) : Promise.resolve();
         prepare.then(() => epoch === this.#epoch && this.maintain({ automatic: true })).then(() => {
-            if (epoch === this.#epoch && !this.#autoPostPaused && this.#shouldCompact()) this.compact().catch(() => {});
+            if (epoch === this.#epoch && !this.#autoPostPaused && !this.#worldbookOnly() && this.#shouldCompact()) this.compact().catch(() => {});
         }).catch(() => {});
     }
     generationStopped() {
@@ -1353,11 +1401,91 @@ export class Controller {
     messageSwiped() { this.#storyChanged(); }
     messageDeleted() { this.#storyChanged(); }
     messageSwipeDeleted() { this.#storyChanged(); }
+    /** Bring changed source entries into this save without a full rescan.
+     * New entries are classified; entries the story never touched take the new
+     * source; entries both the author and the story changed are merged by the
+     * model from the old source, the new source and the current version.
+     * Protected text is never sent. Removed entries are dropped. */
+    async syncSourceChanges() {
+        invariant(this.store?.state.initialized && !this.#initializing, '请先完成初始化');
+        invariant(!this.view().activity, '请等待当前任务完成后再同步原书');
+        const activity = this.#beginActivity('sync', '正在核对原书变化');
+        const { epoch, signal } = activity, store = this.store;
+        this.#state('正在同步原书变化');
+        try {
+            const raw = await this.#loadRules(epoch, activity.chatId, signal);
+            const state = store.snapshot(), book = state.bookName;
+            const config = new Set(this.rules.configEntryUids.map(String));
+            const current = new Map(raw.filter(entry => !config.has(String(entry.uid))).map(entry => [String(entry.uid), entry]));
+            const bySource = entries => new Map(Object.values(entries).filter(entry => entry.source).map(entry => [String(entry.source.uid), entry]));
+            const live = bySource(state.data.entries), baseline = bySource(state.base.entries);
+            const removed = [...new Set([...live.keys(), ...baseline.keys()])].filter(uid => !current.has(uid))
+                .map(uid => (live.get(uid) ?? baseline.get(uid)).id);
+            const base = {}, data = {}, classify = [], textChanged = new Map();
+            for (const [uid, entry] of current) {
+                const used = live.get(uid), old = baseline.get(uid) ?? used;
+                if (!used && !old) { classify.push(makeSourceEntry(book, entry)); continue; }
+                const sameText = (used ?? old).source.original === (entry.content ?? '');
+                const sameMeta = JSON.stringify((used ?? old).source.metadata) === JSON.stringify(entry);
+                if (sameText && sameMeta && old.source.original === used?.source.original) continue;
+                if (sameText) {
+                    // Metadata only (keys, order, toggles): no model call.
+                    const refresh = item => item && createEntry({ ...item, title: entry.comment || item.title, enabled: !entry.disable, constant: entry.constant,
+                        source: { ...item.source, metadata: clone(entry) } });
+                    if (used) data[used.id] = { ...refresh(used), version: used.version + 1 };
+                    if (baseline.get(uid)) base[old.id] = refresh(baseline.get(uid));
+                    continue;
+                }
+                classify.push(makeSourceEntry(book, entry)); // The old version this live entry was derived from (after a rollback the baseline may already be newer).
+                const derived = baseline.get(uid)?.source.original === used?.source.original ? baseline.get(uid) : null;
+                textChanged.set(sourceId(book, entry.uid), { used, old: derived });
+            }
+            const classified = [];
+            const groups = batches(classify, this.settings.batchChars, entryText, INITIALIZATION_BATCH_ITEMS);
+            for (let i = 0; i < groups.length; i++) {
+                this.#updateActivity(activity, { label: `扫描变化条目 ${i + 1}/${groups.length}` });
+                const result = await classifyEntries(this.client, groups[i], this.rules.naturalLanguage, signal);
+                this.#assertActivity(activity);
+                classified.push(...result.entries);
+            }
+            const ruled = applyRules(classified, this.compiledRules).entries;
+            const merges = [];
+            for (const next of ruled) {
+                const change = textChanged.get(next.id);
+                base[next.id] = next;
+                const writable = entry => (entry?.segments ?? []).filter(segment => segment.writable).map(segment => segment.text).join('');
+                const touched = change?.used && entryText(change.used) !== change.used.source.original;
+                if (touched && next.segments.some(segment => segment.writable)) {
+                    merges.push({ id: next.id, title: next.title, current: writable(change.used), next, used: change.used,
+                        oldSource: change.old ? writable(change.old) : change.used.segments.every(segment => segment.writable) ? change.used.source.original : '' });
+                } else data[next.id] = { ...next, version: (change?.used?.version ?? 0) + 1 };
+            }
+            if (merges.length) {
+                this.#updateActivity(activity, { label: `合并 ${merges.length} 条剧情改过的条目` });
+                const merged = await mergeSourceUpdates(this.client, merges, signal);
+                this.#assertActivity(activity);
+                for (const item of merged) {
+                    const source = merges.find(entry => entry.id === item.id);
+                    data[item.id] = { ...source.next, segments: item.segments, version: source.used.version + 1,
+                        evidence: clone(source.used.evidence ?? []), lineage: clone(source.used.lineage ?? []) };
+                }
+            }
+            await this.#saveActivity(activity, () => store.syncSource({ base, data, removed }, { expectedRevision: state.revision }));
+            this.#assertActivity(activity);
+            this.sourceChanges = sourceBookChanges(store.state, raw, this.rules.configEntryUids);
+            const summary = `原书已同步：新增 ${classify.length - textChanged.size} 条，更新 ${Object.keys(data).length - (classify.length - textChanged.size)} 条（其中 ${merges.length} 条与剧情合并），删除 ${removed.length} 条`;
+            this.#state(summary);
+            return { executed: true, message: summary };
+        } catch (error) {
+            if (epoch === this.#epoch && !signal.aborted) this.#state('原书同步未完成，原资料保留', error.message);
+            throw error;
+        } finally { this.#endActivity(activity); }
+    }
     async manual(action) {
         invariant(this.store?.state.initialized && !this.#initializing, '请先完成初始化');
         if (action.type === 'reset') {
             await this.#loadRules();
-            invariant(!this.sourceChanges.changed, '原书已变化，旧基准不能当作新版重置；请先备份并重新扫描。');
+            invariant(!this.sourceChanges.changed, '原书已变化，旧基准不能当作新版重置；请先同步变化的条目。');
         }
         const entry = this.store.state.data.entries[action.id];
         if (entry && ['edit', 'classify'].includes(action.type)) {
@@ -1410,6 +1538,7 @@ export class Controller {
     }
     async compact() {
         invariant(this.store?.state.initialized, '请先初始化');
+        if (this.#worldbookOnly()) return { executed: false, reason: '仅动态世界书模式不整理脉络与事件' };
         if (this.#compacting || this.#initializing || this.#selecting() || this.store.state.data.scopeContext?.deferPost) return { executed: false, reason: '当前任务尚未结束，稍后可整理事件' };
         this.#compacting = true;
         const activity = this.#beginActivity('compact', '后置正在整理历史事件');
@@ -1420,7 +1549,7 @@ export class Controller {
         this.#state('正在整理历史事件');
         try {
             await this.#loadRules(epoch, base.chatId, activity.signal);
-            invariant(!this.sourceChanges.changed, '原书已变化，请先备份并重新扫描。');
+            invariant(!this.sourceChanges.changed, '原书已变化，请先同步变化的条目。');
             const result = await compact(this.client, this.#guarded(base), activity.signal, scopeId);
             this.#assertActivity(activity);
             await this.#assertSourceCurrent(activity);
@@ -1455,6 +1584,7 @@ export class Controller {
             || Object.hasOwn(j.patch.scopeChanges?.scopeSummaries ?? {}, scopeId)
             || Object.values(j.patch.entries).some(entry => entry && entryScope(entry) === scopeId && entry.kind === 'event');
         return { count: commits.filter(related).length, cycles: commits.length, commitId: commits.at(-1)?.id ?? null,
+            summaryChars: scopeSummary(state.data, scopeId).length,
             size: scopeSummary(state.data, scopeId).length + Object.values(state.data.entries)
                 .filter(e => e.enabled && entryScope(e) === scopeId && e.kind === 'event' && e.segments.some(s => s.writable)).reduce((n, e) => n + entryText(e).length, 0) };
     }
@@ -1471,7 +1601,10 @@ export class Controller {
         const attempt = this.#compactAttempts.get(scopeId);
         if (attempt && this.store.state.journal.some(commit => commit.id === attempt.commitId)
             && current.cycles >= attempt.cycles && current.cycles - attempt.cycles < 3) return false;
+        // Every maintenance rewrites the whole summary; keep it short enough to
+        // fit an ordinary output budget before it truncates every later batch.
         return current.count - last.count >= this.settings.compactEvery
-            || (current.size >= this.settings.compactChars && current.size >= Math.max(1, last.size * 1.25));
+            || (current.size >= this.settings.compactChars && current.size >= Math.max(1, last.size * 1.25))
+            || (current.summaryChars >= SUMMARY_COMPACT_CHARS && current.summaryChars >= Math.max(1, (last.summaryChars ?? 0) * 1.1));
     }
 }
