@@ -68,7 +68,8 @@ test('current and requested scopes bound catalog, mandatory NPCs and native cons
     assert.match(prepared.details, /A的老朋友/); assert.match(prepared.details, /B的老朋友/);
     assert.equal(c.store.state.data.scopeContext.activeScopeId, 'B');
     // Even a future scoped source with native constant semantics cannot escape filtering.
-    c.store.state.data.entries.cross = entry('cross', 'C', { constant: true, source: { book: 'main', uid: 99 } });
+    // Reuse a real source so the injected entry stays consistent with the book (source-change detection compares live sources too).
+    c.store.state.data.entries.cross = entry('cross', 'C', { constant: true, source: structuredClone(c.store.state.data.entries['source:main:1'].source) });
     const guarded = await c.previewPlan();
     assert.equal(guarded.entries.find(e => e.id === 'cross').enabled, false);
     assert.equal(guarded.selectedIds.includes('cross'), false);

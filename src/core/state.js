@@ -8,6 +8,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
     inventoryEnabled: true,
     windowEnabled: true,
+    // 'worldbook' keeps only dynamic entries plus selection: no summary, events or inventory.
+    memoryMode: 'full',
+    // Independent worldbook classification batches sent at the same time.
+    scanConcurrency: 3,
     recentTurns: 12,
     batchChars: 18000,
     maintenanceEvery: 3,
@@ -157,4 +161,14 @@ export function assertOriginalPreserved(before, after) {
     for (const [id, entry] of Object.entries(before.entries)) {
         if (entry.source) invariant(JSON.stringify(entry.source) === JSON.stringify(after.entries[id]?.source), '维护不能修改原书基准');
     }
+}
+
+/** Player-facing reason the Prompt Template dependency is not ready. */
+export function templateHint(status) {
+    return ({
+        disabled: '提示词模板（ST-Prompt-Template）在扩展管理里被停用了，请勾选启用后刷新酒馆',
+        'switch-off': '提示词模板已加载，但它自己设置里的“是否启用扩展”是关着的，请打开该开关',
+        'not-loaded': '已找到提示词模板，但它没有成功加载，请刷新酒馆；仍不行就按帖首重新安装',
+        missing: '没有检测到提示词模板（ST-Prompt-Template），请先安装并启用，再刷新酒馆',
+    })[status] ?? '请安装并启用提示词模板（ST-Prompt-Template）';
 }

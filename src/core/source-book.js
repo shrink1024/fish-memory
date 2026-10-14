@@ -18,15 +18,19 @@ function comparableMetadata(entry) {
 }
 export function sourceBookChanges(save, raw, configEntryUids = []) {
     if (!save?.initialized) return { changed: false, added: [], removed: [], updated: [] };
-    const baseline = new Map(Object.values(save.base.entries).filter(entry => entry.source).map(entry => [String(entry.source.uid), entry.source]));
+    const sources = entries => new Map(Object.values(entries ?? {}).filter(entry => entry?.source).map(entry => [String(entry.source.uid), entry.source]));
+    // An incremental sync updates the baseline and is replayed like any commit.
+    // Rolling back across it restores the old live sources, so check both.
+    const baseline = sources(save.base.entries), live = sources(save.data?.entries);
     const config = new Set(configEntryUids.map(String));
     const current = new Map(raw.filter(entry => !config.has(String(entry.uid))).map(entry => [String(entry.uid), entry]));
     const added = [], removed = [], updated = [];
+    const differs = (old, entry) => old.original !== (entry.content ?? '') || JSON.stringify(comparableMetadata(old.metadata)) !== JSON.stringify(comparableMetadata(entry));
     for (const [uid, entry] of current) {
-        const old = baseline.get(uid);
-        if (!old) added.push(String(entry.comment || uid));
-        else if (old.original !== (entry.content ?? '') || JSON.stringify(comparableMetadata(old.metadata)) !== JSON.stringify(comparableMetadata(entry))) updated.push(String(entry.comment || uid));
+        const old = baseline.get(uid), used = live.get(uid);
+        if (!old && !used) added.push(String(entry.comment || uid));
+        else if ((old && differs(old, entry)) || (used && differs(used, entry)) || !old) updated.push(String(entry.comment || uid));
     }
-    for (const [uid, old] of baseline) if (!current.has(uid)) removed.push(String(old.metadata?.comment || uid));
+    for (const uid of new Set([...baseline.keys(), ...live.keys()])) if (!current.has(uid)) removed.push(String((baseline.get(uid) ?? live.get(uid)).metadata?.comment || uid));
     return { changed: Boolean(added.length || removed.length || updated.length), added, removed, updated };
 }

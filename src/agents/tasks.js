@@ -3,6 +3,7 @@ import { createEntry, entryText, GLOBAL_SCOPE } from '../core/state.js';
 import { initializeRequest, strategyRequest, maintainRequest, selectRequest, compactRequest } from './requests.js';
 import { sourceSegments } from './source-segments.js';
 import { restoreProtectedReferences } from '../core/views.js';
+import { SOURCE_MERGE } from './prompts.js';
 
 // The controller keeps the trace open until task validation finishes. Simple
 // standalone clients can still execute the same task without diagnostics.
@@ -53,6 +54,9 @@ export async function maintain(client, save, messages, signal, scopeId = GLOBAL_
     return completeTask(client, { ...request, signal }, result => {
         invariant(Array.isArray(result.operations), '后置维护须返回 operations 操作列表；无变化时返回空数组');
         const restored = restoreProtectedReferences(result, request.input.memory);
+        // Worldbook-only saves never keep narrative memory; ignore such operations
+        // instead of failing the batch (the history window does not trim here).
+        if (save.worldbookOnly) restored.operations = restored.operations.filter(op => op?.type === 'update');
         validate(restored);
         return restored;
     });
@@ -77,5 +81,26 @@ export async function compact(client, save, signal, scopeId = GLOBAL_SCOPE) {
         const ids = new Set(memory.entries.map(e => e.id));
         invariant(result.operations.every(op => op.type === 'summary' || (op.type === 'mergeEvents' ? Array.isArray(op.sources) && op.sources.every(source => ids.has(source.id)) : ids.has(op.id))), '整理不得修改当前事实或未提供的条目');
         return restoreProtectedReferences(result, memory);
+    });
+}
+
+/** Author changed source entries that this save had already rewritten from the
+ * story. The model merges each one; protected segments stay the new source. */
+export async function mergeSourceUpdates(client, items, signal) {
+    const input = { entries: items.map(({ id, title, oldSource, next, current }) => ({ id, title, oldSource, current,
+        newSource: next.segments.filter(segment => segment.writable).map(segment => ({ id: segment.id, writable: segment.writable, text: segment.text })) })) };
+    return completeTask(client, { purpose: 'sourceMerge', system: SOURCE_MERGE, input, signal }, result => {
+        invariant(Array.isArray(result.entries) && result.entries.length === items.length, '原书合并没有覆盖全部条目');
+        const outputs = new Map(result.entries.map(item => [item?.id, item]));
+        return items.map(({ id, next }) => {
+            const item = outputs.get(id);
+            invariant(item && Array.isArray(item.segments), `原书合并漏掉了条目 ${id}`);
+            const writable = next.segments.filter(segment => segment.writable).map(segment => segment.id);
+            const texts = new Map(item.segments.map(segment => [segment?.id, segment?.text]));
+            invariant(texts.size === writable.length && writable.every(segmentId => typeof texts.get(segmentId) === 'string'),
+                '原书合并须返回该条目全部可写片段，且不得包含受保护片段');
+            const segments = next.segments.map(segment => segment.writable ? { ...segment, text: plainText(texts.get(segment.id), '合并片段', 200000) } : segment);
+            return { id, segments, note: typeof item.note === 'string' ? item.note.slice(0, 500) : '' };
+        });
     });
 }

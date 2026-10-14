@@ -128,7 +128,25 @@ export function auxiliaryResponseLength(purpose, input = {}) {
     }
     if (['strategy', 'preferences'].includes(purpose)) return 4096;
     if (purpose === 'initialize') return Math.max(4096, Math.min(8192, (input?.entries?.length ?? 14) * 512 + 1024));
+    if (['maintain', 'compact'].includes(purpose)) return memoryRewriteLength(input?.memory);
+    if (purpose === 'sourceMerge') {
+        const chars = (input?.entries ?? []).reduce((sum, entry) => sum + (entry?.newSource ?? []).filter(segment => segment?.writable)
+            .reduce((n, segment) => n + String(segment.text ?? '').length, 0) + String(entry?.current ?? '').length, 0);
+        return Math.max(4096, Math.min(MEMORY_REWRITE_MAX_TOKENS, 2048 + Math.ceil(chars * 1.3)));
+    }
     return 8192;
+}
+
+/** Maintenance and compaction rewrite the whole summary and any updated
+ * segment in full. CJK text runs near one token per character, so a fixed
+ * 8192 tokens truncates long-running chats. Budget for the summary plus the
+ * largest writable segments, still bounded by explicit model output caps. */
+export const MEMORY_REWRITE_MAX_TOKENS = 32768;
+export function memoryRewriteLength(memory) {
+    const summary = String(memory?.summary ?? '').length;
+    const segments = (memory?.entries ?? []).flatMap(entry => (entry?.segments ?? []).map(segment => String(segment?.text ?? '').length))
+        .sort((a, b) => b - a).slice(0, 3).reduce((sum, value) => sum + value, 0);
+    return Math.max(8192, Math.min(MEMORY_REWRITE_MAX_TOKENS, 2048 + Math.ceil((summary + segments) * 1.3)));
 }
 
 /** Only explicit output metadata is a hard bound. Context length is not one. */
@@ -180,7 +198,7 @@ export class AgentClient {
         throwIfAborted(signal);
         // Read settings once for this request. Saving new limits does not alter work already in flight.
         const current = this.getTimeouts?.();
-        const longTask = ['initialize', 'strategy', 'maintain', 'compact'].includes(purpose);
+        const longTask = ['initialize', 'strategy', 'maintain', 'compact', 'sourceMerge'].includes(purpose);
         const timeoutMs = longTask ? current?.initializationTimeoutMs ?? this.initializationTimeoutMs : current?.timeoutMs ?? this.timeoutMs;
         invariant(validTimeout(timeoutMs), '辅助模型等待时间应为 0（关闭插件限时）或 1000–86400000 毫秒的整数');
         const deadline = timeoutSignal(timeoutMs);
