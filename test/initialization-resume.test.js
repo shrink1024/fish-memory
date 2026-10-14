@@ -46,7 +46,9 @@ test('scope commits keep accepted worldbook batches across stopping and reopenin
     } });
     f.book.push({ uid: 3, comment: '第三批', content: '第三批世界书正文' });
     await f.controller.start(); const scanning = f.controller.initialize(); scanning.catch(() => {});
-    for (let i = 0; i < 80 && f.calls.filter(call => call.purpose === 'initialize').length < 3; i++) await tick();
+    // Batches may run concurrently; finished ones are checkpointed in order while the third is pending.
+    for (let i = 0; i < 200 && f.saved.get('old-chat')?.initializationCheckpoint?.classifiedBatches !== 2; i++) await tick();
+    assert.equal(f.calls.filter(call => call.purpose === 'initialize').length, 3);
     assert.equal(f.saved.get('old-chat').initializationCheckpoint.classifiedBatches, 2);
     await f.controller.setContext({ owner: 'card', activeScopeId: 'new-scope', deferPost: true });
     f.controller.cancel(); pending.resolve(); await assert.rejects(scanning);
