@@ -119,6 +119,19 @@ export async function createSillyTavernHost(deps = {}) {
     };
     const persistence = await tauriPersistence(deps, script) ?? lukerPersistence(deps, script);
     const enqueueSave = task => persistence ? persistence.enqueue(task) : task();
+    /** Prompt Template readiness. A zip install keeps names like
+     * "ST-Prompt-Template-main", so the running API is the authority; the
+     * manager entry only tells whether the player disabled it. Its own
+     * "是否启用扩展" switch is a separate setting from the manager checkbox. */
+    function templateStatus() {
+        const names = Array.isArray(extensions.extensionNames) ? extensions.extensionNames : [];
+        const installed = names.find(name => /(?:^|\/)st-prompt-template(?:[-_.].*)?$/i.test(name) || /prompt[-_ ]?template/i.test(name.split('/').pop() ?? ''));
+        const entry = extensions.findExtension?.('ST-Prompt-Template') ?? (installed ? extensions.findExtension?.(installed) : null);
+        const api = globalThis.EjsTemplate;
+        if (entry && entry.enabled === false) return { state: 'disabled' };
+        if (typeof api?.getFeatures !== 'function') return { state: entry || installed ? 'not-loaded' : 'missing' };
+        return { state: api.getFeatures()?.enabled ? 'ready' : 'switch-off' };
+    }
     const save = deps.save ?? (async expectedRevision => {
         const live = ctx();
         const savingChatId = currentIdentity(live);
@@ -251,13 +264,12 @@ export async function createSillyTavernHost(deps = {}) {
             hidden: Boolean(message.is_system || (windowChatId === chatId && windowKeys.has(messageKey(message, index, readOnly)))),
             hiddenBy: message.extra?.dwmHidden?.owner === OWNER || (!message.is_system && windowChatId === chatId && windowKeys.has(messageKey(message, index, readOnly))) ? OWNER : null,
         }));
-        const template = extensions.findExtension?.('ST-Prompt-Template');
-        const templateApi = globalThis.EjsTemplate;
+        const template = templateStatus();
         return {
             chatId,
             bookName,
             messages,
-            templateEnabled: Boolean(template?.enabled && templateApi?.getFeatures?.()?.enabled),
+            templateEnabled: template.state === 'ready', templateStatus: template.state,
             group: live.groupId ?? live.selected_group ?? null,
             generating: Boolean(script.isGenerating?.()),
             userInput: String(deps.getUserInput?.() ?? globalThis.document?.querySelector?.('#send_textarea')?.value ?? ''),
