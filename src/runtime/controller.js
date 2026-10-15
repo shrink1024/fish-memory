@@ -1,3 +1,4 @@
+import { applicationSnapshot, APPLICATION_SCAN, validateApplicationSelection, selectedApplicationEntries, applyPresetApplication } from '../agents/preset-application.js';
 import { throwIfAborted, combineSignals } from '../platform/abort.js';
 import { sourceBookChanges } from '../core/source-book.js';
 import { presetSnapshot, PREFERENCE_SCAN, validatePreferenceCandidates, selectedPreferences, applyAuxiliaryPreferences } from '../agents/preset-preferences.js';
@@ -44,6 +45,7 @@ export class Controller {
     #pausedPostKeys = new Set();
     #activityClaims = new Map();
     #presetDraft = null;
+    #applicationDraft = null;
     #loading = null;
     #loadedTarget = null;
     #worldbookCheck = null;
@@ -91,11 +93,12 @@ export class Controller {
     #instrument(client) {
         const complete = async (request, accept = result => result) => {
             const presetFingerprint = this.#preset().fingerprint, preferences = this.#auxiliaryPreferences();
-            request = applyAuxiliaryPreferences(request, preferences);
+            const application = this.#application(), applicationEntries = this.#applicationEntries();
+            request = applyPresetApplication(applyAuxiliaryPreferences(request, preferences), applicationEntries);
             const epoch = this.#epoch, start = Date.now();
             const serializedInput = serializeAgentInput(request.input);
             let trace = this.host.traceCapture?.register({ ...request, input: serializedInput });
-            const startFallback = input => this.traces.start({ source: '鱼忆', label: ({ initialize: '扫描世界书', strategy: '统合记忆策略', select: '前置选材', maintain: '后置维护', compact: '整理事件', preferences: '扫描预设偏好', sourceMerge: '合并原书更新' })[request.purpose] ?? request.purpose,
+            const startFallback = input => this.traces.start({ source: '鱼忆', label: ({ initialize: '扫描世界书', strategy: '统合记忆策略', select: '前置选材', maintain: '后置维护', compact: '整理事件', preferences: '扫描预设应用', sourceMerge: '合并原书更新' })[request.purpose] ?? request.purpose,
                 transport: this.connectionMode === 'test' ? 'test' : 'agent-boundary',
                 context: { chatId: this.host.snapshot().chatId },
                 request: { messages: [{ role: 'system', content: request.system }, { role: 'user', content: input }] },
@@ -109,6 +112,7 @@ export class Controller {
                     metric.outputChars = JSON.stringify(result).length;
                     if (fallbackId) this.traces.update(fallbackId, { responseBody: result });
                     if (preferences.length && request.purpose !== 'preferences') invariant(this.#preset().fingerprint === presetFingerprint, '请求期间预设已改变，旧偏好结果不再采用');
+                    if (applicationEntries.length && request.purpose !== 'preferences') invariant(this.#application().fingerprint === application.fingerprint, '请求期间预设已改变，请重试');
                     return untilAborted(accept(result), request.signal);
                 };
                 const onAttempt = attempt => {
@@ -319,7 +323,45 @@ export class Controller {
         return yielded;
     }
     #preset() { return presetSnapshot(this.host.readPreset?.() ?? {}); }
-    #auxiliaryPreferences() { return selectedPreferences(this.store?.state.preferences?.preset, this.#preset()); }
+    #auxiliaryPreferences() { if (this.store?.state.preferences?.presetApplication) return []; return selectedPreferences(this.store?.state.preferences?.preset, this.#preset()); }
+    #application() { return applicationSnapshot(this.host.readPreset?.() ?? {}); }
+    #applicationEntries() { return selectedApplicationEntries(this.store?.state.preferences?.presetApplication, this.#application()); }
+    async scanPresetApplication() {
+        invariant(this.store && !this.view().activity, '请等待存档载入及当前任务完成');
+        const preset = this.#application(), store = this.store, bookName = this.host.snapshot().bookName;
+        invariant(store.state.bookName === bookName, '请等待当前世界书载入');
+        invariant(preset.entries.length, '当前没有可读取的预设文本条目');
+        const activity = this.#beginActivity('preferences', '正在推荐预设开关');
+        this.#state('正在扫描预设；原设置保留');
+        try {
+            const selectedIds = await this.client.completeValidated({ purpose: 'preferences', system: APPLICATION_SCAN, input: { entries: preset.entries }, signal: activity.signal }, result => {
+                this.#assertActivity(activity);
+                invariant(this.store === store && this.host.snapshot().bookName === bookName && this.#application().fingerprint === preset.fingerprint, '扫描期间预设或世界书已改变，请重新扫描');
+                return validateApplicationSelection(result, preset);
+            });
+            this.#assertActivity(activity);
+            this.#applicationDraft = { id: uid('preset-application'), chatId: activity.chatId, fingerprint: preset.fingerprint, selectedIds };
+            this.#state('已推荐预设开关，可手动调整后应用');
+        } catch (error) {
+            if (!activity.signal.aborted && activity.epoch === this.#epoch) this.#state('预设推荐未完成，已应用设置保留', error.message);
+            throw error;
+        } finally { this.#endActivity(activity); }
+    }
+    async savePresetApplication(ids, fingerprint) {
+        invariant(this.store && !this.view().activity, '请等待存档载入及当前任务完成');
+        const epoch = this.#epoch, chatId = this.host.snapshot().chatId, store = this.store, bookName = this.host.snapshot().bookName;
+        invariant(store.state.bookName === bookName, '请等待当前世界书载入');
+        const preset = this.#application();
+        invariant(fingerprint === preset.fingerprint, '预设已改变，请重新检查条目');
+        const selectedIds = validateApplicationSelection({ selectedIds: ids }, preset);
+        await store.idle();
+        this.#assertCurrent(epoch, chatId);
+        invariant(this.store === store && this.host.snapshot().bookName === bookName && this.#application().fingerprint === fingerprint && !this.view().activity, '预设或任务状态已改变，请重试');
+        await store.updatePreferences({ presetApplication: { name: preset.name, fingerprint, selectedIds }, preset: null });
+        this.#assertCurrent(epoch, chatId);
+        this.#applicationDraft = null;
+        this.#state('预设副本已应用到此存档的辅助请求');
+    }
     async scanPreset() {
         invariant(this.store && !this.#initializing, '请先载入存档，并等待扫描完成');
         invariant(!this.view().activity, '请等待当前辅助任务完成后扫描预设');
@@ -579,7 +621,7 @@ export class Controller {
         return { apiVersion: 1, chatId, revision: save.revision, ...scopeRead(save, scopeId) };
     }
     view() {
-        const snapshot = this.host.snapshot(), preset = this.#preset();
+        const snapshot = this.host.snapshot(), preset = this.#preset(), application = this.#application();
         const activities = [...this.#activities.values()].filter(activity => activity.isCurrent())
             .sort((a, b) => Number(b.kind === 'select') - Number(a.kind === 'select') || b.startedAt - a.startedAt)
             .map(({ id, kind, label, startedAt, phase, cancellable, stopLabel, hint }) => ({ id, kind, label, startedAt, phase, cancellable, stopLabel, hint }));
@@ -593,6 +635,9 @@ export class Controller {
                     message: '旧记忆缺少逐楼阅读记录，无法确认的旧消息会保留原文。需要重新缩减历史时，请先备份聊天，再重新扫描。' }] : [])],
             enabled: this.#enabled(), saveEnabled: this.store?.state.preferences?.enabled !== false,
             activityClaimed: [...this.#activityClaims.values()].some(claim => claim.chatId === snapshot.chatId),
+            presetApplication: { ...application, saved: clone(this.store?.state.preferences?.presetApplication ?? null),
+                draft: clone(this.#applicationDraft), stale: Boolean(this.store?.state.preferences?.presetApplication
+                    && this.store.state.preferences.presetApplication.fingerprint !== application.fingerprint) },
             preset: { name: preset.name, available: Boolean(preset.entries.length),
                 stale: Boolean(this.store?.state.preferences?.preset && this.store.state.preferences.preset.fingerprint !== preset.fingerprint),
                 saved: clone(this.store?.state.preferences?.preset ?? null), draft: clone(this.#presetDraft) },
@@ -678,6 +723,7 @@ export class Controller {
         const currentChatId = this.host.snapshot().chatId;
         for (const [owner, claim] of this.#activityClaims) if (claim.chatId !== currentChatId) this.#activityClaims.delete(owner);
         this.#presetDraft = null;
+        this.#applicationDraft = null;
         this.sourceChanges = { changed: false, added: [], removed: [], updated: [] };
         this.#autoInitialization = null;
         this.#initializationSourceFingerprint = ''; this.#initializationContextFingerprint = ''; this.#initializationClassificationFingerprint = '';
@@ -857,14 +903,14 @@ export class Controller {
     #initializationInputs(store) {
         return { scopeContext: store.state.data.scopeContext, messageScopes: store.state.data.messageScopes,
             inventoryEnabled: store.state.data.inventoryEnabled, preferences: store.state.preferences,
-            presetFingerprint: this.#preset().fingerprint, batchChars: this.settings.batchChars,
+            presetFingerprint: this.#preset().fingerprint, applicationFingerprint: this.#application().fingerprint, batchChars: this.settings.batchChars,
             classificationProtocol: 2, batchItems: INITIALIZATION_BATCH_ITEMS };
     }
     #initializationRequestSettings(store) {
         return JSON.stringify(this.#classificationInputs(store));
     }
     #classificationInputs(store) {
-        return { preferences: store.state.preferences, presetFingerprint: this.#preset().fingerprint,
+        return { preferences: store.state.preferences, presetFingerprint: this.#preset().fingerprint, applicationFingerprint: this.#application().fingerprint,
             batchChars: this.settings.batchChars, classificationProtocol: 2, batchItems: INITIALIZATION_BATCH_ITEMS };
     }
     #initializationIdentity(store) {
@@ -1194,12 +1240,12 @@ export class Controller {
         const inspect = () => this.host.previewSnapshot?.() ?? this.host.snapshot();
         const snapshot = inspect(), epoch = this.#epoch;
         invariant(snapshot.chatId && snapshot.bookName, '请先打开带主世界书的角色聊天');
-        const save = this.store?.snapshot() ?? null, settings = clone(this.settings), presetFingerprint = this.#preset().fingerprint;
+        const save = this.store?.snapshot() ?? null, settings = clone(this.settings), presetFingerprint = this.#preset().fingerprint, applicationFingerprint = this.#application().fingerprint;
         const unchanged = () => {
             const latest = inspect();
             invariant(epoch === this.#epoch && latest.chatId === snapshot.chatId && latest.bookName === snapshot.bookName
                 && JSON.stringify(latest.messages) === JSON.stringify(snapshot.messages) && latest.userInput === snapshot.userInput
-                && this.store?.state?.revision === save?.revision && JSON.stringify(this.settings) === JSON.stringify(settings) && this.#preset().fingerprint === presetFingerprint,
+                && this.store?.state?.revision === save?.revision && JSON.stringify(this.settings) === JSON.stringify(settings) && this.#preset().fingerprint === presetFingerprint && this.#application().fingerprint === applicationFingerprint,
             '读取期间存档、输入或资料有变化，请刷新预览');
         };
         // Read rules locally: no reconcile, clearPlan, initialization, trace or model call.
@@ -1231,9 +1277,10 @@ export class Controller {
         if (sourceChanged) { narration.status = 'unavailable'; narration.explanation = sourceWarning; }
         else if (!currentSave && save?.initialized) narration.explanation = '保存快照不属于当前聊天或所选剧情；实际发送会先载入或回放，当前不展示旧片段。';
         for (const stage of result.stages) {
-            if (stage.input) { const adapted = applyAuxiliaryPreferences({ system: stage.system, input: stage.input }, this.#auxiliaryPreferences()); stage.system = adapted.system; stage.input = adapted.input; }
+            if (stage.input) { const adapted = applyPresetApplication(applyAuxiliaryPreferences({ system: stage.system, input: stage.input }, this.#auxiliaryPreferences()), this.#applicationEntries()); stage.system = adapted.system; stage.input = adapted.input; }
         }
-        if (save?.preferences?.preset && save.preferences.preset.fingerprint !== this.#preset().fingerprint) result.warnings.push('当前预设已改变，旧辅助偏好暂不采用；请在设置中重新扫描并确认。');
+        if (save?.preferences?.preset && save.preferences.preset.fingerprint !== this.#preset().fingerprint) result.warnings.push('当前预设已改变，旧辅助偏好暂不采用；请在预设应用中重新检查并确认。');
+        if (save?.preferences?.presetApplication && save.preferences.presetApplication.fingerprint !== applicationFingerprint) result.warnings.push('预设已改变，旧预设副本暂不应用；请到预设应用重新确认。');
         result.stages.unshift(narration);
         result.warnings.push('预览按普通发送与点击刷新时的输入草稿计算；重生成、续写、宏展开、原生预算和第三方处理可能改变最终请求。实际发送仍以“实际记录”为准。');
         if (save && !isPrefix(save.processed, snapshot.messages.map(m => m.key))) result.warnings.push('当前候选回复与已存记忆路径不一致；实际发送会先校正记忆，下列内容暂按保存快照展示。');

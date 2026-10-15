@@ -33,6 +33,7 @@ const model = { complete: async ({ purpose, input, signal }) => {
         retrieveWhen: e.title.includes('图书馆') ? '前往北城、调查航海记录或提及馆员许可时。' : e.title.includes('传闻') ? '提及废弃灯塔、失落航线或铜罗盘时；注意其未证实状态。' : '涉及相关人物、地点或规则时。',
         segments: [{ id: 'body', text: e.content, writable: !e.title.includes('边界') }] })) };
     if (purpose === 'strategy') return { strategy: input.strategies.join('\n') };
+    if (purpose === 'preferences') return { selectedIds: ['language', 'facts'] };
     if (purpose === 'select') return { ids: input.catalog.filter(e => e.title.includes('图书馆') || e.kind === 'event').slice(0, input.selectionLimit).map(e => e.id) };
     if (purpose === 'compact') return { operations: [] };
     const moved = input.messages.find(m => m.content.includes('迁居北城'));
@@ -50,6 +51,12 @@ const model = { complete: async ({ purpose, input, signal }) => {
     if (!input.memory.entries.some(e => e.kind === 'npc_pool')) operations.push({ type: 'create', title: '旧港路人', kind: 'npc_pool', intro: '曾在旧港遇见、暂不需要独立维护的人物。', retrieveWhen: '再次遇见这些路人时，提取此前交集。', text: '阿岚｜往返旧港与北城的摆渡人，答应在涨潮时载你与莉娜去北城。关系：初次认识。', evidence: [input.messages[0].key] });
     return { operations };
 } };
+host.readPreset = () => ({ name: '旧港 · 演示预设', entries: [
+    { id: 'language', title: '记录语言', enabled: true, content: '使用简体中文，人物与地名保留原写法。' },
+    { id: 'facts', title: '事实一致性', enabled: true, content: '区分已经发生的事实、人物猜测与未完成的约定。' },
+    { id: 'terms', title: '专名约定', enabled: false, content: 'North Library 统一记录为北城图书馆。' },
+    { id: 'narration', title: '正文风格', enabled: true, content: '用细腻的景物描写展开场景，正文不少于一千字。' },
+] });
 const controller = new Controller(host, { model, settings: { enabled: true } });
 const manager = createFloatingManager(document);
 document.body.append(manager.element);

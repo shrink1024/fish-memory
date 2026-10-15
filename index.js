@@ -1,3 +1,4 @@
+import { orderedPresetEntries } from './src/agents/preset-application.js';
 import { createSillyTavernHost } from './src/adapters/sillytavern.js';
 import { createSettingsPersistence } from './src/adapters/settings.js';
 import { Controller } from './src/runtime/controller.js';
@@ -37,10 +38,8 @@ async function boot() {
         if (SillyTavern.getContext().mainApi !== 'openai') return { name: '当前连接没有可读取的聊天补全预设', entries: [] };
         const manager = openai.promptManager;
         const order = manager?.getPromptOrderForCharacter?.(manager.activeCharacter) ?? [];
-        const enabled = new Set(order.filter(item => item.enabled).map(item => item.identifier));
         return { name: openai.oai_settings?.preset_settings_openai ?? '',
-            entries: (openai.oai_settings?.prompts ?? []).filter(prompt => !prompt.marker && enabled.has(prompt.identifier))
-                .map(prompt => ({ id: prompt.identifier, title: prompt.name || prompt.identifier, content: prompt.content })) };
+            entries: orderedPresetEntries(openai.oai_settings?.prompts ?? [], order) };
     };
     const extensionSettings = context.extensionSettings ?? (await import('/scripts/extensions.js')).extension_settings;
     const settings = extensionSettings.dwm ?? {};

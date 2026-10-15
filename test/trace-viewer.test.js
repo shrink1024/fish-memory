@@ -106,7 +106,7 @@ test('message pagination avoids eagerly creating thousands of disclosures and is
     f.viewer.destroy();
 });
 
-test('fifth tab works before initialization and trace updates do not redraw other tabs', async () => {
+test('trace tab works before initialization and trace updates do not redraw other tabs', async () => {
     const f = fixture([{ id: 'external', label: '外部调用', request: { messages: [{ role: 'user', content: '未初始化也可查看' }] } }]);
     f.viewer.destroy();
     const container = f.doc.createElement('main'); let viewReads = 0;
@@ -117,7 +117,7 @@ test('fifth tab works before initialization and trace updates do not redraw othe
     assert.equal(container.children[0], initialRoot); assert.equal(viewReads, 1); assert.equal(f.reads(), 0);
     findButton(container, '收发').click();
     assert.match(container.textContent, /未初始化也可查看/);
-    assert.equal(walk(container).filter(node => node.attributes.role === 'tab').length, 5);
+    assert.equal(walk(container).filter(node => node.attributes.role === 'tab').length, 6);
     const readCount = viewReads; f.store.records.push({ id: 'next', request: { prompt: '新请求' } }); f.store.notify();
     await new Promise(resolve => setTimeout(resolve, 120)); assert.equal(viewReads, readCount);
     panel.destroy(); assert.equal(f.listeners.size, 0);

@@ -44,7 +44,7 @@ test('preset scan raw generation and exact trace matching share encoded input, p
         assert.equal(JSON.parse(generatedInput).entries[0].content, material.entries[0].content);
         const record = store.snapshot().records[0];
         assert.equal(record.source, '鱼忆');
-        assert.equal(record.label, '扫描预设偏好');
+        assert.equal(record.label, '扫描预设应用');
         assert.equal(record.request.messages[1].content, generatedInput);
         assert.equal(record.processingError, undefined);
     } finally { capture.dispose(); }

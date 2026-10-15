@@ -1,4 +1,3 @@
-import { preferenceLabel } from '../agents/preset-preferences.js';
 import { buildRuleDocument, compileRules, formToScript } from '../rules/index.js';
 import { diffText } from './diff.js';
 import { createTraceViewer } from './trace-viewer.js';
@@ -32,7 +31,8 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
     let mobileDetail = false, entryMode = 'read', visibleCount = 80, composing = false, queuedRender = false;
     let ruleNL = '', ruleScript = '', ruleOutput = '', ruleMatch = { field: 'title', op: 'contains', value: '', action: 'lock', limit: '' };
     let recentTurnsDraft = null, timeoutDraft = null, cadenceDraft = null, mvuDraft = null, connectionModeDraft = null, lastSaveId = null;
-    let localPreview = null, presetSelection = new Set(), presetDraftKey = null;
+    let localPreview = null;
+    let applicationSelection = new Set(), applicationKey = null;
     const entryDrafts = new Map(), poolDrafts = new Map(), expanded = new Set(), scrollPositions = new Map();
     const connectionDraft = { endpoint: '', model: '', apiKey: '', maxOutputTokens: undefined };
     const h = (tag, className = '', content) => {
@@ -178,7 +178,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         shell.append(state);
         if (view.activity) shell.append(activityIndicator.element);
         const nav = h('nav', 'dwm-tabs'); nav.setAttribute('aria-label', '鱼忆工作台'); nav.setAttribute('role', 'tablist');
-        const tabs = [['library', '资料'], ['round', '本轮'], ['activity', '维护与记录'], ['settings', '设置'], ['traces', '收发']];
+        const tabs = [['library', '资料'], ['round', '本轮'], ['activity', '维护与记录'], ['settings', '设置'], ['preset', '预设应用'], ['traces', '收发']];
         tabs.forEach(([id, title], index) => {
             const b = button(title, () => navigate(id), { navigation: true, key: `tab-${id}`, className: tab === id ? 'dwm-active-tab' : '' });
             b.id = `${panelId}-tab-${id}`; b.setAttribute('role', 'tab'); b.setAttribute('aria-selected', String(tab === id)); b.setAttribute('aria-controls', `${panelId}-content`); b.tabIndex = tab === id ? 0 : -1;
@@ -203,6 +203,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         if (tab === 'round') renderRound(content, view);
         if (tab === 'activity') renderActivity(content, view);
         if (tab === 'settings') renderSettings(content, view);
+        if (tab === 'preset') renderPresetApplication(content, view);
         if (tab === 'traces') {
             const modes = h('div', 'dwm-segments dwm-diagnostics-modes');
             for (const [id, label] of [['actual', '实际记录'], ['preview', '发送前预览']]) {
@@ -241,7 +242,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         renderWorldbookCheck(panel, view);
         if (view.initialization?.message) panel.append(h('p', view.initialization.retry ? 'dwm-warning' : 'dwm-muted', view.initialization.message));
         if (view.initializationResume) panel.append(h('p', 'dwm-notice', `已有扫描进度：世界书 ${view.initializationResume.classifiedBatches}/${view.initializationResume.totalBatches} 批，历史 ${view.initializationResume.processedCount} 条。再次扫描会先核对资料，继续仍有效的进度。`));
-        if (view.preset?.available) panel.append(h('p', 'dwm-muted', '预设偏好可在设置中单独扫描，不影响建立记忆。'));
+        if (view.preset?.available) panel.append(h('p', 'dwm-muted', '预设可在“预设应用”中选择或扫描推荐，不影响建立记忆。'));
         panel.append(row(button(view.initialization?.retry ? '手动扫描 / 重试初始化' : '建立此存档记忆', () => initialize(view), { primary: true, disabled: !view.save || Boolean(view.progress) || Boolean(view.activity) || Object.values(readiness).some(value => value === false) }), button('设置辅助模型', () => navigate('settings'), { navigation: true })));
         if (view.progress) panel.append(h('p', 'dwm-warning', '扫描中继续发送将走酒馆原生流程；新增剧情会在扫描后补记。'));
         if (view.connectionMode === 'test') panel.append(h('p', 'dwm-muted', '本页使用模拟模型，不会调用真实 API。'));
@@ -529,7 +530,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
             value => call(() => controller.updateSettings({ scanConcurrency: Number(value) }), '扫描速度已保存')).wrap);
         parent.append(concurrency);
         renderTimeouts(parent, current);
-        renderPreset(parent, view);
+
         renderConnection(parent, view);
         renderMvu(parent, view);
         const binding = details('世界书检查', 'worldbook-check'); renderWorldbookCheck(binding, view); parent.append(binding);
@@ -555,29 +556,41 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         }, '等待时间已保存，从下一次辅助请求生效')));
         parent.append(panel);
     }
-    function renderPreset(parent, view) {
-        const preset = view.preset ?? {}, panel = card('辅助 Agent 的预设偏好', '只采用语言、专名、术语和称谓。叙事、变量更新、输出协议、工具权限及绕过安全限制的条目不继承；原预设不会改动。');
-        panel.append(h('p', 'dwm-muted', `当前预设：${preset.name || '尚不可读取'}`));
-        if (preset.stale) panel.append(h('p', 'dwm-warning', '预设已经改变，旧偏好暂不使用；请重新扫描并确认。'));
-        if (preset.saved?.selected?.length) {
-            const saved = details('已确认的辅助偏好与来源', 'saved-preset');
-            for (const item of preset.saved.selected) saved.append(h('p', '', `${preferenceLabel(item.preference)} · 来源：${item.source.title}`));
-            panel.append(saved);
+    function renderPresetApplication(parent, view) {
+        const preset = view.presetApplication ?? { entries: [] };
+        const draft = preset.draft?.fingerprint === preset.fingerprint ? preset.draft : null;
+        const key = `${view.chatId ?? ''}:${view.save?.id ?? ''}:${preset.fingerprint}:${draft?.id ?? 'saved'}`;
+        if (applicationKey !== key) {
+            applicationKey = key;
+            applicationSelection = new Set(draft?.selectedIds ?? (preset.stale ? [] : preset.saved?.selectedIds) ?? []);
         }
-        panel.append(button('扫描当前预设（调用模型）', () => call(() => controller.scanPreset()), { disabled: !view.save || !preset.available || Boolean(view.activity) }));
-        if (!preset.available) panel.append(h('p', 'dwm-muted', '当前仅支持读取酒馆聊天补全预设中已启用的文本条目。没有可读条目时继续使用鱼忆自身提示词。'));
-        const draft = preset.draft;
-        if (draft) {
-            const key = draft.id || `${draft.chatId}:${draft.fingerprint}:${draft.candidates.map(item => item.id).join(',')}`;
-            if (presetDraftKey !== key) { presetDraftKey = key; presetSelection = new Set(); }
-            panel.append(h('p', 'dwm-muted', '扫描结果尚未采用。勾选并确认后，仅保存到当前存档。'));
-            for (const item of draft.candidates) {
-                const candidate = h('div', 'dwm-preset-candidate');
-                candidate.append(toggle(preferenceLabel(item.preference), presetSelection.has(item.id), `来源：${item.source.title}`, value => { if (value) presetSelection.add(item.id); else presetSelection.delete(item.id); })); panel.append(candidate);
-            }
-            if (!draft.candidates.length) panel.append(h('p', 'dwm-muted', '没有找到可直接复用的通用约定；不影响记忆功能。'));
-            panel.append(button('确认所选偏好', () => call(() => controller.confirmPreset([...presetSelection])), { disabled: Boolean(view.activity) }));
+        const panel = card('预设应用', '为鱼忆选择当前预设中的文本条目。仅影响此存档的辅助请求，不改酒馆正文的预设开关。');
+        panel.append(h('p', 'dwm-muted', `当前预设：${preset.name || '尚不可读取'} · ${preset.entries.length} 个文本条目`));
+        const scopeNote = details('哪些内容会应用？', 'preset-scope-note');
+        scopeNote.append(h('p', 'dwm-muted', '按当前预设顺序插入选中的完整文本。角色卡、聊天历史等占位块不在此处；脚本不执行，宏占位符保留原文。鱼忆自身的任务、输出格式与读写权限仍有效。条目越多，每次辅助请求的输入开销越大。'));
+        panel.append(scopeNote);
+        if (preset.stale) panel.append(h('p', 'dwm-warning', '原预设已变化，旧选择暂停应用。请重新检查并应用。'));
+        if (!preset.saved && view.preset?.saved?.selected?.length) panel.append(h('p', 'dwm-muted', '旧版已确认的语言偏好仍生效；应用这里的选择后会替换旧偏好。'));
+        const disabled = !view.save || Boolean(view.activity);
+        panel.append(button('扫描推荐开关（调用模型）', () => call(() => controller.scanPresetApplication()), { disabled: disabled || !preset.entries.length }));
+        panel.append(h('p', 'dwm-muted', draft ? '已生成推荐。你可以任意调整下面的开关，点“应用到辅助请求”后生效。' : '可直接手动选择，也可先扫描推荐。开关修改后需点击应用；未应用不会改变实际请求。'));
+        panel.append(row(button('沿用原预设开关', () => { applicationSelection = new Set(preset.entries.filter(e => e.enabled).map(e => e.id)); render(); }, { disabled }),
+            button('全部关闭', () => { applicationSelection = new Set(); render(); }, { disabled })));
+        panel.append(h('p', 'dwm-muted', `当前勾选 ${applicationSelection.size} 条；已应用 ${preset.stale ? 0 : preset.saved?.selectedIds?.length ?? 0} 条。`));
+        if (!preset.entries.length) panel.append(h('p', 'dwm-muted', '当前没有可读取的聊天补全预设文本条目。仍可照常使用鱼忆。'));
+        for (const entry of preset.entries) {
+            const item = h('div', 'dwm-preset-candidate');
+            const recommended = draft ? (draft.selectedIds.includes(entry.id) ? '扫描推荐开启' : '扫描推荐关闭') : '';
+            item.append(toggle(entry.title, applicationSelection.has(entry.id), `原预设：${entry.enabled ? '开启' : '关闭'}${recommended ? ` · ${recommended}` : ''}`, value => {
+                if (value) applicationSelection.add(entry.id); else applicationSelection.delete(entry.id); render();
+            }));
+            const source = details('查看条目原文', `preset-entry-${entry.id}`);
+            source.append(h('pre', 'dwm-preset-source', entry.content)); item.append(source); panel.append(item);
         }
+        panel.append(button('应用到辅助请求', () => call(async () => {
+            await controller.savePresetApplication([...applicationSelection], preset.fingerprint);
+            applicationKey = null;
+        }, '已应用，可在“收发”核对提示预览与实际请求'), { disabled }));
         parent.append(panel);
     }
     function renderConnection(parent, view) {

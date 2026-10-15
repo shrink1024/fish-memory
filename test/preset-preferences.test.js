@@ -1,3 +1,4 @@
+import { APPLICATION_SCAN } from '../src/agents/preset-application.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Controller } from '../src/runtime/controller.js';
@@ -32,7 +33,7 @@ function fixture() {
         storage: { read: async id => structuredClone(saved.get(id) ?? null), write: async (id, value) => saved.set(id, structuredClone(value)) } };
     const c = new Controller(host, { model: { complete: async request => {
         calls.push(structuredClone({ purpose: request.purpose, system: request.system, input: request.input }));
-        if (request.purpose === 'preferences') return scanGate ? scanGate : structuredClone(reply);
+        if (request.purpose === 'preferences') return scanGate ? scanGate : request.system === APPLICATION_SCAN ? { selectedIds: ['language'] } : structuredClone(reply);
         if (request.purpose === 'initialize') return { entries: request.input.entries.map(entry => ({ id: entry.id, kind: 'fact', intro: entry.title, segments: [{ id: 'body', text: entry.content, writable: true }] })) };
         return request.purpose === 'select' ? { ids: [] } : { operations: [] };
     } } });
@@ -69,4 +70,49 @@ test('preset scan late return cannot transfer a proposal to another save', async
     f.state.chatId = 'second'; await f.c.chatChanged(); resolve(reply);
     await assert.rejects(scan, /取消|作废/);
     assert.equal(f.c.view().preset.draft, null);
+});
+
+
+test('preset application manual override reaches preview and actual requests, persists per save and can be cleared', async () => {
+    const f = fixture(); await f.c.start(); await f.c.initialize();
+    const before = f.host.readPreset();
+    await f.c.scanPresetApplication();
+    assert.deepEqual(f.c.view().presetApplication.draft.selectedIds, ['language']);
+    assert.equal(f.c.view().presetApplication.saved, null);
+    const fingerprint = f.c.view().presetApplication.fingerprint;
+    await f.c.savePresetApplication(['off'], fingerprint);
+    assert.deepEqual(f.host.readPreset(), before);
+    assert.deepEqual(f.c.view().presetApplication.saved.selectedIds, ['off']);
+    const preview = await f.c.previewPrompts();
+    const system = preview.stages.find(s => s.id === 'select').system;
+    assert.match(system, /不应读取/);
+    await f.c.generationBefore();
+    assert.equal(f.calls.findLast(r => r.purpose === 'select').system, system);
+    f.state.chatId = 'second'; await f.c.chatChanged();
+    assert.equal(f.c.view().presetApplication.saved, null);
+    f.state.chatId = 'first'; await f.c.chatChanged();
+    assert.deepEqual(f.c.view().presetApplication.saved.selectedIds, ['off']);
+    await f.c.savePresetApplication([], fingerprint);
+    assert.doesNotMatch((await f.c.previewPrompts()).stages.find(s => s.id === 'select').system, /不应读取/);
+});
+test('preset application rejects stale UI and ignores changed original text until reconfirmed', async () => {
+    const f = fixture(); await f.c.start(); await f.c.initialize();
+    const fingerprint = f.c.view().presetApplication.fingerprint;
+    await f.c.savePresetApplication(['off'], fingerprint);
+    f.setPreset({ ...input, entries: input.entries.map(e => e.id === 'off' ? { ...e, content: '改过的原文' } : e) });
+    assert.equal(f.c.view().presetApplication.stale, true);
+    await assert.rejects(f.c.savePresetApplication(['off'], fingerprint), /预设已改变/);
+    const preview = await f.c.previewPrompts();
+    assert.doesNotMatch(preview.stages.find(s => s.id === 'select').system, /改过的原文|不应读取/);
+});
+test('late application scan cannot cross chats or overwrite a saved manual selection', async () => {
+    let resolve; const pending = new Promise(yes => { resolve = yes; });
+    const f = fixture(); await f.c.start();
+    await f.c.savePresetApplication(['off'], f.c.view().presetApplication.fingerprint);
+    f.hold(pending); const running = f.c.scanPresetApplication(); running.catch(() => {});
+    await assert.rejects(f.c.savePresetApplication([], f.c.view().presetApplication.fingerprint), /等待/);
+    f.state.chatId = 'second'; await f.c.chatChanged(); resolve({ selectedIds: ['language'] });
+    await assert.rejects(running, /取消|作废/);
+    assert.equal(f.c.view().presetApplication.draft, null);
+    assert.equal(f.c.view().presetApplication.saved, null);
 });

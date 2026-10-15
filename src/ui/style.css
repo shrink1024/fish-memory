@@ -260,3 +260,9 @@
 .dwm-fallback::backdrop { background: #0008; }
 .dwm-fallback button { min-height: 44px; margin: 4px; padding: 8px 12px; color: inherit; background: transparent; border: 1px solid color-mix(in srgb, currentColor 25%, transparent); border-radius: 6px; cursor: pointer; }
 .dwm-fallback details { margin-block: 12px; overflow-wrap: anywhere; }
+
+/* Six workspace tabs retain touch targets on narrow screens. */
+.dwm-preset-source { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 360px; overflow: auto; font: inherit; }
+@media (max-width: 600px) { .dwm-tabs { flex-wrap: wrap; } .dwm-tabs .dwm-button { flex: 1 0 30%; min-height: 44px; } }
+.dwm-preset-candidate .dwm-disclosure { margin: 0; padding: 0; border: 0; }
+.dwm-preset-candidate .dwm-disclosure > summary { min-height: 44px; padding: 10px 0; }

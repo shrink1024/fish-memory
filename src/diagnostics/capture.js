@@ -1,7 +1,7 @@
 import { serializeAgentInput } from '../agents/client.js';
 // Observes browser transport only. No generation, persistent storage or agent input.
 const HOST_ROUTES = new Set(['/api/backends/chat-completions/generate', '/api/backends/text-completions/generate', '/api/backends/kobold/generate', '/api/novelai/generate']);
-const TASKS = { initialize: '扫描世界书', strategy: '统合记忆策略', select: '前置选材', maintain: '后置维护', compact: '整理事件', preferences: '扫描预设偏好' };
+const TASKS = { initialize: '扫描世界书', strategy: '统合记忆策略', select: '前置选材', maintain: '后置维护', compact: '整理事件', preferences: '扫描预设应用' };
 const safe = (fn, fallback) => { try { return fn(); } catch { return fallback; } };
 
 export function modelRoute(input, base = 'http://localhost') {
