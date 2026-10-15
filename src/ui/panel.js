@@ -34,7 +34,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
     let recentTurnsDraft = null, timeoutDraft = null, cadenceDraft = null, mvuDraft = null, connectionModeDraft = null, lastSaveId = null;
     let localPreview = null, presetSelection = new Set(), presetDraftKey = null;
     const entryDrafts = new Map(), poolDrafts = new Map(), expanded = new Set(), scrollPositions = new Map();
-    const connectionDraft = { endpoint: '', model: '', apiKey: '' };
+    const connectionDraft = { endpoint: '', model: '', apiKey: '', maxOutputTokens: undefined };
     const h = (tag, className = '', content) => {
         const el = doc.createElement(tag);
         if (className) el.className = className;
@@ -584,6 +584,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         const panel = card('辅助模型连接', '用于扫描、选材与维护。单独连接（含密钥）会保存在本浏览器，刷新后继续使用；换浏览器或清除站点数据后需重新填写。');
         if (!connectionDraft.endpoint && view.connection?.endpoint) connectionDraft.endpoint = view.connection.endpoint;
         if (!connectionDraft.model && view.connection?.model) connectionDraft.model = view.connection.model;
+        if (connectionDraft.maxOutputTokens === undefined) connectionDraft.maxOutputTokens = view.connection?.maxOutputTokens ?? '';
         if (view.connectionMode === 'test') { panel.append(h('p', 'dwm-notice', '演示模式 · 当前使用模拟模型，没有真实 API 请求。')); parent.append(panel); return; }
         const mode = connectionModeDraft ?? view.connectionMode?.mode ?? view.connectionMode ?? 'raw';
         panel.append(h('p', 'dwm-muted', `当前生效：${view.connectionMode === 'compatible' ? `单独接口 · ${view.connection?.model || '未指定模型'}` : '沿用酒馆连接'}。下方修改在应用后生效。`));
@@ -591,11 +592,12 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         if (mode === 'compatible') {
             panel.append(field('接口基础地址', connectionDraft.endpoint, value => { connectionDraft.endpoint = value; }, { placeholder: 'https://…/v1', hint: '鱼忆会在地址后添加 /chat/completions。' }).wrap,
                 field('模型名称', connectionDraft.model, value => { connectionDraft.model = value; }).wrap,
+                field('辅助输出额度（token，可留空）', connectionDraft.maxOutputTokens, value => { connectionDraft.maxOutputTokens = value; }, { type: 'number', hint: '留空沿用服务端默认值。思考也可能占用额度；截断时可按模型支持范围填写更大值，如 32768。较大额度可能增加费用，应用连接后生效。' }).wrap,
                 field('接口密钥', connectionDraft.apiKey, value => { connectionDraft.apiKey = value; }, { type: 'password', hint: view.connection?.hasApiKey ? '已保存密钥；地址不变时留空可继续使用。更换地址需重新填写。' : '只用于本次连接，不写入存档。' }).wrap);
         }
         if (view.activity) panel.append(h('p', 'dwm-muted', '任务正在运行，请先停止或等待完成，再应用连接。'));
         panel.append(button('应用连接', () => call(async () => {
-            await controller.updateConnection({ mode, endpoint: connectionDraft.endpoint.trim(), model: connectionDraft.model.trim(), apiKey: connectionDraft.apiKey }); connectionDraft.apiKey = ''; connectionModeDraft = null;
+            await controller.updateConnection({ mode, endpoint: connectionDraft.endpoint.trim(), model: connectionDraft.model.trim(), apiKey: connectionDraft.apiKey, maxOutputTokens: connectionDraft.maxOutputTokens }); connectionDraft.apiKey = ''; connectionModeDraft = null;
         }, '连接已应用；下一次辅助任务将使用此连接'), { disabled: Boolean(view.activity) })); parent.append(panel);
     }
     function renderMvuState(parent, state = {}) {

@@ -244,16 +244,15 @@ export function compatibleConnection({ endpoint, model, apiKey = '', fetchImpl =
     invariant(['auto', 'max_tokens', 'max_completion_tokens'].includes(tokenParameter), '不支持的辅助输出长度参数');
     const openaiReasoning = /(?:^|\/)(?:gpt-[56](?:[.\-]|$)|o[134](?:-|$))/i.test(model);
     const lengthParameter = tokenParameter === 'auto' ? openaiReasoning ? 'max_completion_tokens' : 'max_tokens' : tokenParameter;
-    // Reasoning tokens share this allowance. A task-sized cap would starve the
-    // JSON answer, so (as before alpha.5) leave the provider default unless the
-    // player chose an explicit limit or parameter.
-    const omitLength = tokenParameter === 'auto' && !maxOutputTokens
-        && (openaiReasoning || /(?:^|[\/\-_.:])(?:r1|reasoner|reasoning|thinking|qwq)(?:$|[\/\-_.:])/i.test(model));
+    // Unknown gateway aliases can reason too. Never infer their output budget from a name.
+    const explicitLength = maxOutputTokens !== undefined && maxOutputTokens !== null && maxOutputTokens !== '';
+    invariant(!explicitLength || (Number.isSafeInteger(Number(maxOutputTokens)) && Number(maxOutputTokens) > 0), '辅助输出额度必须是正整数，或留空沿用服务端默认值');
+    const omitLength = !explicitLength && tokenParameter === 'auto';
     return async ({ purpose, system, input, signal, responseLength = auxiliaryResponseLength(purpose) }) => {
         const response = await fetchImpl(url.href.replace(/\/$/, '') + '/chat/completions', {
             method: 'POST', headers: { 'Content-Type': 'application/json', ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
             body: JSON.stringify({ model, messages: [{ role: 'system', content: system }, { role: 'user', content: input }], stream: false,
-                ...(omitLength ? {} : { [lengthParameter]: boundedResponseLength(responseLength, null, { max_output_tokens: maxOutputTokens }) }) }), signal,
+                ...(omitLength ? {} : { [lengthParameter]: explicitLength ? Number(maxOutputTokens) : responseLength }) }), signal,
         });
         throwIfAborted(signal);
         if ([401, 403].includes(response.status)) throw modelApiError(null, response.status);

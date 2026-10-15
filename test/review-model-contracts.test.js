@@ -122,7 +122,7 @@ test('compatible calls set an auxiliary output budget and reject a truncated res
         return { ok: true, json: async () => ({ choices: [{ message: { content: '{"operations":[]}' }, finish_reason: 'length' }] }) };
     } });
     await assert.rejects(generate({ purpose: 'maintain', system: '', input: '{}', responseLength: 8192 }), /输出.*上限|截断/);
-    assert.equal(body.max_tokens, 8192);
+    assert.equal(body.max_tokens, undefined);
 });
 
 test('batching supports a separate item cap without splitting or dropping source entries', () => {

@@ -80,12 +80,12 @@ test('compatible reasoning models keep the provider default unless the player se
         assert.equal(body.max_completion_tokens, undefined, model);
     }
     for (const model of ['gpt-5', 'o3-mini', 'openai/gpt-5', 'gpt-6-astra']) {
-        assert.equal((await send(model, { maxOutputTokens: 12000 })).max_completion_tokens, 2048, model);
+        assert.equal((await send(model, { maxOutputTokens: 12000 })).max_completion_tokens, 12000, model);
     }
-    assert.equal((await send('deepseek-reasoner', { maxOutputTokens: 12000 })).max_tokens, 2048);
+    assert.equal((await send('deepseek-reasoner', { maxOutputTokens: 12000 })).max_tokens, 12000);
     for (const model of ['gpt-4.1', 'other', 'deepseek-chat']) {
         const body = await send(model);
-        assert.equal(body.max_tokens, 2048, model);
+        assert.equal(body.max_tokens, undefined, model);
         assert.equal(body.max_completion_tokens, undefined, model);
     }
 });

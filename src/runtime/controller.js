@@ -78,8 +78,8 @@ export class Controller {
             } catch { /* Keep the ST connection when the stored value is unusable. */ }
         }
     }
-    #applyConnection(mode, { endpoint, model, apiKey = '' } = {}) {
-        const config = { endpoint: String(endpoint ?? '').trim().replace(/\/$/, ''), model: String(model ?? '').trim(), apiKey: String(apiKey ?? '') };
+    #applyConnection(mode, { endpoint, model, apiKey = '', maxOutputTokens } = {}) {
+        const config = { endpoint: String(endpoint ?? '').trim().replace(/\/$/, ''), model: String(model ?? '').trim(), apiKey: String(apiKey ?? ''), maxOutputTokens: maxOutputTokens === '' || maxOutputTokens == null ? undefined : Number(maxOutputTokens) };
         const client = this.#client(['raw', 'tavern'].includes(mode) ? request => this.host.rawGenerate(request) : compatibleConnection(config));
         this.#connectionConfig = ['raw', 'tavern'].includes(mode) ? null : config;
         this.connectionMode = mode; this.client = client;
@@ -601,7 +601,7 @@ export class Controller {
             worldbookChecking: Boolean(this.#worldbookCheck && this.#worldbookCheck.target.chatId === snapshot.chatId && this.#worldbookCheck.target.bookName === snapshot.bookName),
             save: this.store?.state ? playerView(this.store.state) : null,
             sourceBook: this.store?.state?.bookName ?? '', connectionMode: this.connectionMode,
-            connection: { mode: this.connectionMode, endpoint: this.#connectionConfig?.endpoint ?? '', model: this.#connectionConfig?.model ?? '', hasApiKey: Boolean(this.#connectionConfig?.apiKey) },
+            connection: { mode: this.connectionMode, endpoint: this.#connectionConfig?.endpoint ?? '', model: this.#connectionConfig?.model ?? '', maxOutputTokens: this.#connectionConfig?.maxOutputTokens, hasApiKey: Boolean(this.#connectionConfig?.apiKey) },
             mvu: clone(this.mvu), diagnostics: { ...clone(this.diagnostics), memory: memoryMetrics(this.store?.state),
                 pendingCount: Math.max(0, this.host.snapshot().messages.length - (this.store?.state.processed.length ?? 0)) } };
     }
@@ -760,13 +760,13 @@ export class Controller {
         }
         this.#state(reason);
     }
-    async updateConnection({ mode = 'raw', endpoint, model, apiKey }) {
+    async updateConnection({ mode = 'raw', endpoint, model, apiKey, maxOutputTokens }) {
         invariant(!this.view().activity, '请先停止或等待当前任务完成，再应用连接；当前任务继续运行。');
         // Blank means retain the session key only for the same endpoint. Never
         // forward an existing credential when changing to a different server.
         const normalizedEndpoint = endpoint?.trim().replace(/\/$/, '');
         const retainedKey = normalizedEndpoint && normalizedEndpoint === this.#connectionConfig?.endpoint ? this.#connectionConfig.apiKey : '';
-        const config = this.#applyConnection(mode, { endpoint: normalizedEndpoint, model, apiKey: apiKey || retainedKey });
+        const config = this.#applyConnection(mode, { endpoint: normalizedEndpoint, model, apiKey: apiKey || retainedKey, maxOutputTokens });
         try { this.connectionStore?.save?.(['raw', 'tavern'].includes(mode) ? null : { mode: 'compatible', ...config }); }
         catch { this.#state('连接已更新；本机保存失败，刷新后需重新填写'); this.readinessChanged(); return; }
         this.#state('连接已更新');
