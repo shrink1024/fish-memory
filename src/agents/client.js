@@ -291,11 +291,39 @@ export function requestMessages({ system, input, head = [], tail = [], recovery 
 export const REASONING_EFFORTS = Object.freeze(['inherit', 'auto', 'min', 'low', 'medium', 'high', 'max']);
 const WIRE_EFFORT = { min: 'low', low: 'low', medium: 'medium', high: 'high', max: 'high' };
 
-/** Optional separate connection; credentials are supplied at runtime, never in save data. */
-export function compatibleConnection({ endpoint, model, apiKey = '', fetchImpl = fetch, tokenParameter = 'auto', maxOutputTokens }) {
+function connectionUrl(endpoint) {
     const url = new URL(endpoint);
     invariant(['https:', 'http:'].includes(url.protocol), '模型连接必须使用 HTTP(S)');
     invariant(url.protocol === 'https:' || ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname), '非本地连接必须使用 HTTPS');
+    return url;
+}
+
+/** Model ids an OpenAI-compatible endpoint advertises at GET /models. Only a
+ * convenience for filling the model name; manual entry always remains. */
+export async function listModels({ endpoint, apiKey = '', fetchImpl = globalThis.fetch, signal } = {}) {
+    const url = connectionUrl(endpoint);
+    let response;
+    try {
+        response = await fetchImpl(url.href.replace(/\/$/, '') + '/models', { method: 'GET', headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {}, signal });
+    } catch {
+        throwIfAborted(signal);
+        throw new Error('无法连接该接口获取模型列表：地址可能有误，或该接口不允许网页直接访问。请检查地址后重试，或直接手动填写模型名称。');
+    }
+    throwIfAborted(signal);
+    if ([401, 403].includes(response.status)) throw modelApiError(null, response.status);
+    let payload = null;
+    try { payload = await response.json(); } catch { /* handled below */ }
+    const list = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload?.models) ? payload.models : Array.isArray(payload) ? payload : null;
+    if (!response.ok || !list) throw new Error(`该接口没有提供模型列表${response.ok ? '' : `（HTTP ${response.status}）`}，请手动填写模型名称。`);
+    const ids = [...new Set(list.map(item => typeof item === 'string' ? item : item?.id ?? item?.name)
+        .filter(id => typeof id === 'string' && id.trim() && id.length <= 300).map(id => id.trim()))];
+    if (!ids.length) throw new Error('该接口返回的模型列表为空，请手动填写模型名称。');
+    return ids.sort((a, b) => a.localeCompare(b)).slice(0, 1000);
+}
+
+/** Optional separate connection; credentials are supplied at runtime, never in save data. */
+export function compatibleConnection({ endpoint, model, apiKey = '', fetchImpl = fetch, tokenParameter = 'auto', maxOutputTokens }) {
+    const url = connectionUrl(endpoint);
     invariant(['auto', 'max_tokens', 'max_completion_tokens'].includes(tokenParameter), '不支持的辅助输出长度参数');
     const openaiReasoning = /(?:^|\/)(?:gpt-[56](?:[.\-]|$)|o[134](?:-|$))/i.test(model);
     const lengthParameter = tokenParameter === 'auto' ? openaiReasoning ? 'max_completion_tokens' : 'max_tokens' : tokenParameter;

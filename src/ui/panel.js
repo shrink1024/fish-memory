@@ -626,9 +626,13 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         const modeField = selectField('连接方式', mode, [['raw', '沿用酒馆连接'], ['compatible', '单独的兼容接口']], value => { connectionModeDraft = value; render(); }); panel.append(modeField.wrap);
         if (mode === 'compatible') {
             panel.append(field('接口基础地址', connectionDraft.endpoint, value => { connectionDraft.endpoint = value; }, { placeholder: 'https://…/v1', hint: '鱼忆会在地址后添加 /chat/completions。' }).wrap,
-                field('模型名称', connectionDraft.model, value => { connectionDraft.model = value; }).wrap,
-                field('辅助输出额度（token，可留空）', connectionDraft.maxOutputTokens, value => { connectionDraft.maxOutputTokens = value; }, { type: 'number', hint: '留空沿用服务端默认值。思考也可能占用额度；截断时可按模型支持范围填写更大值，如 32768。较大额度可能增加费用，应用连接后生效。' }).wrap,
-                field('接口密钥', connectionDraft.apiKey, value => { connectionDraft.apiKey = value; }, { type: 'password', hint: view.connection?.hasApiKey ? '已保存密钥；地址不变时留空可继续使用。更换地址需重新填写。' : '只用于本次连接，不写入存档。' }).wrap);
+                field('接口密钥', connectionDraft.apiKey, value => { connectionDraft.apiKey = value; }, { type: 'password', hint: view.connection?.hasApiKey ? '已保存密钥；地址不变时留空可继续使用。更换地址需重新填写。' : '只用于本次连接，不写入存档。' }).wrap,
+                field('模型名称', connectionDraft.model, value => { connectionDraft.model = value; }, { hint: '可直接填写，或先点“获取模型列表”再从列表选择。' }).wrap,
+                button('获取模型列表', () => call(() => controller.fetchModels({ endpoint: connectionDraft.endpoint, apiKey: connectionDraft.apiKey }), '已获取模型列表')));
+            const listed = view.modelList?.endpoint === connectionDraft.endpoint.trim().replace(/\/$/, '') ? view.modelList.models : [];
+            if (listed.length) panel.append(selectField('从列表选择', listed.includes(connectionDraft.model) ? connectionDraft.model : '',
+                [['', `共 ${listed.length} 个模型，选择后填入模型名称`], ...listed.map(id => [id, id])], value => { if (value) { connectionDraft.model = value; render(); } }, 'model-list').wrap);
+            panel.append(field('辅助输出额度（token，可留空）', connectionDraft.maxOutputTokens, value => { connectionDraft.maxOutputTokens = value; }, { type: 'number', hint: '留空沿用服务端默认值。思考也可能占用额度；截断时可按模型支持范围填写更大值，如 32768。较大额度可能增加费用，应用连接后生效。' }).wrap);
         }
         if (view.activity) panel.append(h('p', 'dwm-muted', '任务正在运行，请先停止或等待完成，再应用连接。'));
         panel.append(button('应用连接', () => call(async () => {

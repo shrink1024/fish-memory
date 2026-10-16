@@ -10,7 +10,7 @@ import { clone, invariant, uid, isPrefix, SerialQueue } from '../core/util.js';
 import { planWindow } from '../core/window.js';
 import { maintenanceFocus } from '../core/focus.js';
 import { applyMaintenance } from '../core/operations.js';
-import { AgentClient, compatibleConnection, untilAborted, serializeAgentInput, requestMessages, REASONING_EFFORTS } from '../agents/client.js';
+import { AgentClient, compatibleConnection, listModels, untilAborted, serializeAgentInput, requestMessages, REASONING_EFFORTS } from '../agents/client.js';
 import { classifyEntries, alignStrategy, maintain, select, compact, mergeSourceUpdates } from '../agents/tasks.js';
 import { prescan, DEFERRED } from '../agents/prescan.js';
 import { discoverRules, compileRules, applyRules, evaluateRules } from '../rules/index.js';
@@ -58,6 +58,7 @@ export class Controller {
     #initializationContextFingerprint = '';
     #initializationClassificationFingerprint = '';
     #connectionConfig = null;
+    #modelList = null;
     constructor(host, { model, traces = createTraceStore(), settings = {}, persistSettings = async () => {}, chooseFallback = async () => 'cancel', connectionStore = null } = {}) {
         this.host = host; this.settings = { ...DEFAULT_SETTINGS, ...settings, ...normalizeTimeoutSettings(settings) };
         if (!Number.isInteger(this.settings.maintenanceEvery) || this.settings.maintenanceEvery < 1 || this.settings.maintenanceEvery > MAINTENANCE_EVERY_MAX) this.settings.maintenanceEvery = DEFAULT_SETTINGS.maintenanceEvery;
@@ -652,6 +653,7 @@ export class Controller {
             save: this.store?.state ? playerView(this.store.state) : null,
             sourceBook: this.store?.state?.bookName ?? '', connectionMode: this.connectionMode,
             connection: { mode: this.connectionMode, endpoint: this.#connectionConfig?.endpoint ?? '', model: this.#connectionConfig?.model ?? '', maxOutputTokens: this.#connectionConfig?.maxOutputTokens, hasApiKey: Boolean(this.#connectionConfig?.apiKey) },
+            modelList: clone(this.#modelList),
             mvu: clone(this.mvu), diagnostics: { ...clone(this.diagnostics), memory: memoryMetrics(this.store?.state),
                 pendingCount: Math.max(0, this.host.snapshot().messages.length - (this.store?.state.processed.length ?? 0)) } };
     }
@@ -810,6 +812,17 @@ export class Controller {
             this.#initializationNotice('retry', '扫描已中断，已保存的进度保留；可继续扫描', true);
         }
         this.#state(reason);
+    }
+    /** Fill-in help for the separate connection. A blank key reuses the saved
+     * one only for the same endpoint, exactly as applying a connection does. */
+    async fetchModels({ endpoint, apiKey } = {}) {
+        const normalized = String(endpoint ?? '').trim().replace(/\/$/, '');
+        invariant(normalized, '请先填写接口基础地址');
+        const key = apiKey || (normalized === this.#connectionConfig?.endpoint ? this.#connectionConfig.apiKey : '');
+        const models = await listModels({ endpoint: normalized, apiKey: key });
+        this.#modelList = { endpoint: normalized, models };
+        this.#notify();
+        return { executed: true, message: `已获取 ${models.length} 个模型，可在“从列表选择”里挑选` };
     }
     async updateConnection({ mode = 'raw', endpoint, model, apiKey, maxOutputTokens }) {
         invariant(!this.view().activity, '请先停止或等待当前任务完成，再应用连接；当前任务继续运行。');
