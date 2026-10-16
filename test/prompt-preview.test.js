@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createSave, createEntry, makeSourceEntry, DEFAULT_SETTINGS } from '../src/core/state.js';
 import { buildPromptPreview } from '../src/diagnostics/prompt-preview.js';
-import { initializeRequest, strategyRequest, selectRequest, maintainRequest, compactRequest, selectionMessages } from '../src/agents/requests.js';
+import { initializeRequest, strategyRequest, selectRequest, maintainRequest, compactRequest, selectionMessages, sourceRole } from '../src/agents/requests.js';
 import { classifyEntries, alignStrategy, select, maintain, compact } from '../src/agents/tasks.js';
 import { compileRules } from '../src/rules/index.js';
 
@@ -72,8 +72,10 @@ test('current preview matches real task inputs while preserving backlog and unse
     f.snapshot.messages = Array.from({ length: 8 }, (_, i) => ({ key: `m${i}`, role: i % 2 ? 'assistant' : 'user', content: `消息${i}` }));
     f.save.processed = ['m0', 'm1']; f.snapshot.userInput = '继续去渡口'; f.settings.recentTurns = 1;
     const expectedRecent = [...f.snapshot.messages.slice(2), { key: 'current-input', role: 'user', content: '继续去渡口' }];
+    // Auxiliary inputs label story text as archival material rather than a live turn.
+    const asMaterial = messages => messages.map(({ key, role, content }) => ({ key, role: sourceRole(role), content, source: '存档正文' }));
     const preview = buildPromptPreview(f);
-    assert.deepEqual(get(preview, 'select').input.messages, expectedRecent);
+    assert.deepEqual(get(preview, 'select').input.messages, asMaterial(expectedRecent));
     assert.deepEqual(inputAndSystem(get(preview, 'select')), inputAndSystem(selectRequest(f.save, expectedRecent)));
     assert.deepEqual(inputAndSystem(get(preview, 'maintain-1')), inputAndSystem(maintainRequest(f.save, f.snapshot.messages.slice(2))));
     assert.equal(get(preview, 'maintain-1').input.messages.some(message => message.key === 'current-input'), false);

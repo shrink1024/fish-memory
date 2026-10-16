@@ -1,8 +1,10 @@
 import { clone, isPrefix } from '../core/util.js';
 import { DEFAULT_SETTINGS, makeSourceEntry, entryText, normalizeScopeId, readableScopes, entryScope } from '../core/state.js';
 import { applyRules, compileRules, discoverRules } from '../rules/index.js';
-import { INITIALIZE, ALIGN_STRATEGY, MAINTAIN, SELECT, COMPACT } from '../agents/prompts.js';
+import { INITIALIZE, ALIGN_STRATEGY, MAINTAIN, MAINTAIN_REWRITE, SELECT, COMPACT } from '../agents/prompts.js';
 import { initializeRequest, selectRequest, maintainRequest, compactRequest, requestBatches, selectionMessages, INITIALIZATION_BATCH_ITEMS } from '../agents/requests.js';
+import { prescan } from '../agents/prescan.js';
+import { maintenanceFocus } from '../core/focus.js';
 
 const AGENTS = {
     initialize: { id: 'fish-initialize', title: '鱼忆 · 初始化 Agent', description: '扫描主世界书、分类资料并统合记忆策略；分批扫描与策略统合属于同一职责。', identified: true },
@@ -68,7 +70,8 @@ export function buildPromptPreview({ snapshot, save = null, settings: suppliedSe
     let groups = null;
     if (Array.isArray(rawEntries) && context.bookName) {
         const entries = rawEntries.filter(entry => !rules.configEntryUids.includes(entry.uid)).map(entry => makeSourceEntry(context.bookName, entry));
-        groups = requestBatches(entries, settings.batchChars, entryText, INITIALIZATION_BATCH_ITEMS);
+        // Disabled and pure-script entries are settled without a model call.
+        groups = requestBatches(prescan(entries).pending, settings.batchChars, entryText, INITIALIZATION_BATCH_ITEMS);
         if (!groups.length) stages.push(stage(AGENTS.initialize, 'initialize', '扫描世界书', 'skipped', '主书没有需要分类的条目，本步不调用模型。', { system: INITIALIZE }));
         for (const [index, batch] of groups.entries()) stages.push(stage(AGENTS.initialize, `initialize-${index + 1}`, `扫描世界书 · ${index + 1}/${groups.length}`,
             initialized || busy.initializing ? 'conditional' : 'ready',
@@ -83,7 +86,7 @@ export function buildPromptPreview({ snapshot, save = null, settings: suppliedSe
         : !pathMatches ? '需先依据当前所选剧情回放存档，当前版本不能当作本轮输入。' : '';
     if (unavailableReason) {
         stages.push(stage(AGENTS.select, 'select', '前置选材', 'unavailable', unavailableReason, { system: SELECT }, ['动态目录、常驻脉络和选材输入待存档就绪后确定。']));
-        stages.push(stage(AGENTS.maintain, 'maintain', '后置维护', 'unavailable', unavailableReason, { system: MAINTAIN }, ['初始化后的记忆以及待维护剧情批次尚未确定。']));
+        stages.push(stage(AGENTS.maintain, 'maintain', '后置维护', 'unavailable', unavailableReason, { system: settings.summaryMode === 'rewrite' && settings.memoryMode !== 'worldbook' ? MAINTAIN_REWRITE : MAINTAIN }, ['初始化后的记忆以及待维护剧情批次尚未确定。']));
         stages.push(stage(AGENTS.maintain, 'compact', '整理事件', 'unavailable', unavailableReason, { system: COMPACT }, ['当前范围脉络和可整理事件尚未确定。']));
         return { at, chatId: context.chatId ?? null, revision: sameSave ? save.revision : null, warnings, stages };
     }
@@ -102,12 +105,13 @@ export function buildPromptPreview({ snapshot, save = null, settings: suppliedSe
         selectRequest(save, recent, { eligible: eligibleHere, selectionLimit: settings.selectionLimit, selectionChars: settings.selectionChars, observedState: selectObservation }), selectUncertainties));
 
     const safeSave = guarded(save, compiledRules), pending = pendingBatches(context, save, settings);
+    if (settings.summaryMode === 'rewrite' && settings.memoryMode !== 'worldbook') safeSave.summaryRewrite = true;
     const deferred = Boolean(save.data.scopeContext?.deferPost);
     const maintenanceNotes = deferred ? ['角色卡尚未提交本轮资料范围，后置暂停。解除暂停后的归属范围仍可能变化。'] : [];
     if (pending.length) {
         for (const [index, batch] of pending.entries()) {
             const observation = observationFor(observedState, context, batch, settings);
-            const request = maintainRequest(safeSave, batch, batch[0].scopeId, observation);
+            const request = maintainRequest(safeSave, batch, batch[0].scopeId, observation, { focus: maintenanceFocus(safeSave, batch[0].scopeId, batch) });
             const unknown = [...maintenanceNotes];
             if (index) {
                 delete request.input.memory;

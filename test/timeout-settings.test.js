@@ -89,7 +89,7 @@ test('invalid stored timeouts fall back safely while invalid updates never save 
 });
 
 test('worldbook batches and the actual historical initialization/maintenance path get independent long-task budgets', async t => {
-    const timers = controlledTimeouts(t), f = fixture({ settings: { batchChars: 1, scanConcurrency: 1 } });
+    const timers = controlledTimeouts(t), f = fixture({ settings: { batchChars: 1, historyBatchChars: 1, scanConcurrency: 1 } });
     await f.controller.start(); await f.controller.initialize();
     assert.deepEqual(f.calls.map(call => call.purpose), ['initialize', 'initialize', 'strategy', 'maintain', 'maintain']);
     assert.deepEqual(timers.map(timer => timer.milliseconds), Array(5).fill(1800000));

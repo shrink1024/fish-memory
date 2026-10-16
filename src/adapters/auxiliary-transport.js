@@ -1,5 +1,5 @@
 import { throwIfAborted } from '../platform/abort.js';
-import { auxiliaryResponseLength, assertCompleteModelResponse, boundedResponseLength, modelApiError } from '../agents/client.js';
+import { auxiliaryResponseLength, assertCompleteModelResponse, boundedResponseLength, modelApiError, requestMessages } from '../agents/client.js';
 
 /** Dedicated auxiliary transport using ST's connection parameter builders only.
  * No generation/prompt events, macro expansion of source data, or reply cleanup. */
@@ -8,7 +8,7 @@ export async function generateAuxiliary({ params, context, script, openai, textg
     const signal = params.signal;
     throwIfAborted(signal);
     const requestedLength = params.responseLength ?? auxiliaryResponseLength(params.purpose, params.input);
-    const messages = [{ role: 'system', content: String(params.system ?? '') }, { role: 'user', content: String(params.input ?? '') }];
+    const messages = requestMessages(params);
     let data, url, templateStops = [];
     if (api === 'openai') {
         if (typeof openai?.createGenerationParameters !== 'function') throw new Error('当前酒馆缺少独立辅助请求接口，请更新酒馆或配置单独辅助连接。');
@@ -18,6 +18,8 @@ export async function generateAuxiliary({ params, context, script, openai, textg
         const responseLength = boundedResponseLength(requestedLength, settings.openai_max_tokens, metadata);
         Object.assign(settings, { openai_max_tokens: responseLength, stream_openai: false, n: 1,
             function_calling: false, enable_web_search: false, request_images: false });
+        // The story's thinking effort is not inherited unless the player asks.
+        if (params.reasoningEffort && params.reasoningEffort !== 'inherit') settings.reasoning_effort = params.reasoningEffort;
         ({ generate_data: data } = await openai.createGenerationParameters(settings, model, 'quiet', messages));
         url = '/api/backends/chat-completions/generate';
     } else if (api === 'textgenerationwebui') {

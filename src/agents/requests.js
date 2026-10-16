@@ -1,10 +1,19 @@
 import { clone } from '../core/util.js';
 import { entryText, scopeSummary, readableScopes, GLOBAL_SCOPE } from '../core/state.js';
 import { frontCatalog, maintenanceView, hasProtectedReferences } from '../core/views.js';
-import { INITIALIZE, ALIGN_STRATEGY, MAINTAIN, SELECT, COMPACT } from './prompts.js';
+import { INITIALIZE, ALIGN_STRATEGY, MAINTAIN, MAINTAIN_REWRITE, SELECT, COMPACT } from './prompts.js';
 
 export const INITIALIZATION_BATCH_ITEMS = 24;
 export const isReadableMessage = message => !message.hidden || message.hiddenBy === 'dynamic-world-memory';
+
+/** Story text entering an auxiliary task is archival material, not a live
+ * turn addressed to the model. Marking the speaker keeps the projection's
+ * provenance explicit so the material is read as a record to file. */
+export function sourceRole(role) {
+    if (role === 'user') return 'player';
+    if (role === 'assistant') return 'character';
+    return role === 'system' ? 'narration' : 'material';
+}
 
 // Both the executing tasks and read-only previews use these projections. Nothing
 // in a save envelope (audit, journal, source baselines) is passed wholesale.
@@ -24,13 +33,16 @@ function referenceInstructions(memory) {
 }
 /** Player chose "仅动态世界书": keep the worldbook current, nothing else. */
 export const WORLDBOOK_ONLY_NOTE = '本存档使用“仅动态世界书”模式：只用 update 更新已有条目；不要新增条目或晋升人物，不要返回 create、promote、summary、inventory 或 mergeEvents。';
-export function maintainRequest(save, messages, scopeId = GLOBAL_SCOPE, observedState = null) {
-    const memory = maintenanceView(save, scopeId, { includeProvenance: false });
+/** Second pass for entries the first pass listed in needEntries. */
+export const FOLLOW_UP_NOTE = '补充更新：上一步已处理这批正文，并请求了 memory.entries 中这些条目的全文。本次只用 update 修改其中被本批正文改变的事实；不要返回 appendSummary、summary、create、promote、inventory、mergeEvents 或 needEntries。无需修改时返回空数组。';
+export function maintainRequest(save, messages, scopeId = GLOBAL_SCOPE, observedState = null, { focus = null, followUp = false } = {}) {
+    const memory = maintenanceView(save, scopeId, { includeProvenance: false, focus });
+    const notes = [save.worldbookOnly ? WORLDBOOK_ONLY_NOTE : '', followUp ? FOLLOW_UP_NOTE : ''].filter(Boolean);
     // Keep this projection's private reference capability for task validation;
     // serialized requests and diagnostics contain only the masked plain data.
-    return { purpose: 'maintain', system: save.worldbookOnly ? `${MAINTAIN}\n${WORLDBOOK_ONLY_NOTE}` : MAINTAIN,
+    return { purpose: 'maintain', system: [save.summaryRewrite ? MAINTAIN_REWRITE : MAINTAIN, ...notes].join('\n'),
         input: { memory, ...referenceInstructions(memory), ...(observedState ? { observedState: clone(observedState) } : {}),
-            messages: messages.filter(isReadableMessage).map(({ key, role, content }) => ({ key, role, content, scopeId })) } };
+            messages: messages.filter(isReadableMessage).map(({ key, role, content }) => ({ key, role: sourceRole(role), content, source: '存档正文', scopeId })) } };
 }
 export function selectRequest(save, messages, { eligible = () => true, selectionLimit = 16, selectionChars = 24000, observedState = null } = {}) {
     messages = messages.filter(isReadableMessage);
@@ -39,11 +51,12 @@ export function selectRequest(save, messages, { eligible = () => true, selection
         input: { strategy: save.data.strategy, summary: [...readableScopes(save.data.scopeContext)].map(scopeId => { const text = scopeSummary(save.data, scopeId); return text ? (scopeId === GLOBAL_SCOPE ? text : `【范围 ${scopeId}】\n${text}`) : ''; }).filter(Boolean).join('\n\n'),
             scopeContext: { activeScopeId: save.data.scopeContext?.activeScopeId ?? GLOBAL_SCOPE, requestedScopeIds: save.data.scopeContext?.requestedScopeIds ?? [] }, selectionLimit, selectionChars, catalog,
             ...(observedState ? { observedState } : {}),
-            messages: messages.map(({ key, role, content }) => ({ key, role, content })) } });
+            messages: messages.map(({ key, role, content }) => ({ key, role: sourceRole(role), content, source: '存档正文' })) } });
 }
-export function compactRequest(save, scopeId = GLOBAL_SCOPE) {
+export function compactRequest(save, scopeId = GLOBAL_SCOPE, { summaryOnly = false } = {}) {
     const memory = maintenanceView(save, scopeId);
-    memory.entries = memory.entries.filter(e => e.kind === 'event').map(e => ({ ...e,
+    delete memory.catalog;
+    memory.entries = memory.entries.filter(e => !summaryOnly && e.kind === 'event').map(e => ({ ...e,
         mergeable: !save.data.entries[e.id].source && save.data.entries[e.id].segments.every(s => s.writable) }));
     return { purpose: 'compact', system: COMPACT, input: { memory, ...referenceInstructions(memory) } };
 }

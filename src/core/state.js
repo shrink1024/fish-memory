@@ -10,10 +10,17 @@ export const DEFAULT_SETTINGS = Object.freeze({
     windowEnabled: true,
     // 'worldbook' keeps only dynamic entries plus selection: no summary, events or inventory.
     memoryMode: 'full',
+    // 'append' adds a short paragraph per batch; 'rewrite' rewrites the whole summary.
+    summaryMode: 'append',
     // Independent worldbook classification batches sent at the same time.
     scanConcurrency: 3,
+    // Thinking effort for auxiliary tasks; 'inherit' follows the story preset.
+    auxReasoningEffort: 'low',
     recentTurns: 12,
     batchChars: 18000,
+    // Initialization history batches. Each batch carries fixed memory overhead,
+    // so fewer, larger batches cost less than per-turn sized ones.
+    historyBatchChars: 40000,
     maintenanceEvery: 3,
     timeoutMs: 300000,
     initializationTimeoutMs: 1800000,

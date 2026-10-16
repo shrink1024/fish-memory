@@ -34,7 +34,7 @@ function fixture({ handler, writeHandler, settings = {} } = {}) {
         if (request.purpose === 'maintain') return { operations: [{ type: 'summary', text: request.input.messages.at(-1).key }] };
         return { ids: [] };
     } };
-    const make = () => new Controller(host, { model, settings: { enabled: true, batchChars: 1, ...settings } });
+    const make = () => new Controller(host, { model, settings: { enabled: true, batchChars: 1, historyBatchChars: 1, ...settings } });
     return { controller: make(), make, host, state, book, saved, calls, writes };
 }
 const histories = calls => calls.filter(call => call.purpose === 'maintain').flatMap(call => call.input.messages.map(message => message.key));

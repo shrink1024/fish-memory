@@ -32,7 +32,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
     let ruleNL = '', ruleScript = '', ruleOutput = '', ruleMatch = { field: 'title', op: 'contains', value: '', action: 'lock', limit: '' };
     let recentTurnsDraft = null, timeoutDraft = null, cadenceDraft = null, mvuDraft = null, connectionModeDraft = null, lastSaveId = null;
     let localPreview = null;
-    let applicationSelection = new Set(), applicationKey = null;
+    let applicationSelection = new Set(), applicationPositions = {}, applicationKey = null;
     const entryDrafts = new Map(), poolDrafts = new Map(), expanded = new Set(), scrollPositions = new Map();
     const connectionDraft = { endpoint: '', model: '', apiKey: '', maxOutputTokens: undefined };
     const h = (tag, className = '', content) => {
@@ -274,7 +274,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
             item.setAttribute('aria-current', entry.id === selected ? 'true' : 'false');
             const meta = h('div', 'dwm-entry-meta'); meta.append(h('span', '', KIND_NAMES[entry.kind] ?? entry.kind));
             if (entry.needsReview) meta.append(h('span', 'dwm-review-label', '待核对'));
-            else if (!entry.enabled) meta.append(h('span', '', '已停用'));
+            else if (!entry.enabled) meta.append(h('span', '', entry.status === 'deferred' ? '已停用 · 启用后扫描' : '已停用'));
             else if (entry.constant || entry.important) meta.append(h('span', '', '常驻'));
             item.append(meta, h('strong', '', entry.title || '未命名条目'), h('span', 'dwm-entry-intro', entry.intro || '暂无简介')); list.append(item);
         }
@@ -318,7 +318,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         const back = button('返回资料列表', () => { mobileDetail = false; render(); container.querySelector('[data-focus="entry-search"]')?.focus({ preventScroll: true }); }, { navigation: true, className: 'dwm-mobile-back' }); parent.append(back);
         const meta = h('div', 'dwm-entry-heading-meta'); meta.append(badge(KIND_NAMES[entry.kind] ?? entry.kind));
         meta.append(badge(entry.constant ? '蓝灯 · 常驻' : entry.important ? '重要人物 · 常驻' : '前置按需选材'));
-        if (!entry.enabled) meta.append(badge('已停用'));
+        if (!entry.enabled) meta.append(badge(entry.status === 'deferred' ? '已停用 · 原书启用后同步即扫描' : '已停用'));
         if (entry.needsReview) meta.append(badge('待核对', 'dwm-review-badge'));
         parent.append(meta);
         const title = h('h3', 'dwm-entry-title', entry.title || '未命名条目'); title.tabIndex = -1; title.dataset.detailHeading = 'true'; parent.append(title);
@@ -494,6 +494,15 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         usage.append(modeChoice.wrap, h('p', 'dwm-muted', current.memoryMode === 'worldbook'
             ? '仅动态世界书：只更新已有条目，不新增条目或晋升人物；不再维护和发送故事脉络、事件与物品，历史窗口不省略原文；已有资料保留，切回完整记忆即可继续使用。'
             : '想只用动态世界书、关掉脉络与事件记忆时，可在这里切换。'));
+        if (current.memoryMode !== 'worldbook') {
+            const rewrite = (current.summaryMode ?? DEFAULT_SETTINGS.summaryMode) === 'rewrite';
+            usage.append(selectField('故事脉络写法', rewrite ? 'rewrite' : 'append',
+                [['append', '追加（默认）：每批只写新增的一段'], ['rewrite', '整段重写：每批把整段脉络重写一遍']],
+                value => call(() => controller.updateSettings({ summaryMode: value }), value === 'rewrite' ? '已改为整段重写，从下一次整理生效' : '已改为追加，从下一次整理生效')).wrap,
+            h('p', 'dwm-muted', rewrite
+                ? '整段重写：脉络始终是一段连贯的概述，但每批都要输出完整脉络，长聊天扫描和后台整理明显更慢、更费 token。'
+                : '追加：每批只写新增的一小段，扫描和后台整理更快、更省；两次整理之间脉络像按时间往后记的记录，超过 8000 字时自动整理成连贯概述。'));
+        }
         usage.append(toggle('由鱼忆管理历史窗口', Boolean(current.windowEnabled), '只在当次发送中省略已记入且超出近期范围的原文，不写入持久隐藏。与其他自动隐藏工具请只启用一方。', value => call(() => controller.updateSettings({ windowEnabled: value }))));
         if (view.window) usage.append(h('p', 'dwm-muted', `${Number.isInteger(view.window.omittedCount) ? `本轮已省略 ${view.window.omittedCount} 条旧原文。` : ''}${view.window.reason || ''}`));
         const rounds = field('保留最近几轮完整对话', recentTurnsDraft ?? current.recentTurns ?? 12, value => { recentTurnsDraft = value; }, { type: 'number' }); rounds.input.min = '1'; rounds.input.max = '1000';
@@ -528,6 +537,10 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         concurrency.append(selectField('同时扫描的批数', String(current.scanConcurrency ?? DEFAULT_SETTINGS.scanConcurrency),
             [['1', '1 批（逐批）'], ['2', '2 批'], ['3', '3 批（默认）'], ['4', '4 批'], ['6', '6 批']],
             value => call(() => controller.updateSettings({ scanConcurrency: Number(value) }), '扫描速度已保存')).wrap);
+        concurrency.append(selectField('辅助任务思考强度', current.auxReasoningEffort ?? DEFAULT_SETTINGS.auxReasoningEffort,
+            [['low', '低（默认，最快）'], ['medium', '中'], ['high', '高'], ['auto', '交给模型自动'], ['inherit', '沿用酒馆预设']],
+            value => call(() => controller.updateSettings({ auxReasoningEffort: value }), '思考强度已保存')).wrap);
+        concurrency.append(h('p', 'dwm-muted', '扫描、选材和整理用不着深度思考，思考越多越慢、越贵。只影响鱼忆的辅助请求，不改正文的设置；模型不支持调节时此项无效。'));
         parent.append(concurrency);
         renderTimeouts(parent, current);
 
@@ -563,11 +576,12 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         if (applicationKey !== key) {
             applicationKey = key;
             applicationSelection = new Set(draft?.selectedIds ?? (preset.stale ? [] : preset.saved?.selectedIds) ?? []);
+            applicationPositions = { ...(preset.stale ? {} : preset.saved?.positions ?? {}) };
         }
         const panel = card('预设应用', '为鱼忆选择当前预设中的文本条目。仅影响此存档的辅助请求，不改酒馆正文的预设开关。');
         panel.append(h('p', 'dwm-muted', `当前预设：${preset.name || '尚不可读取'} · ${preset.entries.length} 个文本条目`));
         const scopeNote = details('哪些内容会应用？', 'preset-scope-note');
-        scopeNote.append(h('p', 'dwm-muted', '按当前预设顺序插入选中的完整文本。角色卡、聊天历史等占位块不在此处；脚本不执行，宏占位符保留原文。鱼忆自身的任务、输出格式与读写权限仍有效。条目越多，每次辅助请求的输入开销越大。'));
+        scopeNote.append(h('p', 'dwm-muted', '选中的条目按原文和原角色包住鱼忆的任务：“头部”放在任务之前，“尾部”放在任务输入之后、整个请求的最后。默认沿用预设本身的位置：排在聊天记录之后或按深度插入的条目算尾部，其余算头部，可逐条改。角色卡、聊天历史等占位块不在此处；脚本不执行，宏占位符保留原文。尾部条目离输出最近，若要求写正文或改变输出格式，可能让辅助任务失败。条目越多，每次辅助请求的输入开销越大。'));
         panel.append(scopeNote);
         if (preset.stale) panel.append(h('p', 'dwm-warning', '原预设已变化，旧选择暂停应用。请重新检查并应用。'));
         if (!preset.saved && view.preset?.saved?.selected?.length) panel.append(h('p', 'dwm-muted', '旧版已确认的语言偏好仍生效；应用这里的选择后会替换旧偏好。'));
@@ -584,11 +598,19 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
             item.append(toggle(entry.title, applicationSelection.has(entry.id), `原预设：${entry.enabled ? '开启' : '关闭'}${recommended ? ` · ${recommended}` : ''}`, value => {
                 if (value) applicationSelection.add(entry.id); else applicationSelection.delete(entry.id); render();
             }));
+            if (applicationSelection.has(entry.id)) {
+                const position = applicationPositions[entry.id] ?? entry.position ?? 'head';
+                const label = value => `${value === 'head' ? '头部（任务之前）' : '尾部（请求最后）'}${value === entry.position ? ' · 预设原位置' : ''}`;
+                item.append(selectField('插入位置', position, [['head', label('head')], ['tail', label('tail')]], value => {
+                    if (value === entry.position) delete applicationPositions[entry.id]; else applicationPositions[entry.id] = value; render();
+                }, `preset-position-${entry.id}`).wrap);
+            }
             const source = details('查看条目原文', `preset-entry-${entry.id}`);
             source.append(h('pre', 'dwm-preset-source', entry.content)); item.append(source); panel.append(item);
         }
         panel.append(button('应用到辅助请求', () => call(async () => {
-            await controller.savePresetApplication([...applicationSelection], preset.fingerprint);
+            await controller.savePresetApplication([...applicationSelection], preset.fingerprint,
+                Object.fromEntries(Object.entries(applicationPositions).filter(([id]) => applicationSelection.has(id))));
             applicationKey = null;
         }, '已应用，可在“收发”核对提示预览与实际请求'), { disabled }));
         parent.append(panel);

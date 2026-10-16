@@ -1,6 +1,6 @@
 import { clone, invariant, plainText, uid, limitText } from './util.js';
 import { assertNoPendingProtectedReferences } from './views.js';
-import { createEntry, assertOriginalPreserved, entryText, entryScope, normalizeScopeId, GLOBAL_SCOPE } from './state.js';
+import { createEntry, assertOriginalPreserved, entryText, entryScope, normalizeScopeId, scopeSummary, GLOBAL_SCOPE } from './state.js';
 
 // Navigation sources, not a claim that every retained fact is supported by every
 // source. Keep both the early origin and recent changes without endless growth.
@@ -29,6 +29,16 @@ export function applyMaintenance(data, result, { allowedEvidence = [], maxChars 
             if (scopeId === GLOBAL_SCOPE) next.summary = text;
             else (next.scopeSummaries ??= {})[scopeId] = text;
             touched.add('$summary');
+        } else if (op.type === 'appendSummary') {
+            // Maintenance adds to the running summary; compaction rewrites it.
+            const text = plainText(op.text, '新增脉络', 8000).trim();
+            if (text) {
+                const current = scopeSummary(next, scopeId);
+                const joined = current ? `${current}\n${text}` : text;
+                if (scopeId === GLOBAL_SCOPE) next.summary = joined;
+                else (next.scopeSummaries ??= {})[scopeId] = joined;
+                touched.add('$summary');
+            }
         } else if (op.type === 'inventory') {
             invariant(next.inventoryEnabled, '物品清单已关闭，禁止继续维护');
             invariant(Array.isArray(op.items) && op.items.length <= 200, '物品清单无效');

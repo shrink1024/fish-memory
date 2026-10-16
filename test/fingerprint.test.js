@@ -27,7 +27,7 @@ function fixture() {
         if (fail && request.input.messages[0].key === 'floor-2') throw Error('合成第二批中断');
         return { operations: [] };
     } };
-    return { make: () => new Controller(host, { model, settings: { batchChars: 1 } }), book, saved, calls, succeed: () => { fail = false; } };
+    return { make: () => new Controller(host, { model, settings: { batchChars: 1, historyBatchChars: 1 } }), book, saved, calls, succeed: () => { fail = false; } };
 }
 
 test('HTTP-like environments without subtle can initialize, retain a checkpoint, and resume after reload', async t => {

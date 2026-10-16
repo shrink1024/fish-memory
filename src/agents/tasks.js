@@ -49,15 +49,27 @@ export async function alignStrategy(client, strategies, entries, naturalLanguage
         result => plainText(result.strategy, '统一记忆策略', 10000));
 }
 
-export async function maintain(client, save, messages, signal, scopeId = GLOBAL_SCOPE, observedState = null, validate = () => {}) {
-    const request = maintainRequest(save, messages, scopeId, observedState);
+export async function maintain(client, save, messages, signal, scopeId = GLOBAL_SCOPE, observedState = null, validate = () => {}, { focus = null, followUp = false } = {}) {
+    const request = maintainRequest(save, messages, scopeId, observedState, { focus, followUp });
+    const full = new Set(request.input.memory.entries.map(entry => entry.id));
+    const listed = new Set((request.input.memory.catalog ?? []).map(entry => entry.id));
     return completeTask(client, { ...request, signal }, result => {
         invariant(Array.isArray(result.operations), '后置维护须返回 operations 操作列表；无变化时返回空数组');
-        const restored = restoreProtectedReferences(result, request.input.memory);
+        // Catalog entries were not supplied in full: an edit to one becomes a
+        // request for its text, answered by a separate follow-up pass.
+        const needed = new Set(followUp ? [] : (Array.isArray(result.needEntries) ? result.needEntries : []).filter(id => listed.has(id)));
+        const { needEntries: _needEntries, ...rest } = result;
+        const kept = { ...rest, operations: result.operations.filter(op => {
+            if (op?.type !== 'update' || !listed.has(op.id)) return true;
+            if (!followUp) needed.add(op.id);
+            return false;
+        }) };
+        const restored = restoreProtectedReferences(kept, request.input.memory);
         // Worldbook-only saves never keep narrative memory; ignore such operations
         // instead of failing the batch (the history window does not trim here).
-        if (save.worldbookOnly) restored.operations = restored.operations.filter(op => op?.type === 'update');
+        if (save.worldbookOnly || followUp) restored.operations = restored.operations.filter(op => op?.type === 'update' && (!followUp || full.has(op.id)));
         validate(restored);
+        if (needed.size) restored.needEntries = [...needed].slice(0, 12);
         return restored;
     });
 }
@@ -73,8 +85,8 @@ export async function select(client, save, messages, { eligible = () => true, se
         return ids;
     });
 }
-export async function compact(client, save, signal, scopeId = GLOBAL_SCOPE) {
-    const request = compactRequest(save, scopeId);
+export async function compact(client, save, signal, scopeId = GLOBAL_SCOPE, { summaryOnly = false } = {}) {
+    const request = compactRequest(save, scopeId, { summaryOnly });
     const memory = request.input.memory;
     return completeTask(client, { ...request, signal }, result => {
         invariant(Array.isArray(result.operations) && result.operations.every(op => op && ['summary', 'update', 'mergeEvents'].includes(op.type)), '整理只能更新脉络与给出的历史事件');

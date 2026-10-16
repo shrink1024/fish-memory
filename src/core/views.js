@@ -21,7 +21,7 @@ function referenceSource(memory, source) {
     return source[2] === 'segment' ? entry?.segments.find(segment => segment.id === source[3])?.text : entry?.[source[2]];
 }
 function referenceAllowed(source, operation, path) {
-    if (operation.type === 'summary') return path.length === 1 && path[0] === 'text' && source[0] === 'summary';
+    if (['summary', 'appendSummary'].includes(operation.type)) return path.length === 1 && path[0] === 'text' && source[0] === 'summary';
     if (operation.type === 'inventory') return path.length === 3 && path[0] === 'items' && source[0] === 'inventory'
         && path[1] === source[1] && path[2] === source[2];
     if (operation.type === 'update' && source[0] === 'entry' && operation.id === source[1]) {
@@ -155,7 +155,9 @@ export function frontRead(save, ids, eligible = () => true, context = save.data.
         return { id, scopeId: entryScope(e), title: e.title, kind: e.kind, content: entryText(e) };
     });
 }
-export function maintenanceView(save, scopeId = GLOBAL_SCOPE, { includeProvenance = true } = {}) {
+/** `focus` (a Set of ids) limits full text to the entries this batch needs;
+ * the rest of the writable memory is listed as a catalog the agent can ask for. */
+export function maintenanceView(save, scopeId = GLOBAL_SCOPE, { includeProvenance = true, focus = null } = {}) {
     scopeId = normalizeScopeId(scopeId);
     const protectedBodies = Object.values(save.data.entries)
         .flatMap(e => e.segments.filter(s => !e.enabled || !s.writable).map(s => s.text))
@@ -163,10 +165,11 @@ export function maintenanceView(save, scopeId = GLOBAL_SCOPE, { includeProvenanc
         // Replacing it everywhere corrupts otherwise unrelated narrative text.
         .filter(body => typeof body === 'string' && (body.match(/[\p{L}\p{N}]/gu)?.length ?? 0) >= 4)
         .sort((a, b) => b.length - a.length);
+    const writable = Object.values(save.data.entries).filter(e => e.enabled && entryScope(e) === scopeId && e.segments.some(s => s.writable));
+    const catalog = focus ? writable.filter(e => !focus.has(e.id)) : [];
     const view = {
         scopeId, strategy: save.data.strategy, summary: scopeSummary(save.data, scopeId),
-        entries: Object.values(save.data.entries)
-            .filter(e => e.enabled && entryScope(e) === scopeId && e.segments.some(s => s.writable))
+        entries: writable.filter(e => !focus || focus.has(e.id))
             .map(e => ({ id: e.id, scopeId: entryScope(e), title: e.title, kind: e.kind,
                 // A mixed entry's introduction may quote a protected segment.
                 intro: e.segments.every(s => s.writable) ? e.intro : '',
@@ -175,6 +178,7 @@ export function maintenanceView(save, scopeId = GLOBAL_SCOPE, { includeProvenanc
                 segments: e.segments.filter(s => s.writable).map(s => ({ id: s.id, text: s.text })),
                 ...(includeProvenance ? { evidence: clone(e.evidence), lastEvidence: clone(e.lastEvidence ?? e.evidence),
                     evidenceTrimmed: Boolean(e.evidenceTrimmed), lineage: clone(e.lineage ?? []) } : {}) })),
+        ...(catalog.length ? { catalog: catalog.map(e => ({ id: e.id, title: e.title, kind: e.kind, intro: e.intro.length > 80 ? `${e.intro.slice(0, 80)}…` : e.intro })) } : {}),
         ...(save.data.inventoryEnabled ? { inventory: clone(scopeInventory(save.data, scopeId)) } : {}),
     };
     // Keep references reversible only for text already present in this writable
@@ -208,6 +212,7 @@ export function maintenanceView(save, scopeId = GLOBAL_SCOPE, { includeProvenanc
         return output + text.slice(cursor);
     };
     view.strategy = scrub(view.strategy, ['strategy']); view.summary = scrub(view.summary, ['summary']);
+    for (const item of view.catalog ?? []) for (const key of ['title', 'intro']) item[key] = scrub(item[key], ['catalog', item.id, key]);
     for (const entry of view.entries) {
         for (const key of ['title', 'intro', 'retrieveWhen']) entry[key] = scrub(entry[key], ['entry', entry.id, key]);
         for (const segment of entry.segments) segment.text = scrub(segment.text, ['entry', entry.id, 'segment', segment.id]);

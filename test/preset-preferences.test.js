@@ -32,7 +32,7 @@ function fixture() {
         loadWorldbook: async () => [{ uid: 1, comment: '设定', content: '既有设定' }], clearPlan() {}, setPlan() {}, applyWindow: async () => {},
         storage: { read: async id => structuredClone(saved.get(id) ?? null), write: async (id, value) => saved.set(id, structuredClone(value)) } };
     const c = new Controller(host, { model: { complete: async request => {
-        calls.push(structuredClone({ purpose: request.purpose, system: request.system, input: request.input }));
+        calls.push(structuredClone({ purpose: request.purpose, system: request.system, input: request.input, head: request.head, tail: request.tail }));
         if (request.purpose === 'preferences') return scanGate ? scanGate : request.system === APPLICATION_SCAN ? { selectedIds: ['language'] } : structuredClone(reply);
         if (request.purpose === 'initialize') return { entries: request.input.entries.map(entry => ({ id: entry.id, kind: 'fact', intro: entry.title, segments: [{ id: 'body', text: entry.content, writable: true }] })) };
         return request.purpose === 'select' ? { ids: [] } : { operations: [] };
@@ -84,16 +84,25 @@ test('preset application manual override reaches preview and actual requests, pe
     assert.deepEqual(f.host.readPreset(), before);
     assert.deepEqual(f.c.view().presetApplication.saved.selectedIds, ['off']);
     const preview = await f.c.previewPrompts();
-    const system = preview.stages.find(s => s.id === 'select').system;
-    assert.match(system, /不应读取/);
+    const stage = preview.stages.find(s => s.id === 'select');
+    assert.doesNotMatch(stage.system, /不应读取/, 'preset text wraps the task instead of being quoted inside it');
+    assert.match(JSON.stringify(stage.head), /不应读取/);
     await f.c.generationBefore();
-    assert.equal(f.calls.findLast(r => r.purpose === 'select').system, system);
+    const actual = f.calls.findLast(r => r.purpose === 'select');
+    assert.equal(actual.system, stage.system);
+    assert.deepEqual(actual.head, stage.head);
     f.state.chatId = 'second'; await f.c.chatChanged();
     assert.equal(f.c.view().presetApplication.saved, null);
     f.state.chatId = 'first'; await f.c.chatChanged();
     assert.deepEqual(f.c.view().presetApplication.saved.selectedIds, ['off']);
+    await f.c.savePresetApplication(['off'], fingerprint, { off: 'tail' });
+    assert.deepEqual(f.c.view().presetApplication.saved.positions, { off: 'tail' });
+    const moved = (await f.c.previewPrompts()).stages.find(s => s.id === 'select');
+    assert.equal(moved.head, undefined); assert.match(JSON.stringify(moved.tail), /不应读取/);
+    await assert.rejects(f.c.savePresetApplication(['off'], fingerprint, { off: 'middle' }), /插入位置/);
     await f.c.savePresetApplication([], fingerprint);
-    assert.doesNotMatch((await f.c.previewPrompts()).stages.find(s => s.id === 'select').system, /不应读取/);
+    const cleared = (await f.c.previewPrompts()).stages.find(s => s.id === 'select');
+    assert.doesNotMatch(JSON.stringify([cleared.system, cleared.head ?? null, cleared.tail ?? null]), /不应读取/);
 });
 test('preset application rejects stale UI and ignores changed original text until reconfirmed', async () => {
     const f = fixture(); await f.c.start(); await f.c.initialize();
@@ -103,7 +112,8 @@ test('preset application rejects stale UI and ignores changed original text unti
     assert.equal(f.c.view().presetApplication.stale, true);
     await assert.rejects(f.c.savePresetApplication(['off'], fingerprint), /预设已改变/);
     const preview = await f.c.previewPrompts();
-    assert.doesNotMatch(preview.stages.find(s => s.id === 'select').system, /改过的原文|不应读取/);
+    const stage = preview.stages.find(s => s.id === 'select');
+    assert.doesNotMatch(JSON.stringify([stage.system, stage.head ?? null, stage.tail ?? null]), /改过的原文|不应读取/);
 });
 test('late application scan cannot cross chats or overwrite a saved manual selection', async () => {
     let resolve; const pending = new Promise(yes => { resolve = yes; });

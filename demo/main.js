@@ -53,7 +53,7 @@ const model = { complete: async ({ purpose, input, signal }) => {
 } };
 host.readPreset = () => ({ name: '旧港 · 演示预设', entries: [
     { id: 'language', title: '记录语言', enabled: true, content: '使用简体中文，人物与地名保留原写法。' },
-    { id: 'facts', title: '事实一致性', enabled: true, content: '区分已经发生的事实、人物猜测与未完成的约定。' },
+    { id: 'facts', title: '事实一致性', enabled: true, role: 'user', position: 'tail', content: '区分已经发生的事实、人物猜测与未完成的约定。' },
     { id: 'terms', title: '专名约定', enabled: false, content: 'North Library 统一记录为北城图书馆。' },
     { id: 'narration', title: '正文风格', enabled: true, content: '用细腻的景物描写展开场景，正文不少于一千字。' },
 ] });

@@ -87,12 +87,15 @@ export function createPromptPreview(doc, controller) {
         for (const [id, label] of [['read', '分栏阅读'], ['raw', '原文']]) { const b = button(label, () => { mode = id; renderReader(); reader.querySelector(`[data-focus="preview-mode-${id}"]`)?.focus({ preventScroll: true }); }, `mode-${id}`); b.setAttribute('aria-pressed', String(mode === id)); modes.append(b); }
         reader.append(modes);
         if (mode === 'raw') {
-            reader.append(h('p', 'dwm-hint dwm-muted', 'system 与 input 对应辅助请求；input 在发送时序列化为 user 消息。待定字段省略，未伪造完整请求。正文阶段展示注入片段。'),
-                h('pre', 'dwm-trace-raw', JSON.stringify({ system: stage.system, input: stage.input }, null, 2))); return;
+            reader.append(h('p', 'dwm-hint dwm-muted', 'system 与 input 对应辅助请求；input 在发送时序列化为 user 消息。head/tail 是预设应用的头尾条目，按原角色排在任务前后。待定字段省略，未伪造完整请求。正文阶段展示注入片段。'),
+                h('pre', 'dwm-trace-raw', JSON.stringify({ ...(stage.head ? { head: stage.head } : {}), system: stage.system, input: stage.input, ...(stage.tail ? { tail: stage.tail } : {}) }, null, 2))); return;
         }
+        const wrapped = (title, items) => { if (items?.length) section(reader, title, body => { for (const item of items) body.append(h('div', 'dwm-trace-prose', `[${item.role}] ${item.content}`)); }); };
+        wrapped('预设头部 · head', stage.head);
         if (stage.system) section(reader, '系统提示词 · system', body => body.append(h('div', 'dwm-trace-prose', stage.system)));
         if (stage.input === null || stage.input === undefined) reader.append(h('p', 'dwm-muted', '输入尚未确定；原因见上方说明。'));
         else section(reader, '当前已知输入 · input', body => value(body, stage.input), true);
+        wrapped('预设尾部 · tail', stage.tail);
     }
     function render() {
         const listScroll = list.scrollTop;

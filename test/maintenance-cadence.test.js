@@ -70,7 +70,7 @@ test('a custom interval above twenty persists and counts AI replies across a rel
     await f.reply(21);
     const requests = f.calls.filter(r => r.purpose === 'maintain');
     assert.equal(requests.length, 1);
-    assert.equal(requests[0].input.messages.filter(message => message.role === 'assistant').length, 21);
+    assert.equal(requests[0].input.messages.filter(message => message.role === 'character').length, 21);
     assert.equal(f.controller.store.state.processed.length, 42);
     assert.equal(f.controller.view().maintenance.pendingReplies, 0);
 });
