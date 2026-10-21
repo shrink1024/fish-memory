@@ -1,6 +1,6 @@
 import { applicationSnapshot, APPLICATION_SCAN, validateApplicationSelection, validateApplicationPositions, selectedApplicationEntries, applyPresetApplication } from '../agents/preset-application.js';
 import { throwIfAborted, combineSignals } from '../platform/abort.js';
-import { sourceBookChanges } from '../core/source-book.js';
+import { sourceBookChanges, nativeSwitchOverlay } from '../core/source-book.js';
 import { presetSnapshot, PREFERENCE_SCAN, validatePreferenceCandidates, selectedPreferences, applyAuxiliaryPreferences } from '../agents/preset-preferences.js';
 import { MemoryStore } from '../core/store.js';
 import { sha256Fingerprint } from '../core/fingerprint.js';
@@ -8,7 +8,7 @@ import { DEFAULT_SETTINGS, MAINTENANCE_EVERY_MAX, templateHint, normalizeTimeout
 import { playerView, scopeRead, memoryMetrics } from '../core/views.js';
 import { clone, invariant, uid, isPrefix, SerialQueue } from '../core/util.js';
 import { planWindow } from '../core/window.js';
-import { maintenanceFocus } from '../core/focus.js';
+import { maintenanceFocus, triggeredIds } from '../core/focus.js';
 import { applyMaintenance } from '../core/operations.js';
 import { AgentClient, compatibleConnection, listModels, untilAborted, serializeAgentInput, requestMessages, REASONING_EFFORTS } from '../agents/client.js';
 import { classifyEntries, alignStrategy, maintain, select, compact, mergeSourceUpdates } from '../agents/tasks.js';
@@ -26,6 +26,9 @@ async function initializationFingerprint(value) {
 }
 
 const SUMMARY_COMPACT_CHARS = 8000;
+
+// A player-set tier survives source updates; only the scanned flags refresh.
+const keepTier = used => used?.tier ? { tier: used.tier, enabled: used.tier !== 'off' } : {};
 
 export class Controller {
     #listeners = new Set();
@@ -59,6 +62,13 @@ export class Controller {
     #initializationClassificationFingerprint = '';
     #connectionConfig = null;
     #modelList = null;
+    // Story edits while background maintenance runs. Keys of the batch being
+    // written let a later edit leave that request alone (see #storyChanged).
+    // The main book as last read; its live switches steer selection (see nativeSwitchOverlay).
+    #nativeRaw = null;
+    #storyRevision = 0;
+    #maintenancePrefix = null;
+    #storyDirty = false;
     constructor(host, { model, traces = createTraceStore(), settings = {}, persistSettings = async () => {}, chooseFallback = async () => 'cancel', connectionStore = null } = {}) {
         this.host = host; this.settings = { ...DEFAULT_SETTINGS, ...settings, ...normalizeTimeoutSettings(settings) };
         if (!Number.isInteger(this.settings.maintenanceEvery) || this.settings.maintenanceEvery < 1 || this.settings.maintenanceEvery > MAINTENANCE_EVERY_MAX) this.settings.maintenanceEvery = DEFAULT_SETTINGS.maintenanceEvery;
@@ -786,6 +796,7 @@ export class Controller {
         this.rules = discoverRules(raw);
         this.compiledRules = compileRules(this.rules.script);
         this.sourceChanges = sourceBookChanges(this.store?.state, raw, this.rules.configEntryUids);
+        this.#nativeRaw = raw;
         if (this.store?.state && this.host.snapshot().bookName !== this.store.state.bookName) {
             this.sourceChanges = { ...this.sourceChanges, changed: true, rebound: true };
         }
@@ -803,6 +814,7 @@ export class Controller {
         this.#abort = new AbortController();
         this.#epoch++;
         this.#initializing = false; this.#maintenance = null; this.#compacting = false; this.#nativeBypass = false;
+        this.#storyDirty = false; this.#maintenancePrefix = null;
         for (const activity of this.#activities.values()) activity.dispose();
         this.#activities.clear();
         for (const release of this.#selectionWaiters) release();
@@ -922,16 +934,24 @@ export class Controller {
     }
     #initializationInputs(store) {
         return { scopeContext: store.state.data.scopeContext, messageScopes: store.state.data.messageScopes,
-            inventoryEnabled: store.state.data.inventoryEnabled, preferences: store.state.preferences,
-            presetFingerprint: this.#preset().fingerprint, applicationFingerprint: this.#application().fingerprint, batchChars: this.settings.batchChars,
+            inventoryEnabled: store.state.data.inventoryEnabled, ...this.#appliedRequestInputs(store),
             classificationProtocol: 2, batchItems: INITIALIZATION_BATCH_ITEMS };
+    }
+    /** Only what actually reaches auxiliary requests: the applied preset entries
+     * and confirmed language/term preferences. The whole preset and unrelated
+     * save preferences used to be fingerprinted, so editing an unselected preset
+     * entry, or a preset read differently after a reload, threw away a finished
+     * worldbook scan and started it over. */
+    #appliedRequestInputs(store) {
+        const preferences = store === this.store ? this.#auxiliaryPreferences() : [];
+        const application = store === this.store ? this.#applicationEntries().map(({ id, role, position, content }) => ({ id, role, position, content })) : [];
+        return { appliedPreferences: preferences, appliedPreset: application, batchChars: this.settings.batchChars };
     }
     #initializationRequestSettings(store) {
         return JSON.stringify(this.#classificationInputs(store));
     }
     #classificationInputs(store) {
-        return { preferences: store.state.preferences, presetFingerprint: this.#preset().fingerprint, applicationFingerprint: this.#application().fingerprint,
-            batchChars: this.settings.batchChars, classificationProtocol: 2, batchItems: INITIALIZATION_BATCH_ITEMS };
+        return { ...this.#appliedRequestInputs(store), classificationProtocol: 2, batchItems: INITIALIZATION_BATCH_ITEMS };
     }
     #initializationIdentity(store) {
         return { saveId: store.state.id, chatId: store.state.chatId, bookName: store.state.bookName, revision: store.state.revision };
@@ -1152,10 +1172,18 @@ export class Controller {
         const limit = activity.kind === 'initialize' ? this.settings.historyBatchChars ?? this.settings.batchChars : this.settings.batchChars;
         const groups = runs.flatMap(run => batches(run, limit));
         let count = store.state.processed.length, condenseFailed = false;
-        for (const batch of groups) {
+        const storyRevision = this.#storyRevision;
+        try { for (const batch of groups) {
+            // Published before any wait in this iteration (selection, MVU), so an
+            // edit during those waits is judged against this batch, not the last.
+            const batchPrefix = keys.slice(0, count + batch.length);
+            if (store === this.store) this.#maintenancePrefix = batchPrefix;
             this.#assertActivity(activity);
             if (store === this.store) await this.#afterSelection(activity);
             if (store === this.store && this.#selecting()) break;
+            // Later batches were cut from a story that has since changed; stop
+            // here and let maintain() restart once on the current messages.
+            if (store === this.store && this.#storyRevision !== storyRevision) { this.#storyDirty = true; break; }
             this.progress = { stage: '维护剧情记忆', done: count, total: messages.length }; this.#notify();
             this.#updateActivity(activity, { label: activity.kind === 'initialize' ? `扫描历史剧情 ${count}/${messages.length}` : `正在整理最近 ${messages.length - count} 条消息` });
             const before = store.snapshot();
@@ -1178,6 +1206,7 @@ export class Controller {
                     throw Object.assign(new Error('当前剧情候选已变化，旧整理结果不再提交'), { dwmInitializationPathChanged: store !== this.store });
                 }
             };
+            if (store === this.store && !isPrefix(batchPrefix, this.host.snapshot().messages.map(message => message.key))) { this.#storyDirty = true; break; }
             // Large memories send only the entries this batch touches in full.
             const result = readable.length ? await maintain(this.client, view, readable, signal, scopeId, observedState,
                 candidate => this.#validateGuarded(before, candidate, evidence, scopeId), { focus: maintenanceFocus(view, scopeId, readable) }) : { operations: [] };
@@ -1191,7 +1220,7 @@ export class Controller {
             if (!condenseFailed && !this.#worldbookOnly() && scopeSummary(store.state.data, scopeId).length >= SUMMARY_COMPACT_CHARS) {
                 condenseFailed = !await this.#condenseSummary(store, scopeId, { signal, activity });
             }
-        }
+        } } finally { if (store === this.store) this.#maintenancePrefix = null; }
     }
     /** Entries the first pass saw only in the catalog get one targeted pass.
      * The batch itself is already committed; a failure here costs only these updates. */
@@ -1286,7 +1315,15 @@ export class Controller {
         };
         const pending = task();
         this.#maintenance = pending;
-        try { return await pending; } finally { if (this.#maintenance === pending) this.#maintenance = null; }
+        try { return await pending; } finally {
+            if (this.#maintenance === pending) this.#maintenance = null;
+            if (this.#storyDirty && epoch === this.#epoch) {
+                this.#storyDirty = false;
+                // Automatic continuation: skipped while the player has paused
+                // automatic maintenance, and never clears that pause.
+                Promise.resolve().then(() => epoch === this.#epoch && !this.#autoPostPaused && this.maintain()).catch(() => {});
+            }
+        }
     }
     async previewPlan() {
         const activity = this.#beginActivity('preview', '正在试选本轮资料');
@@ -1330,6 +1367,8 @@ export class Controller {
         unchanged();
         const rules = discoverRules(rawEntries), compiledRules = compileRules(rules.script);
         const sourceChanged = sourceBookChanges(save, rawEntries, rules.configEntryUids).changed;
+        // Selection and injection read the book's live switches; maintenance does not.
+        const liveSave = nativeSwitchOverlay(save, rawEntries);
         let projection = null;
         if (settings.mvuEnabled && settings.mvuBookName === snapshot.bookName && this.host.readMvu) {
             try { projection = await this.host.readMvu(settings); } catch { /* Optional observation stays unknown. */ }
@@ -1338,7 +1377,7 @@ export class Controller {
         const observedState = this.#observedState(projection, snapshot, snapshot.messages);
         const scopes = readableScopes(save?.data.scopeContext);
         const eligible = entry => scopes.has(entryScope(entry)) && (this.host.previewEligible ? this.host.previewEligible(entry) : entry.enabled);
-        const result = buildPromptPreview({ snapshot, save, settings, rules, compiledRules, rawEntries, eligible,
+        const result = buildPromptPreview({ snapshot, save, selectionSave: liveSave, settings, rules, compiledRules, rawEntries, eligible,
             connectionMode: this.connectionMode, observedState,
             busy: { initializing: this.#initializing, maintaining: Boolean(this.#maintenance), compacting: this.#compacting } });
         const sourceWarning = '原书已变化：旧基准的前置、后置和记忆注入暂不可用。请先导出聊天 JSONL 备份并重新扫描，或在发送时明确选择按原书发送。';
@@ -1349,7 +1388,7 @@ export class Controller {
             }
         }
         const currentSave = !sourceChanged && save?.chatId === snapshot.chatId && save?.bookName === snapshot.bookName
-            && isPrefix(save.processed, snapshot.messages.map(m => m.key)) ? save : null;
+            && isPrefix(save.processed, snapshot.messages.map(m => m.key)) ? liveSave : null;
         const narration = previewNarration(currentSave, { eligible, compiledRules, configEntryUids: rules.configEntryUids });
         if (sourceChanged) { narration.status = 'unavailable'; narration.explanation = sourceWarning; }
         else if (!currentSave && save?.initialized) narration.explanation = '保存快照不属于当前聊天或所选剧情；实际发送会先载入或回放，当前不展示旧片段。';
@@ -1418,18 +1457,21 @@ export class Controller {
         invariant(this.store?.state.initialized, '请先完成初始化');
         this.#assertActivity(activity);
         invariant(!this.sourceChanges.changed, '原书已变化：请先在“资料”页同步变化的条目，或选择本轮按原世界书发送。');
-        const snapshot = readSnapshot(), save = project ? this.store.project(snapshot.messages.map(m => m.key)) : this.store.snapshot();
+        const snapshot = readSnapshot(), save = nativeSwitchOverlay(project ? this.store.project(snapshot.messages.map(m => m.key)) : this.store.snapshot(), this.#nativeRaw);
         const scopes = readableScopes(save.data.scopeContext);
         const eligible = entry => scopes.has(entryScope(entry)) && (this.host.eligible ? this.host.eligible(entry, snapshot) : entry.enabled);
         const recent = selectionMessages(snapshot, save, this.settings.recentTurns);
         const projection = this.settings.mvuEnabled ? await untilAborted(this.refreshMvu(), activity.signal) : null;
         this.#assertActivity(activity);
         const observedState = this.#observedState(projection, snapshot, recent);
-        const ids = await select(this.client, this.#taskView(save), recent, { eligible, selectionLimit: this.settings.selectionLimit,
-            selectionChars: this.settings.selectionChars, observedState, signal: activity.signal });
+        const forced = triggeredIds(save, snapshot.messages.filter(isReadableMessage), snapshot.userInput, { eligible, rules: entry => evaluateRules(this.compiledRules, entry) });
+        const picked = await select(this.client, this.#taskView(save), recent, { eligible, selectionLimit: this.settings.selectionLimit,
+            selectionChars: this.settings.selectionChars, observedState, forced, authorGuidance: this.rules.naturalLanguage, messageCount: snapshot.messages.length, signal: activity.signal });
+        const ids = [...new Set([...forced, ...picked])];
         this.#assertActivity(activity);
         await this.#assertSourceCurrent(activity);
         invariant(save.revision === this.store.state.revision, '选材期间资料更新，请重试本轮');
+        // The plan itself carries the live switches too, so injection agrees with selection.
         invariant(JSON.stringify(snapshot.messages.map(m => m.key)) === JSON.stringify(readSnapshot().messages.map(m => m.key)), '选材期间剧情候选已变化，请重试本轮');
         return { requestId: uid('request'), chatId: snapshot.chatId, mvu: observedState,
             ...assemblePromptPlan(this.#taskView(save), ids, { eligible, compiledRules: this.compiledRules, configEntryUids: this.rules.configEntryUids }) };
@@ -1521,6 +1563,13 @@ export class Controller {
         // Not proof of a successful reply; adapter handles finalized messages.
     }
     #storyChanged() {
+        this.#storyRevision++;
+        // Deleting or swiping messages after the batch being written cannot
+        // change that batch. Cancelling it would resend the same paid request
+        // on every edit (FM: long saves deleting replies one by one), so the
+        // request finishes and the run restarts once from the current story.
+        const prefix = this.#maintenancePrefix;
+        if (this.#maintenance && !this.#initializing && prefix && isPrefix(prefix, this.host.snapshot().messages.map(m => m.key))) return;
         this.cancel();
         const epoch = this.#epoch;
         // ST awaits event listeners while its UI is in SWIPING/deletion state.
@@ -1565,7 +1614,7 @@ export class Controller {
                 }
                 if (sameText) {
                     // Metadata only (keys, order, toggles): no model call.
-                    const refresh = item => item && createEntry({ ...item, title: entry.comment || item.title, enabled: !entry.disable, constant: entry.constant,
+                    const refresh = item => item && createEntry({ ...item, title: entry.comment || item.title, enabled: item.tier ? item.tier !== 'off' : !entry.disable, constant: entry.constant,
                         source: { ...item.source, metadata: clone(entry) } });
                     if (used) data[used.id] = { ...refresh(used), version: used.version + 1 };
                     if (baseline.get(uid)) base[old.id] = refresh(baseline.get(uid));
@@ -1596,7 +1645,7 @@ export class Controller {
                 if (touched && next.segments.some(segment => segment.writable)) {
                     merges.push({ id: next.id, title: next.title, current: writable(change.used), next, used: change.used,
                         oldSource: change.old ? writable(change.old) : change.used.segments.every(segment => segment.writable) ? change.used.source.original : '' });
-                } else data[next.id] = { ...next, version: (change?.used?.version ?? 0) + 1 };
+                } else data[next.id] = { ...next, ...keepTier(change?.used), version: (change?.used?.version ?? 0) + 1 };
             }
             if (merges.length) {
                 this.#updateActivity(activity, { label: `合并 ${merges.length} 条剧情改过的条目` });
@@ -1604,7 +1653,7 @@ export class Controller {
                 this.#assertActivity(activity);
                 for (const item of merged) {
                     const source = merges.find(entry => entry.id === item.id);
-                    data[item.id] = { ...source.next, segments: item.segments, version: source.used.version + 1,
+                    data[item.id] = { ...source.next, ...keepTier(source.used), segments: item.segments, version: source.used.version + 1,
                         evidence: clone(source.used.evidence ?? []), lineage: clone(source.used.lineage ?? []) };
                 }
             }
@@ -1621,6 +1670,9 @@ export class Controller {
     }
     async manual(action) {
         invariant(this.store?.state.initialized && !this.#initializing, '请先完成初始化');
+        if (action.type === 'tier' && action.tier !== 'off' && this.store.state.data.entries[action.id]?.status === DEFERRED) {
+            return this.#scanDeferredForTier(action);
+        }
         if (action.type === 'reset') {
             await this.#loadRules();
             invariant(!this.sourceChanges.changed, '原书已变化，旧基准不能当作新版重置；请先同步变化的条目。');
@@ -1636,6 +1688,28 @@ export class Controller {
             // Recompute the inventory only; replay must not overwrite other current memories.
             await this.#catchUpInventory();
         }
+    }
+    /** Disabled at scan time, so never classified. Turning it on scans just
+     * this entry once (one model call) before the tier takes effect. */
+    async #scanDeferredForTier(action) {
+        invariant(!this.view().activity, '请等待当前任务完成后再调整');
+        const activity = this.#beginActivity('classify', '正在扫描此条');
+        this.#state('正在扫描此条');
+        try {
+            await this.#loadRules(activity.epoch, activity.chatId, activity.signal);
+            const entry = this.store.state.data.entries[action.id];
+            invariant(entry?.status === DEFERRED, '条目已变化，请重试');
+            const result = await classifyEntries(this.client, [entry], this.rules.naturalLanguage, activity.signal);
+            this.#assertActivity(activity);
+            const [classified] = applyRules(result.entries, this.compiledRules).entries;
+            await this.#saveActivity(activity, () => this.store.manual({ ...action, classified: { ...classified, status: 'confirmed' } }, this.host.snapshot().messages.map(m => m.key)));
+            this.#assertActivity(activity);
+            this.#state('已扫描并调整档位');
+            return { executed: true, message: '已扫描此条并调整档位' };
+        } catch (error) {
+            if (activity.epoch === this.#epoch && !activity.signal.aborted) this.#state('此条扫描未完成，档位未变', error.message);
+            throw error;
+        } finally { this.#endActivity(activity); }
     }
     async #catchUpInventory() {
         const activity = this.#beginActivity('inventory', '正在补记物品');

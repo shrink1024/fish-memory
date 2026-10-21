@@ -1,5 +1,5 @@
 import { clone, invariant, SerialQueue, commonPrefix, isPrefix, uid, plainText } from './util.js';
-import { createSave, validateSave, createEntry, normalizeScopeId, GLOBAL_SCOPE } from './state.js';
+import { createSave, validateSave, createEntry, normalizeScopeId, GLOBAL_SCOPE, TIERS } from './state.js';
 import { applyMaintenance, applyDataPatch, diffData, auditChanges } from './operations.js';
 
 function anchor(sourceKeys) {
@@ -314,6 +314,17 @@ export class MemoryStore {
                     const replacement = createEntry({ ...entry, segments: action.segments ?? entry.segments, title: action.title ?? entry.title,
                         intro: action.intro ?? entry.intro, retrieveWhen: action.retrieveWhen ?? entry.retrieveWhen });
                     data.entries[entry.id] = replacement;
+                } else if (action.type === 'tier') {
+                    invariant(TIERS.includes(action.tier), '档位只能是常驻、按需或关闭');
+                    // A never-scanned (deferred) entry arrives classified by the controller.
+                    const base = action.classified ? createEntry({ ...action.classified, evidence: entry.evidence, lineage: entry.lineage, version: entry.version }) : entry;
+                    data.entries[entry.id] = createEntry({ ...base, tier: action.tier, enabled: action.tier !== 'off' });
+                } else if (action.type === 'tier-reset') {
+                    // Back to the tier of the scanned baseline (initialization or latest sync).
+                    const scanned = baseline.base.entries[entry.id];
+                    const { tier: _tier, ...rest } = entry;
+                    data.entries[entry.id] = createEntry({ ...rest, enabled: scanned ? scanned.enabled : true,
+                        constant: scanned ? scanned.constant : false, important: scanned ? scanned.important : false });
                 } else if (action.type === 'classify') {
                     data.entries[entry.id] = createEntry({ ...entry, kind: action.kind ?? entry.kind, segments: action.segments ?? entry.segments, needsReview: false });
                 } else if (action.type === 'promote') {

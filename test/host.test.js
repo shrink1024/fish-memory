@@ -150,7 +150,7 @@ test('worldbook override uses this request only and leaves original and other bo
     const f = fixture();
     const host = await createSillyTavernHost(f.deps);
     const chatId = host.snapshot().chatId;
-    host.setPlan({ chatId, bookName: 'main', requestId: 'r1', selectedIds: ['source:main:2', 'source:main:3'],
+    host.setPlan({ chatId, bookName: 'main', requestId: 'r1', selectedIds: ['source:main:1', 'source:main:2', 'source:main:3'],
         dynamicEntries: [
             { id: 'source:main:1', source: { book: 'main', uid: 1, original: 'old blue' }, segments: [{ text: 'new blue' }] },
             { id: 'source:main:2', source: { book: 'main', uid: 2, original: 'old green' }, segments: [{ text: 'new <% await danger() %> green' }] },
@@ -167,8 +167,9 @@ test('worldbook override uses this request only and leaves original and other bo
     assert.equal(data.characterLore[1].constant, true);
     assert.equal(data.characterLore[1].content.includes('<%'), false);
     assert.equal(data.characterLore[1].order, 8);
-    assert.equal(data.characterLore[2].disable, true);
-    assert.equal(data.characterLore[3], other);
+    assert.equal(data.characterLore[1].ignoreBudget, true, 'nothing native may drop a chosen entry');
+    assert.equal(data.characterLore.length, 3, 'a natively disabled entry stays out even if listed');
+    assert.equal(data.characterLore[2], other);
     assert.equal(f.raw.entries[1].content, 'old blue');
     assert.equal(f.raw.entries[2].content, 'old green');
     assert.deepEqual([...f.prompts.keys()].sort(), ['dwm:details', 'dwm:inventory', 'dwm:summary']);
@@ -186,8 +187,7 @@ test('unselected managed green cannot activate from native keywords or recursion
         dynamicEntries: [{ id: 'source:main:2', source: { book: 'main', uid: 2 }, segments: [{ text: 'updated' }] }] });
     const data = { characterLore: [{ ...f.raw.entries[2], world: 'main' }] };
     host.applyWorldInfoEntries(data);
-    assert.equal(data.characterLore[0].disable, true);
-    assert.equal(data.characterLore[0].constant, false);
+    assert.deepEqual(data.characterLore, [], 'an unselected entry leaves the scan entirely');
     assert.equal(host.eligible(f.raw.entries[3]), false);
     assert.equal(host.eligible({ characterFilter: { names: ['other'] } }), false);
 });
@@ -224,17 +224,23 @@ test('native character filename and tag filters admit valid green candidates', a
     assert.equal(host.eligible({ characterFilter: { isExclude: true, names: [], tags: ['tag'] } }), false);
 });
 
-test('delay and cooldown become eligible when their native intervals expire', async () => {
+test('main-book timers never block selection; other books keep their native intervals', async () => {
     const f = fixture();
     const host = await createSillyTavernHost(f.deps);
-    const source = metadata => ({ title: '有时间限制的绿灯', source: { book: 'main', uid: 2, metadata } });
+    const managed = metadata => ({ title: '主书条目', source: { book: 'main', uid: 2, metadata } });
+    assert.equal(host.eligible(managed({ delay: 99 })), true);
+    f.live.chatMetadata.timedWorldInfo = { cooldown: { 'main.2': { start: 1, end: 99, protected: false } } };
+    assert.equal(host.eligible(managed({ cooldown: 2 })), true);
+    assert.equal(host.eligible(managed({ delayUntilRecursion: 1 })), true);
+    delete f.live.chatMetadata.timedWorldInfo;
+    const source = metadata => ({ title: '有时间限制的绿灯', source: { book: 'other', uid: 2, metadata } });
     assert.equal(host.eligible(source({ delay: 3 })), false); // Two visible messages; the third is externally hidden.
     assert.equal(host.eligible(source({ delay: 2 })), true);
     f.live.chat.push({ is_user: true, is_system: false, mes: 'next', extra: {} });
     assert.equal(host.eligible(source({ delay: 3 })), true);
-    f.live.chatMetadata.timedWorldInfo = { cooldown: { 'main.2': { start: 1, end: 5, protected: false } } };
+    f.live.chatMetadata.timedWorldInfo = { cooldown: { 'other.2': { start: 1, end: 5, protected: false } } };
     assert.equal(host.eligible(source({ cooldown: 2 })), false);
-    f.live.chatMetadata.timedWorldInfo.sticky = { 'main.2': { start: 1, end: 5, protected: false } };
+    f.live.chatMetadata.timedWorldInfo.sticky = { 'other.2': { start: 1, end: 5, protected: false } };
     assert.equal(host.eligible(source({ cooldown: 2, sticky: 2 })), true);
     delete f.live.chatMetadata.timedWorldInfo.sticky;
     f.live.chat.push({ is_user: true, is_system: false, mes: 'third', extra: {} },
@@ -246,9 +252,9 @@ test('unverifiable recursion, template and missing tag data warn with entry name
     const f = fixture();
     const notices = [];
     const host = await createSillyTavernHost({ ...f.deps, onWarning: notice => notices.push(notice) });
-    const entry = (uid, title, metadata, original = '') => ({ title, source: { book: 'main', uid, metadata, original } });
-    assert.equal(host.eligible(entry(4, '递归门', { delayUntilRecursion: 1 })), false);
-    assert.equal(host.eligible(entry(4, '递归门', { delayUntilRecursion: 1 })), false);
+    const entry = (uid, title, metadata, original = '', book = 'main') => ({ title, source: { book, uid, metadata, original } });
+    assert.equal(host.eligible(entry(4, '递归门', { delayUntilRecursion: 1 }, '', 'other')), false);
+    assert.equal(host.eligible(entry(4, '递归门', { delayUntilRecursion: 1 }, '', 'other')), false);
     assert.equal(host.eligible(entry(5, '条件门', {}, '@@if something')), false);
     assert.equal(host.eligible(entry(6, '标签门', { characterFilter: { names: [], tags: ['tag'] } })), false);
     assert.equal(notices.length, 3);
@@ -298,15 +304,15 @@ test('native activation audit reports missing blue without claiming a budget cau
         eventTypes: { WORLD_INFO_ACTIVATED: 'activated', MESSAGE_RECEIVED: 'received' },
     });
     const dispose = host.bindController({});
-    host.setPlan({ chatId: host.snapshot().chatId, requestId: 'r-budget', entries: [{
+    host.setPlan({ chatId: host.snapshot().chatId, requestId: 'r-budget', selectedIds: ['source:main:1'], entries: [{
         id: 'source:main:1', source: { book: 'main', uid: 1, original: 'old blue' }, segments: [{ text: 'new blue' }],
     }] });
     host.applyWorldInfoEntries({ characterLore: [{ ...f.raw.entries[1], world: 'main' }] });
     events.get('activated')([{ world: 'other', uid: 9 }]);
     assert.equal(notices.length, 1);
-    assert.equal(notices[0].code, 'native-blue-omitted');
+    assert.equal(notices[0].code, 'native-selected-omitted');
     assert.equal(notices[0].cause, 'unknown');
-    assert.match(notices[0].message, /预算、概率、分组/);
+    assert.match(notices[0].message, /鱼忆选定的条目未进入本轮世界书/);
     assert.deepEqual(notices[0].entries, [{ uid: 1, title: 'blue' }]);
     events.get('received')(1, 'normal');
     assert.equal(notices.length, 1);
@@ -323,7 +329,7 @@ test('an activated blue produces no warning; a zero-activation reply reports omi
     });
     const dispose = host.bindController({});
     const start = () => {
-        host.setPlan({ chatId: host.snapshot().chatId, requestId: 'r', entries: [{
+        host.setPlan({ chatId: host.snapshot().chatId, requestId: 'r', selectedIds: ['source:main:1'], entries: [{
             id: 'source:main:1', source: { book: 'main', uid: 1, original: 'old blue' }, segments: [{ text: 'new blue' }],
         }] });
         host.applyWorldInfoEntries({ characterLore: [{ ...f.raw.entries[1], world: 'main' }] });
@@ -334,7 +340,7 @@ test('an activated blue produces no warning; a zero-activation reply reports omi
     start();
     events.get('received')(1, 'normal');
     assert.equal(notices.length, 1);
-    assert.equal(notices[0].code, 'native-blue-omitted');
+    assert.equal(notices[0].code, 'native-selected-omitted');
     dispose();
 });
 

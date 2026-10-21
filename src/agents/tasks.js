@@ -73,8 +73,8 @@ export async function maintain(client, save, messages, signal, scopeId = GLOBAL_
         return restored;
     });
 }
-export async function select(client, save, messages, { eligible = () => true, selectionLimit = 16, selectionChars = 24000, observedState = null, signal } = {}) {
-    const request = selectRequest(save, messages, { eligible, selectionLimit, selectionChars, observedState });
+export async function select(client, save, messages, { eligible = () => true, selectionLimit = 16, selectionChars = 24000, observedState = null, forced = [], authorGuidance = '', messageCount = null, signal } = {}) {
+    const request = selectRequest(save, messages, { eligible, selectionLimit, selectionChars, observedState, forced, authorGuidance, messageCount });
     const catalog = request.input.catalog;
     return completeTask(client, { ...request, signal }, result => {
         invariant(Array.isArray(result.ids), '前置选材格式无效，ids 须为列表');

@@ -68,6 +68,16 @@ export function readableScopes(context) {
 }
 export function sourceId(book, id) { return `source:${encodeURIComponent(book)}:${id}`; }
 export function entryText(entry) { return entry.segments.map(s => s.text).join(''); }
+/** Player-set tier for an entry: always sent, chosen by selection, or unused.
+ * Absent means the scanned flags decide (source blue lamp, important NPC,
+ * source disable). The tier only changes this save's dynamic copy. */
+export const TIERS = Object.freeze(['constant', 'onDemand', 'off']);
+export function scannedTier(entry) {
+    return !entry?.enabled ? 'off' : entry.constant || entry.important ? 'constant' : 'onDemand';
+}
+export function entryTier(entry) { return TIERS.includes(entry?.tier) ? entry.tier : scannedTier(entry); }
+export const alwaysSent = entry => entryTier(entry) === 'constant';
+
 export function createEntry(input) {
     invariant(input && typeof input === 'object', '条目不能为空');
     const entry = {
@@ -89,6 +99,7 @@ export function createEntry(input) {
         version: input.version ?? 1,
         status: input.status ?? 'confirmed',
         needsReview: Boolean(input.needsReview),
+        ...(TIERS.includes(input.tier) ? { tier: input.tier } : {}),
     };
     invariant(KINDS.includes(entry.kind), `未知条目类型：${entry.kind}`);
     invariant(typeof entry.id === 'string' && entry.id.length < 1000, '无效条目身份');

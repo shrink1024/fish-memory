@@ -76,7 +76,7 @@ test('current preview matches real task inputs while preserving backlog and unse
     const asMaterial = messages => messages.map(({ key, role, content }) => ({ key, role: sourceRole(role), content, source: '存档正文' }));
     const preview = buildPromptPreview(f);
     assert.deepEqual(get(preview, 'select').input.messages, asMaterial(expectedRecent));
-    assert.deepEqual(inputAndSystem(get(preview, 'select')), inputAndSystem(selectRequest(f.save, expectedRecent)));
+    assert.deepEqual(inputAndSystem(get(preview, 'select')), inputAndSystem(selectRequest(f.save, expectedRecent, { messageCount: 8 })));
     assert.deepEqual(inputAndSystem(get(preview, 'maintain-1')), inputAndSystem(maintainRequest(f.save, f.snapshot.messages.slice(2))));
     assert.equal(get(preview, 'maintain-1').input.messages.some(message => message.key === 'current-input'), false);
     f.save.processed = f.snapshot.messages.map(message => message.key);

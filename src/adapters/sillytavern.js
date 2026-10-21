@@ -241,8 +241,8 @@ export async function createSillyTavernHost(deps = {}) {
         if (!audit || audit.reported || currentIdentity(ctx()) !== audit.chatId || !audit.scanned) return;
         audit.reported = true;
         const activeIds = new Set(activated.map(entry => `${entry?.world}\0${entry?.uid}`));
-        const missing = [...audit.blue.values()].filter(entry => !activeIds.has(`${audit.bookName}\0${entry.uid}`));
-        if (missing.length) warn('native-blue-omitted', `${missing.length} 条蓝灯未进入本轮原生世界书：${missing.map(e => e.title).join("、")}。请检查原生预算、概率、分组及条目条件。`,
+        const missing = [...audit.sent.values()].filter(entry => !activeIds.has(`${audit.bookName}\0${entry.uid}`));
+        if (missing.length) warn('native-selected-omitted', `${missing.length} 条鱼忆选定的条目未进入本轮世界书：${missing.map(e => e.title).join("、")}。可能被其他扩展或模板条件移除。`,
             { entries: missing, cause: 'unknown' });
     }
 
@@ -520,7 +520,8 @@ export async function createSillyTavernHost(deps = {}) {
         // ST counts the messages it will scan, excluding ordinary is_system
         // messages and removing the previous reply for swipe. We use the
         // visible-chat lower bound; interceptors may further reduce it.
-        if (native.delay || native.cooldown || native.sticky) {
+        const managed = Boolean(entry?.source?.book) && entry.source.book === snapshot().bookName;
+        if (!managed && (native.delay || native.cooldown || native.sticky)) {
             if (!Array.isArray(live.chat)) return uncertain('无法读取原生时间条件');
             const visibleCount = Math.max(0, live.chat.filter(message => !message.is_system).length - (type === 'swipe' ? 1 : 0));
             if (native.delay && visibleCount < Number(native.delay)) return false;
@@ -537,7 +538,7 @@ export async function createSillyTavernHost(deps = {}) {
                 if (native.cooldown && active('cooldown') && !active('sticky')) return false;
             } else if (native.cooldown) return uncertain('无法定位冷却记录');
         }
-        if (native.delayUntilRecursion) return uncertain('递归延迟条件尚不能安全预判');
+        if (!managed && native.delayUntilRecursion) return uncertain('递归延迟条件尚不能安全预判');
         if (String(entry?.source?.original ?? native.content ?? '').includes('@@if')) {
             return uncertain('模板条件尚不能安全预判');
         }
@@ -616,12 +617,23 @@ export async function createSillyTavernHost(deps = {}) {
             selected: new Set(next.selectedIds ?? []),
             configuration: new Set(next.configEntryUids ?? next.configurationUids ?? []),
         };
-        nativeAudit = { chatId: id, bookName, requestId: next.requestId, blue: new Map(), scanned: false, reported: false };
+        nativeAudit = { chatId: id, bookName, requestId: next.requestId, sent: new Map(), scanned: false, reported: false };
         putSlot(SLOT_KEYS.summary, next.summary ?? '', 4);
         putSlot(SLOT_KEYS.inventory, next.inventory ?? '', 4);
         putSlot(SLOT_KEYS.details, detailsText(next.details), 4);
     }
 
+    const TEMPLATE_ACTIVATION = /^[ \t]*@@(?:if|activate|dont_activate)\b/m;
+    /** Main-book entries left to the native path: no dynamic copy yet (added
+     * after the scan), Prompt Template activation conditions fish cannot
+     * evaluate, or off at scan time (never classified) and now on in the book.
+     * Their native timers stay meaningful, so the history window respects them. */
+    function nativePassThrough(original, dynamic) {
+        if (!dynamic) return true;
+        if (TEMPLATE_ACTIVATION.test(String(original?.content ?? ''))) return true;
+        const tiered = ['constant', 'onDemand', 'off'].includes(dynamic.tier);
+        return !tiered && dynamic.status === 'deferred' && !original?.disable;
+    }
     /** Mutates only arrays assembled for this World Info scan. Never writes a book. */
     function applyWorldInfoEntries(data) {
         const active = plan;
@@ -642,30 +654,28 @@ export async function createSillyTavernHost(deps = {}) {
                 // never to the model-facing World Info candidate set.
                 if (active.configuration.has(original.uid) || active.configuration.has(sourceId(active.bookName, original.uid))) continue;
                 const dynamic = active.entries.get(`${active.bookName}\0${original.uid}`);
-                if (!dynamic) { nextItems.push(original); continue; } // Prior template removals are never re-added.
-                // ST hashes every native field for sticky/cooldown continuity.
-                // Even changing constant/disable for semantic selection breaks
-                // that identity. Timed entries retain the entire native record.
-                if (original.sticky || original.cooldown || original.delay) {
-                    nextItems.push(original);
-                    warn('native-timed-entry-preserved', '带粘性、冷却或延迟条件的条目保持原生正文和触发方式，鱼忆本轮不覆盖，以维持原生计时。');
-                    continue;
-                }
-                const green = !original.constant;
+                // Prior template removals are never re-added. Entries fish does not
+                // take over this turn keep their whole native record.
+                if (nativePassThrough(original, dynamic)) { nextItems.push(original); continue; }
+                // The main book is sent exactly as fish decided. Unselected or
+                // off entries leave this scan entirely, so no keyword, recursion
+                // or card toggle can light them; blue lamps are fish's mandatory
+                // picks. A player-set tier replaces the native lamp and switch.
+                const tiered = ['constant', 'onDemand', 'off'].includes(dynamic.tier);
+                const off = tiered ? dynamic.tier === 'off' : Boolean(original.disable || dynamic.enabled === false);
                 const selected = active.selected.has(dynamic.id) || active.selected.has(original.uid) || active.selected.has(sourceId(active.bookName, original.uid));
-                if (!green && !original.disable && dynamic.enabled !== false) {
-                    nativeAudit?.blue.set(String(original.uid), { uid: original.uid, title: String(original.comment?.trim() || dynamic.title || original.uid) });
-                }
+                if (off || !selected) continue;
+                nativeAudit?.sent.set(String(original.uid), { uid: original.uid, title: String(original.comment?.trim() || dynamic.title || original.uid) });
                 const keepNative = preserveNativeBody(dynamic, original);
                 if (keepNative && nativeAudit) nativeAudit.preserved ??= new Set();
                 if (keepNative) nativeAudit?.preserved?.add(String(original.uid));
                 nextItems.push({
                     ...original,
                     content: keepNative ? original.content : safeDynamicBody(dynamic),
-                    // Preserve author disable and all other native gates. Unselected managed
-                    // green entries must not enter through keywords or recursive scanning.
-                    disable: Boolean(original.disable || dynamic.enabled === false || (green && !selected)),
-                    constant: Boolean(original.constant || (green && selected)),
+                    // Native position, depth, order and role stay; nothing native may
+                    // drop a chosen entry: no budget, probability, groups or timers.
+                    disable: false, constant: true, ignoreBudget: true, useProbability: false, probability: 100,
+                    group: '', groupOverride: false, sticky: 0, cooldown: 0, delay: 0, delayUntilRecursion: false,
                 });
             }
             replacements.push([items, nextItems]);
@@ -743,13 +753,20 @@ export async function createSillyTavernHost(deps = {}) {
         const live = ctx(), character = live.characters?.[live.characterId ?? live.this_chid];
         const file = character?.avatar?.replace(/\.[^/.]+$/, '');
         const extra = worldInfo.world_info?.charLore?.find(item => item.name === file)?.extraBooks ?? [];
-        const books = new Set([snapshot(true).bookName, ...extra, ...(worldInfo.selected_world_info ?? []),
+        // Fish clears the timers of main-book entries it takes over; native
+        // pass-through entries and every other book still count the chat length.
+        const main = snapshot(true).bookName;
+        const books = new Set([main, ...extra, ...(worldInfo.selected_world_info ?? []),
             live.chatMetadata?.[worldInfo.METADATA_KEY ?? 'world_info'],
             (live.powerUserSettings ?? powerUser?.power_user)?.persona_description_lorebook].filter(Boolean));
+        const timed = (name, entry) => !entry.disable && (entry.sticky || entry.cooldown || entry.delay)
+            && (name !== main || (!expected.configuration.has(entry.uid) && !expected.configuration.has(sourceId(main, entry.uid))
+                && nativePassThrough(entry, expected.entries.get(`${main}\0${entry.uid}`))));
         try {
-            const loaded = await Promise.all([...books].map(name => worldInfo.loadWorldInfo(name)));
+            const names = [...books];
+            const loaded = await Promise.all(names.map(name => worldInfo.loadWorldInfo(name)));
             if (plan !== expected || plan.chatId !== currentIdentity(ctx())) return;
-            if (loaded.some(book => !book?.entries || Object.values(book.entries).some(entry => !entry.disable && (entry.sticky || entry.cooldown || entry.delay)))) {
+            if (loaded.some((book, index) => !book?.entries || Object.values(book.entries).some(entry => timed(names[index], entry)))) {
                 outgoingWindow = { omittedCount: 0, reason: '原生世界书含时间条件或未完整加载，保留完整历史' };
                 warn('native-timed-window-preserved', '本轮世界书包含粘性、冷却或延迟条件（或尚未完整加载），鱼忆保留完整原文，以维持原生世界书计时。');
                 return;

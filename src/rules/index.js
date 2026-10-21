@@ -1,7 +1,7 @@
 // Author rules are data, never JavaScript or EJS. This module has no host access.
 const MARKER = '[DWM Rules]';
 const FIELDS = new Set(['id', 'title', 'kind', 'constant', 'sourceUID']);
-const OPS = new Set(['lock', 'maxChars', 'always']);
+const OPS = new Set(['lock', 'maxChars', 'always', 'trigger']);
 const MAX_SCRIPT = 10000;
 const MAX_STATEMENTS = 100;
 const MAX_TOKENS = 2000;
@@ -152,12 +152,13 @@ function match(expr, entry) {
 
 export function evaluateRules(compiled, entry) {
     if (compiled?.format !== 'dwm-rule-ast' || compiled.version !== 1 || !Array.isArray(compiled.statements)) throw new TypeError('无效规则 AST');
-    const result = { locked: false, maxChars: null, always: false };
+    const result = { locked: false, maxChars: null, always: false, trigger: false };
     for (const statement of compiled.statements) {
         if (!match(statement.condition, entry)) continue;
         if (statement.action === 'lock') result.locked = true;
         else if (statement.action === 'maxChars') result.maxChars = Math.min(result.maxChars ?? Infinity, statement.value);
         else if (statement.action === 'always') result.always = true;
+        else if (statement.action === 'trigger') result.trigger = true;
         else throw new TypeError('无效规则操作');
     }
     return result;

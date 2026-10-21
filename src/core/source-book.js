@@ -5,10 +5,15 @@ function canonical(value) {
     if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])]));
     return value;
 }
+// On/off and blue/green switches are flipped at runtime by card scripts. They
+// decide whether an entry is used this turn, not what the author wrote, so they
+// are read live (nativeSwitchOverlay) instead of blocking sends as a change.
+const SWITCHES = ['disable', 'constant'];
 function comparableMetadata(entry) {
     // Native editor drag ordering is presentation only; insertion order uses
     // the separate `order` field and must still invalidate the baseline.
     const { displayIndex: _displayIndex, ...metadata } = entry ?? {};
+    for (const key of SWITCHES) delete metadata[key];
     if (metadata.extensions && typeof metadata.extensions === 'object' && !Array.isArray(metadata.extensions)) {
         const { display_index: _displayIndexExtension, ...extensions } = metadata.extensions;
         if (Object.keys(extensions).length) metadata.extensions = extensions;
@@ -32,5 +37,28 @@ export function sourceBookChanges(save, raw, configEntryUids = []) {
         else if ((old && differs(old, entry)) || (used && differs(used, entry)) || !old) updated.push(String(entry.comment || uid));
     }
     for (const uid of new Set([...baseline.keys(), ...live.keys()])) if (!current.has(uid)) removed.push(String((baseline.get(uid) ?? live.get(uid)).metadata?.comment || uid));
-    return { changed: Boolean(added.length || removed.length || updated.length), added, removed, updated };
+    // Entries skipped at scan time (off in the book) that the book now turns on:
+    // sent natively until scanned; offered for an optional sync, never blocking.
+    const pendingScan = Object.values(save.data?.entries ?? {}).filter(entry => entry.status === 'deferred' && entry.source
+        && !entry.tier && current.get(String(entry.source.uid)) && !current.get(String(entry.source.uid)).disable).map(entry => entry.title);
+    return { changed: Boolean(added.length || removed.length || updated.length), added, removed, updated, pendingScan };
+}
+
+/** Selection and injection follow the book's live switches for entries the
+ * player has not tiered. Returns the same save when nothing differs. Never-
+ * scanned entries stay out of selection; the adapter sends them natively. */
+export function nativeSwitchOverlay(save, raw) {
+    if (!save?.initialized || !Array.isArray(raw)) return save;
+    const current = new Map(raw.map(entry => [String(entry.uid), entry]));
+    let view = null;
+    for (const entry of Object.values(save.data.entries)) {
+        if (!entry.source || entry.tier) continue;
+        const native = current.get(String(entry.source.uid));
+        if (!native) continue;
+        const enabled = !native.disable && entry.status !== 'deferred', constant = Boolean(native.constant);
+        if (enabled === entry.enabled && constant === Boolean(entry.constant)) continue;
+        view ??= structuredClone(save);
+        Object.assign(view.data.entries[entry.id], { enabled, constant });
+    }
+    return view ?? save;
 }

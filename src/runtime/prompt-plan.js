@@ -1,5 +1,5 @@
 import { clone } from '../core/util.js';
-import { entryScope, scopeSummary, scopeInventory, normalizeScopeId, readableScopes, GLOBAL_SCOPE } from '../core/state.js';
+import { entryScope, scopeSummary, scopeInventory, normalizeScopeId, readableScopes, GLOBAL_SCOPE, alwaysSent } from '../core/state.js';
 import { frontRead } from '../core/views.js';
 import { evaluateRules } from '../rules/index.js';
 
@@ -7,7 +7,7 @@ import { evaluateRules } from '../rules/index.js';
 export function assemblePromptPlan(save, ids, { eligible, compiledRules, configEntryUids = [] }) {
     const scopes = readableScopes(save.data.scopeContext);
     const mandatory = Object.values(save.data.entries).filter(e => e.enabled && eligible(e)
-        && (e.constant || e.important || evaluateRules(compiledRules, e).always)).map(e => e.id);
+        && (alwaysSent(e) || evaluateRules(compiledRules, e).always)).map(e => e.id);
     const selectedIds = [...new Set([...mandatory, ...ids])];
     const inventoryScope = normalizeScopeId(save.data.scopeContext?.activeScopeId);
     const inventory = save.data.inventoryEnabled && save.inventoryDisabledAt === null ? scopeInventory(save.data, inventoryScope).map(i => `【${i.name}｜${i.description}】`).join('\n') : '';

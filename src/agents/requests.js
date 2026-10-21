@@ -17,10 +17,17 @@ export function sourceRole(role) {
 
 // Both the executing tasks and read-only previews use these projections. Nothing
 // in a save envelope (audit, journal, source baselines) is passed wholesale.
+/** The author's native timers, as a hint only: fish no longer runs them, the
+ * initialization agent turns their intent into retrieveWhen. */
+function nativeTiming(metadata) {
+    const timing = Object.fromEntries(['sticky', 'cooldown', 'delay'].map(key => [key, Number(metadata?.[key])]).filter(([, value]) => Number.isFinite(value) && value > 0));
+    return Object.keys(timing).length ? { nativeTiming: timing } : {};
+}
 export function initializeRequest(entries, naturalLanguage = '') {
     return clone({ purpose: 'initialize', system: INITIALIZE,
         input: { naturalLanguage, entries: entries.map(e => ({ id: e.id, title: e.title, content: entryText(e), constant: e.constant,
-            keywordHints: { primary: e.source?.metadata?.key ?? [], secondary: e.source?.metadata?.keysecondary ?? [] } })) } });
+            keywordHints: { primary: e.source?.metadata?.key ?? [], secondary: e.source?.metadata?.keysecondary ?? [] },
+            ...nativeTiming(e.source?.metadata) })) } });
 }
 export function strategyRequest(strategies, entries, naturalLanguage) {
     const distinct = [...new Set(strategies.filter(Boolean))];
@@ -44,13 +51,15 @@ export function maintainRequest(save, messages, scopeId = GLOBAL_SCOPE, observed
         input: { memory, ...referenceInstructions(memory), ...(observedState ? { observedState: clone(observedState) } : {}),
             messages: messages.filter(isReadableMessage).map(({ key, role, content }) => ({ key, role: sourceRole(role), content, source: '存档正文', scopeId })) } };
 }
-export function selectRequest(save, messages, { eligible = () => true, selectionLimit = 16, selectionChars = 24000, observedState = null } = {}) {
+export function selectRequest(save, messages, { eligible = () => true, selectionLimit = 16, selectionChars = 24000, observedState = null, forced = [], authorGuidance = '', messageCount = null } = {}) {
     messages = messages.filter(isReadableMessage);
-    const catalog = frontCatalog(save, eligible, save.data.scopeContext, messages.map(m => m.key));
+    // Entries the program already sends this turn (author triggers) count as constant.
+    const catalog = frontCatalog(save, eligible, save.data.scopeContext, messages.map(m => m.key)).map(e => forced.includes(e.id) ? { ...e, constant: true } : e);
     return clone({ purpose: 'select', system: SELECT,
         input: { strategy: save.data.strategy, summary: [...readableScopes(save.data.scopeContext)].map(scopeId => { const text = scopeSummary(save.data, scopeId); return text ? (scopeId === GLOBAL_SCOPE ? text : `【范围 ${scopeId}】\n${text}`) : ''; }).filter(Boolean).join('\n\n'),
             scopeContext: { activeScopeId: save.data.scopeContext?.activeScopeId ?? GLOBAL_SCOPE, requestedScopeIds: save.data.scopeContext?.requestedScopeIds ?? [] }, selectionLimit, selectionChars, catalog,
-            ...(observedState ? { observedState } : {}),
+            ...(observedState ? { observedState } : {}), ...(authorGuidance ? { authorGuidance } : {}),
+            ...(Number.isInteger(messageCount) ? { progress: { messageCount } } : {}),
             messages: messages.map(({ key, role, content }) => ({ key, role: sourceRole(role), content, source: '存档正文' })) } });
 }
 export function compactRequest(save, scopeId = GLOBAL_SCOPE, { summaryOnly = false } = {}) {
@@ -70,10 +79,17 @@ export function requestBatches(items, maxChars, text = item => item.content, max
     if (current.length) result.push(current);
     return result;
 }
+/** Unmaintained messages older than the recent turns are not in memory yet, so
+ * selection reads them too, but only the newest part: a long backlog made the
+ * request hundreds of thousands of characters and timed out at the gateway. */
+export const SELECTION_BACKLOG_CHARS = 40000;
 export function selectionMessages(snapshot, save, recentTurns) {
     const starts = snapshot.messages.flatMap((m, i) => m.role === 'user' && isReadableMessage(m) ? [i] : []);
     const start = starts.length > recentTurns ? starts[starts.length - recentTurns] : 0;
-    const recent = snapshot.messages.slice(Math.min(start, save.processed.length)).filter(isReadableMessage);
+    const backlog = snapshot.messages.slice(Math.min(start, save.processed.length), start).filter(isReadableMessage);
+    let kept = 0, used = 0;
+    for (let i = backlog.length - 1; i >= 0 && used + String(backlog[i].content ?? '').length <= SELECTION_BACKLOG_CHARS; i--) { used += String(backlog[i].content ?? '').length; kept++; }
+    const recent = [...backlog.slice(backlog.length - kept), ...snapshot.messages.slice(start).filter(isReadableMessage)];
     if (snapshot.userInput) recent.push({ key: 'current-input', role: 'user', content: snapshot.userInput });
     return recent;
 }

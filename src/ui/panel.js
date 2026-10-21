@@ -3,7 +3,9 @@ import { diffText } from './diff.js';
 import { createTraceViewer } from './trace-viewer.js';
 import { createPromptPreview } from './prompt-preview.js';
 import { createActivityIndicator } from './activity.js';
-import { DEFAULT_SETTINGS, MAINTENANCE_EVERY_MAX, templateHint } from '../core/state.js';
+import { DEFAULT_SETTINGS, MAINTENANCE_EVERY_MAX, templateHint, entryTier } from '../core/state.js';
+
+const TIER_NAMES = { constant: '常驻', onDemand: '按需', off: '关闭' };
 
 const KIND_NAMES = { fact: '世界资料', rule: '规则', npc: '人物', npc_pool: '路人', event: '事件', inventory: '物品' };
 const TASK_NAMES = { initialize: '扫描世界书', strategy: '统合记忆策略', maintain: '维护记忆', select: '本轮选材', compact: '整理事件' };
@@ -192,6 +194,10 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         if (localError) { const error = h('p', 'dwm-error', localError); error.setAttribute('role', 'alert'); feedback.append(error); }
         if (view.error) { const error = details('技术信息', 'task-error'); error.append(prose(view.error)); feedback.append(error); if (view.save?.initialized && /记忆待补齐|正在维护|补记/.test(view.status)) feedback.append(button('重试补记', () => call(() => controller.maintain()))); }
         if (notice) { const success = h('p', 'dwm-notice', notice); success.setAttribute('role', 'status'); feedback.append(success); }
+        if (!view.sourceChanges?.changed && view.sourceChanges?.pendingScan?.length) {
+            const pending = h('p', 'dwm-muted', `原书里新打开了 ${view.sourceChanges.pendingScan.length} 条扫描时关闭、尚未扫描的条目，暂按原书方式发送。需要由鱼忆选材和维护时，可点“只同步变化的条目”扫描它们。`);
+            feedback.append(pending, button('只同步变化的条目', () => call(() => controller.syncSourceChanges(), '原书变化已同步'), { disabled: Boolean(view.activity) || !view.save?.initialized }));
+        }
         if (view.sourceChanges?.changed) {
             const changes = view.sourceChanges;
             const warning = h('p', 'dwm-warning', `主世界书已变化：新增 ${changes.added.length} 条、修改 ${changes.updated.length} 条、删除 ${changes.removed.length} 条。当前动态资料仍以旧书为基准。点“只同步变化的条目”只扫描这些条目：剧情改过的条目会把新旧原书和当前版本一起交给模型合并，只调用少量模型；也可以备份后在设置里整本重新扫描。`);
@@ -273,9 +279,11 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
             const item = button('', () => openEntry(entry.id), { navigation: true, key: `entry-${entry.id}`, className: `dwm-entry-link ${entry.id === selected ? 'dwm-selected' : ''}` });
             item.setAttribute('aria-current', entry.id === selected ? 'true' : 'false');
             const meta = h('div', 'dwm-entry-meta'); meta.append(h('span', '', KIND_NAMES[entry.kind] ?? entry.kind));
+            const tier = entryTier(entry);
             if (entry.needsReview) meta.append(h('span', 'dwm-review-label', '待核对'));
-            else if (!entry.enabled) meta.append(h('span', '', entry.status === 'deferred' ? '已停用 · 启用后扫描' : '已停用'));
-            else if (entry.constant || entry.important) meta.append(h('span', '', '常驻'));
+            else if (tier === 'off') meta.append(h('span', '', entry.status === 'deferred' ? '关闭 · 未扫描' : '关闭'));
+            else if (tier === 'constant') meta.append(h('span', '', '常驻'));
+            if (entry.tier) meta.append(h('span', '', '已手动调整'));
             item.append(meta, h('strong', '', entry.title || '未命名条目'), h('span', 'dwm-entry-intro', entry.intro || '暂无简介')); list.append(item);
         }
         if (matching.length > visibleCount) list.append(button(`再显示 ${Math.min(80, matching.length - visibleCount)} 条`, () => { visibleCount += 80; render(); }, { navigation: true }));
@@ -317,12 +325,15 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
     function renderEntry(parent, entry, view) {
         const back = button('返回资料列表', () => { mobileDetail = false; render(); container.querySelector('[data-focus="entry-search"]')?.focus({ preventScroll: true }); }, { navigation: true, className: 'dwm-mobile-back' }); parent.append(back);
         const meta = h('div', 'dwm-entry-heading-meta'); meta.append(badge(KIND_NAMES[entry.kind] ?? entry.kind));
-        meta.append(badge(entry.constant ? '蓝灯 · 常驻' : entry.important ? '重要人物 · 常驻' : '前置按需选材'));
-        if (!entry.enabled) meta.append(badge(entry.status === 'deferred' ? '已停用 · 原书启用后同步即扫描' : '已停用'));
+        const tier = entryTier(entry);
+        meta.append(badge(tier === 'off' ? '关闭 · 不发送、不维护' : tier === 'onDemand' ? '按需 · 前置选材决定'
+            : entry.tier ? '常驻 · 每轮发送' : entry.constant ? '蓝灯 · 常驻' : '重要人物 · 常驻'));
+        if (entry.tier) meta.append(badge('已手动调整'));
         if (entry.needsReview) meta.append(badge('待核对', 'dwm-review-badge'));
         parent.append(meta);
         const title = h('h3', 'dwm-entry-title', entry.title || '未命名条目'); title.tabIndex = -1; title.dataset.detailHeading = 'true'; parent.append(title);
         parent.append(h('p', 'dwm-entry-description', entry.intro || '尚无简介。'));
+        renderTier(parent, entry, view);
         const actions = h('div', 'dwm-entry-actions');
         for (const [id, label] of [['read', '当前内容'], ['diff', '原书差异'], ['evidence', '修改依据'], ['edit', '编辑']]) {
             const b = button(label, () => { entryMode = id; if (id === 'edit' && !entryDrafts.has(entry.id)) entryDrafts.set(entry.id, newDraft(entry)); render(); }, { navigation: true, className: entryMode === id ? 'dwm-selected' : '' }); b.setAttribute('aria-pressed', String(entryMode === id)); actions.append(b);
@@ -347,6 +358,20 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         const usage = details('何时提取这条资料', `guidance-${entry.id}`); usage.append(prose(entry.retrieveWhen, '初始化尚未给出提取指导。'), h('p', 'dwm-muted', `当前版本 ${entry.version} · ${textOf(entry).length.toLocaleString('zh-CN')} 字符${entry.scopeId && entry.scopeId !== 'global' ? ` · 范围 ${entry.scopeId}` : ''}`)); parent.append(usage);
         if (entry.kind === 'npc' && !entry.important) parent.append(row(button('晋升为重要人物', () => call(() => controller.manual({ type: 'promote', id: entry.id }), '已晋升为重要人物'))));
         if (entry.kind === 'npc_pool') renderPool(parent, entry);
+    }
+    function renderTier(parent, entry, view) {
+        const tier = entryTier(entry), scanned = view.save?.scannedTiers?.[entry.id];
+        const unscanned = entry.status === 'deferred';
+        const wrap = h('div', 'dwm-entry-tier');
+        wrap.append(selectField('档位', tier, [['constant', '常驻：每轮都发送'], ['onDemand', '按需：由发送前的选材决定'], ['off', '关闭：不发送、不维护']],
+            value => { if (value !== tier) call(() => controller.manual({ type: 'tier', id: entry.id, tier: value }), `已调整为${TIER_NAMES[value]}`); }, `tier-${entry.id}`).wrap);
+        const notes = [];
+        if (unscanned && tier === 'off') notes.push('此条在扫描时是关闭的，还没有扫描过；改成常驻或按需时会先调用一次模型扫描这一条。');
+        if (scanned && scanned !== tier) notes.push(`扫描时为「${TIER_NAMES[scanned]}」。`);
+        notes.push('只改这个存档的动态副本，不改原世界书。卡作者规则设为必发的条目，选按需仍会发送；选关闭才会停用。');
+        wrap.append(h('p', 'dwm-muted dwm-hint', notes.join('')));
+        if (entry.tier || (scanned && scanned !== tier)) wrap.append(button('恢复扫描时的档位', () => call(() => controller.manual({ type: 'tier-reset', id: entry.id }), '已恢复扫描时的档位')));
+        parent.append(wrap);
     }
     function renderDiff(parent, entry) {
         if (!entry.source) { parent.append(h('p', 'dwm-empty', '这是鱼忆自建的资料，没有原世界书对应项。'), prose(textOf(entry))); return; }
@@ -680,7 +705,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         form.append(selectField('匹配字段', ruleMatch.field, [['title', '条目名称'], ['id', '条目身份'], ['kind', '条目类型'], ['constant', '是否蓝灯'], ['sourceUID', '原书条目编号']], value => { ruleMatch.field = value; }).wrap,
             selectField('条件', ruleMatch.op, [['contains', '包含'], ['==', '等于'], ['!=', '不等于']], value => { ruleMatch.op = value; }).wrap,
             field('匹配值', ruleMatch.value, value => { ruleMatch.value = value; }, { key: 'rule-value' }).wrap,
-            selectField('执行动作', ruleMatch.action, [['lock', '锁定维护'], ['maxChars', '限制长度'], ['always', '始终选入']], value => { ruleMatch.action = value; render(); }).wrap);
+            selectField('执行动作', ruleMatch.action, [['lock', '锁定维护'], ['maxChars', '限制长度'], ['always', '始终选入'], ['trigger', '关键词出现时必发']], value => { ruleMatch.action = value; render(); }).wrap);
         if (ruleMatch.action === 'maxChars') form.append(field('长度上限', ruleMatch.limit, value => { ruleMatch.limit = value; }, { type: 'number', key: 'rule-limit' }).wrap);
         parent.append(form, button('加入脚本', () => {
             try {

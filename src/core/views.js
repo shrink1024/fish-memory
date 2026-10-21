@@ -1,5 +1,5 @@
 import { clone, invariant, uid } from './util.js';
-import { entryText, entryScope, scopeSummary, scopeInventory, readableScopes, normalizeScopeId, GLOBAL_SCOPE } from './state.js';
+import { entryText, entryScope, scopeSummary, scopeInventory, readableScopes, normalizeScopeId, GLOBAL_SCOPE, alwaysSent, scannedTier } from './state.js';
 
 export const PROTECTED_TEXT_MARKER = '[受保护资料]';
 
@@ -142,7 +142,7 @@ export function frontCatalog(save, eligible = () => true, context = save.data.sc
     const recent = new Set(recentKeys);
     return Object.values(save.data.entries).filter(e => e.enabled && scopes.has(entryScope(e)) && eligible(e)).map(e => ({
         id: e.id, scopeId: entryScope(e), title: e.title, kind: e.kind, intro: e.intro,
-        retrieveWhen: e.retrieveWhen, constant: e.constant || e.important,
+        retrieveWhen: e.retrieveWhen, constant: alwaysSent(e),
         contentChars: entryText(e).length,
         recentEvidenceCount: (e.evidence ?? []).filter(key => recent.has(key)).length,
     }));
@@ -234,7 +234,8 @@ export function memoryMetrics(save) {
 export function playerView(save) {
     return clone({ id: save.id, revision: save.revision, initialized: save.initialized,
         bookName: save.bookName, preferences: save.preferences ?? {}, data: save.data, processedCount: save.processed.length,
-        inventoryNeedsCatchUp: save.inventoryDisabledAt !== null, audit: save.audit });
+        inventoryNeedsCatchUp: save.inventoryDisabledAt !== null, audit: save.audit,
+        scannedTiers: Object.fromEntries(Object.values(save.base?.entries ?? {}).map(e => [e.id, scannedTier(e)])) });
 }
 
 // Card-facing projection intentionally has no source baselines, audit, journal or rules.

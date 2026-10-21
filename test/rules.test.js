@@ -15,7 +15,7 @@ test('discovers disabled native configuration as inert data, in stable order', (
 
 test('matching, precedence and multiple constraints merge monotonically', () => {
     const ast = compileRules('when (title contains "变量" and not constant == true) or kind == "npc" => lock;\nwhen id == "source:book:17" => maxChars 900;\nwhen sourceUID == "17" => maxChars 500;\nwhen kind == "rule" => always;');
-    assert.deepEqual(evaluateRules(ast, entry), { locked: true, maxChars: 500, always: true });
+    assert.deepEqual(evaluateRules(ast, entry), { locked: true, maxChars: 500, always: true, trigger: false });
     const applied = applyRules([entry], ast);
     assert.equal(applied.entries[0].segments[0].writable, false);
     assert.equal(entry.segments[0].writable, true);

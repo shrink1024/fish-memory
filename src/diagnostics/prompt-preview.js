@@ -1,10 +1,10 @@
 import { clone, isPrefix } from '../core/util.js';
 import { DEFAULT_SETTINGS, makeSourceEntry, entryText, normalizeScopeId, readableScopes, entryScope } from '../core/state.js';
-import { applyRules, compileRules, discoverRules } from '../rules/index.js';
+import { applyRules, compileRules, discoverRules, evaluateRules } from '../rules/index.js';
 import { INITIALIZE, ALIGN_STRATEGY, MAINTAIN, MAINTAIN_REWRITE, SELECT, COMPACT } from '../agents/prompts.js';
-import { initializeRequest, selectRequest, maintainRequest, compactRequest, requestBatches, selectionMessages, INITIALIZATION_BATCH_ITEMS } from '../agents/requests.js';
+import { initializeRequest, selectRequest, maintainRequest, compactRequest, requestBatches, selectionMessages, isReadableMessage, INITIALIZATION_BATCH_ITEMS } from '../agents/requests.js';
 import { prescan } from '../agents/prescan.js';
-import { maintenanceFocus } from '../core/focus.js';
+import { maintenanceFocus, triggeredIds } from '../core/focus.js';
 
 const AGENTS = {
     initialize: { id: 'fish-initialize', title: '鱼忆 · 初始化 Agent', description: '扫描主世界书、分类资料并统合记忆策略；分批扫描与策略统合属于同一职责。', identified: true },
@@ -46,7 +46,7 @@ function pendingBatches(snapshot, save, settings) {
  * Conditional stages may contain only the fields already known; omitted fields
  * are described in uncertainties, never replaced with pretend model outputs.
  */
-export function buildPromptPreview({ snapshot, save = null, settings: suppliedSettings = {}, rules: suppliedRules,
+export function buildPromptPreview({ snapshot, save = null, selectionSave = save, settings: suppliedSettings = {}, rules: suppliedRules,
     compiledRules: suppliedCompiledRules, connectionMode = 'raw', observedState = null, busy = {},
     rawEntries = null, eligible = entry => entry.enabled, at = new Date().toISOString() } = {}) {
     const settings = { ...DEFAULT_SETTINGS, ...suppliedSettings };
@@ -101,8 +101,10 @@ export function buildPromptPreview({ snapshot, save = null, settings: suppliedSe
     if (settings.mvuEnabled) selectUncertainties.push(selectObservation ? 'MVU 为当前已读取的指定字段，实际发送前会重新读取并核对所属楼层。'
         : '本次没有可用且属于最新楼层的 MVU 字段；实际发送前会重读，可能追加 observedState。');
     stages.push(stage(AGENTS.select, 'select', '前置选材', !settings.enabled || busy.initializing || busy.maintaining ? 'conditional' : 'ready',
-        '展示前置模型的选材请求。待补记的正文会保留，输入框草稿以 current-input 追加。',
-        selectRequest(save, recent, { eligible: eligibleHere, selectionLimit: settings.selectionLimit, selectionChars: settings.selectionChars, observedState: selectObservation }), selectUncertainties));
+        '展示前置模型的选材请求。近期轮次完整保留；更早的待补记正文只带最新约 4 万字，输入框草稿以 current-input 追加。',
+        selectRequest(selectionSave, recent, { eligible: eligibleHere, selectionLimit: settings.selectionLimit, selectionChars: settings.selectionChars, observedState: selectObservation,
+            forced: triggeredIds(selectionSave, context.messages.filter(isReadableMessage), context.userInput, { eligible: eligibleHere, rules: entry => evaluateRules(compiledRules, entry) }),
+            authorGuidance: rules.naturalLanguage, messageCount: context.messages.length }), selectUncertainties));
 
     const safeSave = guarded(save, compiledRules), pending = pendingBatches(context, save, settings);
     if (settings.summaryMode === 'rewrite' && settings.memoryMode !== 'worldbook') safeSave.summaryRewrite = true;

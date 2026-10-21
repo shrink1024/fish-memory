@@ -53,6 +53,15 @@ export function decodeResponse(raw, contentType = '') {
     return { messages: [...messages.values()], stream: true, done, malformedEvents, ...(events.length ? { errors: events } : {}) };
 }
 
+/** Requests fish did not send itself, named by ST's generation type. */
+const STORY_TYPES = new Set(['normal', 'regenerate', 'swipe', 'continue', 'append', 'appendFinal', 'first_message']);
+export function externalLabel(type) {
+    if (STORY_TYPES.has(type)) return '酒馆正文生成';
+    if (type === 'impersonate') return '酒馆代写（替玩家发言）';
+    if (type === 'quiet') return '后台请求（其他扩展或角色卡）';
+    return '酒馆 / 外部模型调用';
+}
+
 export function installCapture({ target = globalThis, store, context = () => ({}), provenance = () => [], maxResponseChars = 1500000, readTimeoutMs = 300000 } = {}) {
     const original = target.fetch; const intents = new Set(), readers = new Set();
     let disposed = false;
@@ -111,7 +120,7 @@ export function installCapture({ target = globalThis, store, context = () => ({}
         if (route.transport === 'browser-api' && request && !request.messages && !request.input && !request.prompt) return original.apply(this, arguments);
         intent = safe(() => identify(request));
         id = change('start', { ...route, request, context: safe(context, {}), provenance: safe(() => matchedProvenance(request), []),
-            source: intent?.source ?? '来源未确认', label: intent?.label ?? '酒馆 / 外部模型调用', kind: request?.type ?? 'unknown',
+            source: intent?.source ?? '来源未确认', label: intent?.label ?? externalLabel(request?.type), kind: request?.type ?? 'unknown',
             captureNote: route.transport === 'browser-st' ? '浏览器与酒馆之间的收发原文；酒馆服务端可能继续转换供应商协议。' : '浏览器直接发出的模型请求。' });
         if (intent && id) intent.recordIds.push(id);
         if (request === null && input?.clone) {

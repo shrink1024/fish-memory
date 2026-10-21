@@ -15,7 +15,10 @@ test('source comparison detects same-name edits, activation changes, additions a
     const { seed } = await fixture();
     assert.equal(sourceBookChanges(seed.state, [Object.fromEntries(Object.entries(raw).reverse())]).changed, false);
     assert.equal(sourceBookChanges(seed.state, [{ ...raw, content: '北城' }]).updated.length, 1);
-    assert.equal(sourceBookChanges(seed.state, [{ ...raw, disable: true }]).changed, true);
+    // Switch flips are runtime state (card scripts), read live instead of blocking.
+    assert.equal(sourceBookChanges(seed.state, [{ ...raw, disable: true }]).changed, false);
+    assert.equal(sourceBookChanges(seed.state, [{ ...raw, constant: false }]).changed, false);
+    assert.equal(sourceBookChanges(seed.state, [{ ...raw, key: ['新词'] }]).changed, true, 'other activation metadata still counts');
     assert.equal(sourceBookChanges(seed.state, []).removed.length, 1);
     assert.equal(sourceBookChanges(seed.state, [raw, { ...raw, uid: 2 }]).added.length, 1);
 });

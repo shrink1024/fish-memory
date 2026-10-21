@@ -68,16 +68,40 @@ test('history window keeps native time counts for timed entries in any active bo
     assert.equal(f.live.chat.length, 2);
 });
 
-test('timed native entries keep their complete hash-bearing record across changing selections', async () => {
+test('the history window ignores timers only on main-book entries fish takes over', async () => {
+    const f = fixture(), host = await createSillyTavernHost(f.deps);
+    f.live.chat = [{ mes: 'past', is_user: true }, { mes: 'recent', is_user: false }];
+    const at = host.snapshot();
+    await host.applyWindow([{ index: 0, key: at.messages[0].key, hidden: true }]);
+    const managed = { id: 'source:main:1', enabled: true, source: { book: 'main', uid: 1 }, segments: [{ text: 'x' }] };
+    const send = async () => { const out = structuredClone(f.live.chat); await host.filterOutgoingHistory(out, null, null, 'normal'); return out.length; };
+    f.books.main.entries[1] = { uid: 1, sticky: 2, cooldown: 1, delay: 3, content: 'main sticky' };
+    host.setPlan({ chatId: at.chatId, dynamicEntries: [managed] });
+    assert.equal(await send(), 1, 'fish clears the timers of entries it takes over');
+    // Native pass-through keeps its timers, so the window must keep history.
+    host.setPlan({ chatId: at.chatId, dynamicEntries: [] });
+    assert.equal(await send(), 2, 'no dynamic copy yet (added after the scan)');
+    f.books.main.entries[1] = { uid: 1, sticky: 2, delay: 3, content: '@@if stage\n模板条目' };
+    host.setPlan({ chatId: at.chatId, dynamicEntries: [managed] });
+    assert.equal(await send(), 2, 'Prompt Template activation condition');
+    f.books.main.entries[1] = { uid: 1, sticky: 2, content: '未扫描' };
+    host.setPlan({ chatId: at.chatId, dynamicEntries: [{ ...managed, status: 'deferred', enabled: false }] });
+    assert.equal(await send(), 2, 'off at scan time, now on in the book');
+    host.setPlan({ chatId: at.chatId, configEntryUids: [1], dynamicEntries: [] });
+    assert.equal(await send(), 1, 'configuration entries are never sent');
+});
+
+test('main-book timers are dropped: fish alone decides each turn, without native sticky, cooldown or delay', async () => {
     const f = fixture(), host = await createSillyTavernHost(f.deps), at = host.snapshot();
-    const original = { world: 'main', uid: 1, sticky: 2, constant: false, disable: false, content: 'authored' };
+    const original = { world: 'main', uid: 1, sticky: 2, cooldown: 3, delay: 4, constant: false, disable: false, content: 'authored' };
     const dynamic = { id: 'source:main:1', enabled: true, source: { book: 'main', uid: 1, original: 'authored' }, segments: [{ id: 'body', text: 'updated' }] };
-    for (const selectedIds of [[], [dynamic.id], []]) {
+    for (const [selectedIds, sent] of [[[], false], [[dynamic.id], true], [[], false]]) {
         host.setPlan({ chatId: at.chatId, dynamicEntries: [dynamic], selectedIds });
         const data = { characterLore: [structuredClone(original)] }; host.applyWorldInfoEntries(data);
-        assert.deepEqual(data.characterLore, [original]);
+        if (!sent) { assert.deepEqual(data.characterLore, []); continue; }
+        assert.deepEqual(data.characterLore.map(e => [e.content, e.constant, e.disable, e.sticky, e.cooldown, e.delay]), [['updated', true, false, 0, 0, 0]]);
     }
-    assert.equal(host.getWarnings().length, 1);
+    assert.equal(host.getWarnings().length, 0);
 });
 
 test('dedicated chat transport preserves literal macros, output and selected connection without events', async () => {
