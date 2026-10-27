@@ -688,6 +688,18 @@ export async function createSillyTavernHost(deps = {}) {
         }
     }
 
+    function supplementaryBooks() {
+        const live = ctx(), character = live.characters?.[live.characterId ?? live.this_chid];
+        const file = character?.avatar?.replace(/\.[^/.]+$/, '');
+        const extra = worldInfo.world_info?.charLore?.find(item => item.name === file)?.extraBooks ?? [];
+        return [...new Set([...extra, live.chatMetadata?.[worldInfo.METADATA_KEY ?? 'world_info']])]
+            .filter(name => typeof name === 'string' && name && name !== snapshot(true).bookName);
+    }
+    async function readSupplementaryBook(name) {
+        if (!supplementaryBooks().includes(name)) throw new Error('附加世界书绑定已改变，请重新选择');
+        return copy(await worldInfo.loadWorldInfo(name));
+    }
+
     async function restoreLegacyWindow() {
         const target = currentIdentity(ctx());
         return enqueueSave(async () => {
@@ -1131,7 +1143,7 @@ export async function createSillyTavernHost(deps = {}) {
         return result;
     }
 
-    return { snapshot, generationSnapshot, pendingReplacement, previewSnapshot: () => snapshot(true), previewEligible: entry => eligible(entry, { silent: true, type: 'normal' }), loadWorldbook, worldbookStatus, checkWorldbook, eligible, storage, setPlan, clearPlan, applyWorldInfoEntries, applyWindow, restoreLegacyWindow, filterOutgoingHistory, bindController, rawGenerate, stopGeneration, auxiliaryReadiness,
+    return { supplementaryBooks, readSupplementaryBook, snapshot, generationSnapshot, pendingReplacement, previewSnapshot: () => snapshot(true), previewEligible: entry => eligible(entry, { silent: true, type: 'normal' }), loadWorldbook, worldbookStatus, checkWorldbook, eligible, storage, setPlan, clearPlan, applyWorldInfoEntries, applyWindow, restoreLegacyWindow, filterOutgoingHistory, bindController, rawGenerate, stopGeneration, auxiliaryReadiness,
         readMvu: settings => readMvuProjection({ context: ctx, settings, globals: deps.globals ?? globalThis }),
         getWarnings: () => copy(warnings), windowStatus: () => copy(outgoingWindow) };
 }

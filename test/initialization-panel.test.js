@@ -16,7 +16,7 @@ class Node {
     replaceChildren(...items) { for (const child of this.children) child.parent = null; this.children = []; this._text = ''; this.append(...items); }
     remove() { if (this.parent) this.parent.children = this.parent.children.filter(child => child !== this); this.parent = null; }
     contains(node) { return walk(this).includes(node); }
-    querySelectorAll(selector) { return walk(this).filter(node => selector === '[data-focus]' && node.dataset.focus); }
+    querySelectorAll(selector) { return walk(this).filter(node => (selector === '[data-focus]' && node.dataset.focus) || (selector === '[data-scroll]' && node.dataset.scroll)); }
     querySelector() { return null; }
     setAttribute(name, value) { this.attributes[name] = String(value); }
     addEventListener(type, callback) { (this.events[type] ??= new Set()).add(callback); }
@@ -106,4 +106,30 @@ test('preset application draft switches never transfer to a different chat with 
     input = walk(f.root).find(n => n.tagName === 'INPUT' && n.type === 'checkbox');
     assert.equal(input.checked, false);
     assert.match(f.root.textContent, /当前勾选 0 条/);
+});
+
+
+test('mobile hidden list retains its previous scroll offset when detail rerenders', t => {
+    const entry = { id: 'a', title: '滚动测试', kind: 'fact', enabled: true, constant: true, segments: [{ id: 'body', text: '内容', writable: true }], intro: '', retrieveWhen: '', evidence: [], version: 1 };
+    const f = fixture({ save: { id: 'scroll-save', initialized: true, data: { entries: { a: entry }, summary: '', inventory: [] }, audit: [] } });
+    t.after(() => f.panel.destroy());
+    const hiddenList = node => {
+        if (node.dataset.scroll !== 'library-list') return false;
+        let p = node.parent;
+        while (p) { if (p.className.includes('dwm-show-detail')) return true; p = p.parent; }
+        return false;
+    };
+    const prepare = () => { for (const node of walk(f.root).filter(n => n.dataset.scroll)) {
+        node.getClientRects = () => hiddenList(node) ? [] : [{}];
+        let offset = node.scrollTop ?? 0;
+        Object.defineProperty(node, 'scrollTop', { configurable: true, get: () => hiddenList(node) ? 0 : offset, set: v => { if (!hiddenList(node)) offset = v; } });
+    } };
+    prepare();
+    walk(f.root).find(n => n.dataset.scroll === 'library-list').scrollTop = 320;
+    walk(f.root).find(n => n.className.includes('dwm-entry-link')).click();
+    prepare();
+    for (const callback of f.listeners) callback();
+    prepare();
+    f.button('返回资料列表').click();
+    assert.equal(walk(f.root).find(n => n.dataset.scroll === 'library-list').scrollTop, 320);
 });

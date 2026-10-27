@@ -100,6 +100,8 @@ export function createEntry(input) {
         status: input.status ?? 'confirmed',
         needsReview: Boolean(input.needsReview),
         ...(TIERS.includes(input.tier) ? { tier: input.tier } : {}),
+        // Player-imported history: not generated from any reply, so it survives rerolls.
+        ...(input.origin === 'import' ? { origin: 'import' } : {}),
     };
     invariant(KINDS.includes(entry.kind), `未知条目类型：${entry.kind}`);
     invariant(typeof entry.id === 'string' && entry.id.length < 1000, '无效条目身份');

@@ -1,162 +1,67 @@
-import { orderedPresetEntries } from './src/agents/preset-application.js';
-import { createSillyTavernHost } from './src/adapters/sillytavern.js';
-import { createSettingsPersistence } from './src/adapters/settings.js';
-import { Controller } from './src/runtime/controller.js';
-import { mountPanel } from './src/ui/panel.js';
-import { createTraceStore } from './src/diagnostics/trace-store.js';
-import { installCapture } from './src/diagnostics/capture.js';
-import { createProblemExporter } from './src/diagnostics/problem-export.js';
-import { createFloatingManager } from './src/ui/floating-manager.js';
+// Entry kept free of static imports. If a later module is refused (an ad
+// blocker, a missing file, unsupported syntax) this still runs and names the
+// cause instead of ST's bare "[object Event]".
+const MODULE_LIMIT = 200;
+const STATIC_IMPORT = /\b(?:import|export)\s*(?:[\w$*{}\s,]+\s*from\s*)?['"](\.{1,2}\/[^'"]+)['"]/g;
+const TIMED_OUT = Symbol('timed out');
 
-// Keep in step with manifest.json; test/version.test.js checks it.
-const PLUGIN_VERSION = '0.3.2';
+// One probe request, bounded by its own timer and the whole diagnosis' deadline.
+async function readFile(fetchImpl, url, timeoutMs, deadline) {
+    const controller = new AbortController(), stop = () => controller.abort();
+    const timer = setTimeout(stop, timeoutMs);
+    deadline.addEventListener('abort', stop, { once: true });
+    const aborted = new Promise((_, reject) => controller.signal.addEventListener('abort', () => reject(TIMED_OUT), { once: true }));
+    aborted.catch(() => {});
+    try {
+        const response = await Promise.race([fetchImpl(url, { cache: 'no-store', signal: controller.signal }), aborted]);
+        if (!response.ok) return { status: response.status };
+        return { text: await Promise.race([response.text(), aborted]) };
+    } catch (error) {
+        if (controller.signal.aborted) throw TIMED_OUT;
+        return { refused: true };
+    } finally { clearTimeout(timer); deadline.removeEventListener('abort', stop); }
+}
 
-async function boot() {
-    if (!globalThis.SillyTavern?.getContext || document.getElementById('dynamic-world-memory')) return;
-    const context = SillyTavern.getContext();
-    const host = await createSillyTavernHost();
-    const traces = createTraceStore();
-    let worldEntries = [];
-    const events = context.eventSource, types = context.eventTypes ?? context.event_types;
-    const activated = entries => { worldEntries = Array.isArray(entries) ? entries : [...(entries ?? [])]; };
-    const changed = () => { worldEntries = []; };
-    if (types?.WORLD_INFO_ACTIVATED) events?.on(types.WORLD_INFO_ACTIVATED, activated);
-    if (types?.CHAT_CHANGED) events?.on(types.CHAT_CHANGED, changed);
-    const openai = await import('/scripts/openai.js').catch(() => ({}));
-    host.traceCapture = installCapture({ store: traces,
-        context: () => {
-            const live = SillyTavern.getContext();
-            return { chatId: live.getCurrentChatId?.() ?? live.chatId ?? '', character: live.name2 ?? '', memoryChatId: host.snapshot().chatId, messageCount: live.chat?.length ?? 0 };
-        },
-        provenance: () => {
-            const live = SillyTavern.getContext();
-            return [
-                ...worldEntries.map(entry => ({ title: entry.comment || `世界书 #${entry.uid}`, text: entry.content, kind: '世界书' })),
-                ...(openai.oai_settings?.prompts ?? []).map(prompt => ({ title: prompt.name || prompt.identifier, text: prompt.content, kind: '预设' })),
-                ...Object.entries(live.extensionPrompts ?? {}).map(([name, prompt]) => ({ title: name, text: prompt.value, kind: '扩展注入' })),
-            ].filter(entry => typeof entry.text === 'string' && entry.text.length > 8);
-        },
-    });
-    host.readPreset = () => {
-        if (SillyTavern.getContext().mainApi !== 'openai') return { name: '当前连接没有可读取的聊天补全预设', entries: [] };
-        const manager = openai.promptManager;
-        const order = manager?.getPromptOrderForCharacter?.(manager.activeCharacter) ?? [];
-        return { name: openai.oai_settings?.preset_settings_openai ?? '',
-            entries: orderedPresetEntries(openai.oai_settings?.prompts ?? [], order) };
-    };
-    const extensionSettings = context.extensionSettings ?? (await import('/scripts/extensions.js')).extension_settings;
-    const settings = extensionSettings.dwm ?? {};
-    const connectionStore = {
-        key: 'dwm:auxiliary-connection',
-        load() { return JSON.parse(globalThis.localStorage?.getItem(this.key) ?? 'null'); },
-        save(value) { if (value) globalThis.localStorage?.setItem(this.key, JSON.stringify(value)); else globalThis.localStorage?.removeItem(this.key); },
-    };
-    const controller = new Controller(host, {
-        settings, traces, connectionStore,
-        persistSettings: createSettingsPersistence({ extensionSettings,
-            saveSettings: async () => (await import('/script.js')).saveSettings(),
-            getRequestHeaders: () => SillyTavern.getContext().getRequestHeaders(),
-            fetch: (...args) => globalThis.fetch(...args) }),
-        chooseFallback: (error, { signal } = {}) => new Promise(resolve => {
-            if (signal?.aborted) { resolve('cancel'); return; }
-            const dialog = document.createElement('dialog');
-            dialog.className = 'dwm-fallback';
-            const title = document.createElement('h3'); title.textContent = '本轮记忆选材未完成';
-            const detail = document.createElement('details'); const summary = document.createElement('summary'); summary.textContent = '技术信息';
-            const errorText = document.createElement('p'); errorText.textContent = error.message; detail.append(summary, errorText);
-            const hint = document.createElement('p'); hint.textContent = '按原世界书发送会撤去本轮动态资料，保留酒馆和其他工具的正常内容。';
-            dialog.append(title, detail, hint);
-            let finished = false;
-            const finish = value => {
-                if (finished) return; finished = true;
-                signal?.removeEventListener('abort', aborted);
-                if (dialog.open) dialog.close(); dialog.remove(); resolve(value);
-            };
-            const aborted = () => finish('cancel');
-            for (const [value, text] of [['original', '按原世界书发送'], ['retry', '重新选材（调用模型）'], ['cancel', '停止本轮']]) {
-                const button = document.createElement('button'); button.textContent = text;
-                if (value === 'cancel') button.autofocus = true;
-                button.addEventListener('click', () => finish(value)); dialog.append(button);
+/** Walk the relative import graph from `entry` and report the first file that cannot be read.
+ * Returns '' when the probe itself times out; the original error has already been shown. */
+export async function diagnoseLoad(entry, error, { fetchImpl = globalThis.fetch, base = entry, userAgent = globalThis.navigator?.userAgent ?? '',
+    requestTimeoutMs = 4000, totalTimeoutMs = 10000 } = {}) {
+    const shown = url => decodeURIComponent(new URL(url).pathname.slice(new URL('./', base).pathname.length) || url);
+    if (error?.name === 'SyntaxError') return `浏览器无法解析鱼忆的代码（${error.message}），可能版本过旧。请升级浏览器或酒馆所用的 WebView 后刷新。${userAgent ? `\n浏览器：${userAgent}` : ''}`;
+    const deadline = new AbortController(), timer = setTimeout(() => deadline.abort(), totalTimeoutMs);
+    const queue = [String(entry)], seen = new Set(queue);
+    try {
+        while (queue.length) {
+            const url = queue.shift(), result = await readFile(fetchImpl, url, requestTimeoutMs, deadline.signal);
+            if (result.refused) return `文件 ${shown(url)} 无法读取：被浏览器或扩展拦截，或网络连不上。用了广告拦截插件的，请把酒馆网址加入白名单，或暂时停用后刷新。`;
+            if (result.status) return `文件 ${shown(url)} 读取失败（HTTP ${result.status}），安装可能不完整。请在扩展管理里删除鱼忆，再用安装地址重新安装。`;
+            for (const match of result.text.matchAll(STATIC_IMPORT)) {
+                const next = new URL(match[1], url).href;
+                if (!seen.has(next) && seen.size < MODULE_LIMIT) { seen.add(next); queue.push(next); }
             }
-            dialog.addEventListener('cancel', event => { event.preventDefault(); finish('cancel'); });
-            signal?.addEventListener('abort', aborted, { once: true });
-            document.body.append(dialog); dialog.showModal();
-        }),
-    });
-    const mount = document.createElement('div'); mount.id = 'dynamic-world-memory';
-    const drawer = document.createElement('details');
-    const title = document.createElement('summary'); title.textContent = '鱼忆｜动态世界书与记忆';
-    const openManager = document.createElement('button'); openManager.type = 'button'; openManager.textContent = '打开管理窗口';
-    const manager = createFloatingManager(document);
-    manager.body.append(mount);
-    const showManager = event => manager.open(event);
-    const bindManagerEntry = button => manager.bindEntry(button);
-    let toolbarButton = null;
-    bindManagerEntry(openManager);
-    drawer.append(title, openManager);
-    (document.querySelector('#extensions_settings2') ?? document.querySelector('#extensions_settings') ?? document.body).append(drawer);
-    const toolbar = document.getElementById('top-settings-holder');
-    if (toolbar && !document.getElementById('dwm-toolbar-entry')) {
-        const entry = document.createElement('div'); entry.id = 'dwm-toolbar-entry'; entry.className = 'drawer';
-        toolbarButton = document.createElement('button'); toolbarButton.id = 'dwm-toolbar-button'; toolbarButton.type = 'button';
-        toolbarButton.className = 'dwm-toolbar-button drawer-icon fa-solid fa-fish fa-fw closedIcon';
-        toolbarButton.title = '鱼忆｜动态世界书与记忆';
-        toolbarButton.setAttribute('aria-label', '打开鱼忆管理窗口');
-        bindManagerEntry(toolbarButton);
-        // ST also synthesizes Enter clicks for .drawer-icon. Handle activation here
-        // once so its global handler and the native button default cannot double-fire.
-        toolbarButton.addEventListener('keydown', event => {
-            if (!['Enter', ' '].includes(event.key) || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
-            event.preventDefault(); event.stopPropagation();
-            if (!event.repeat) toolbarButton.click();
-        });
-        entry.append(toolbarButton);
-        const worldInfoEntry = toolbar.querySelector(':scope > #WI-SP-button');
-        if (worldInfoEntry) worldInfoEntry.after(entry); else toolbar.append(entry);
-    }
-    const problems = createProblemExporter({ controller, context: () => {
-        const live = SillyTavern.getContext();
-        return { chatId: live.getCurrentChatId?.() ?? live.chatId ?? '', character: live.name2 ?? '', memoryChatId: host.snapshot().chatId,
-            pluginVersion: PLUGIN_VERSION, mainApi: live.mainApi, browser: navigator.userAgent };
-    } });
-    const panel = mountPanel(mount, controller, { exportProblem: () => problems.export() });
-    const renderManagerStatus = () => manager.render(controller.uiStatus());
-    const unsubscribeManager = controller.subscribe(renderManagerStatus);
-    renderManagerStatus();
-    globalThis.dwmFilterOutgoingHistory = (...args) => host.filterOutgoingHistory(...args);
-    host.bindController(controller);
-    await controller.start();
-    // Public handle is for explicit local diagnostics. Agent views are built separately.
-    globalThis.DynamicWorldMemory = Object.freeze({ version: PLUGIN_VERSION, apiVersion: 1,
-        setContext: input => controller.setContext(input), clearContext: owner => controller.clearContext(owner),
-        readScope: scopeId => controller.readScope(scopeId), whenIdle: () => controller.whenIdle(), whenCommitted: () => controller.whenCommitted(),
-        ui: Object.freeze({ status: () => controller.uiStatus(), subscribe: fn => controller.subscribe(() => fn(controller.uiStatus())),
-            stop: id => controller.requestStop(id), open: () => showManager(), claimActivity: input => controller.claimActivity(input) }),
-        // Optional source annotation: exact request matching, never an ambient "current agent".
-        trace: Object.freeze({ begin: metadata => host.traceCapture.register(metadata), exportCurrent: () => problems.currentTraces() }),
-        diagnostics: Object.freeze({ register: source => problems.register(source), export: () => problems.export() }),
-        preview: Object.freeze({ register: source => controller.registerPreviewSource(source) }),
-        controller });
-    globalThis.dispatchEvent(new CustomEvent('dwm:ready'));
-    // Publish the optional card API before background new-save initialization.
-    controller.readinessChanged();
-    globalThis.addEventListener('pagehide', event => {
-        if (event.persisted) return;
-        controller.cancel('页面已关闭，辅助等待已结束');
-        unsubscribeManager();
-        panel.destroy();
-        manager.destroy();
-        host.traceCapture.dispose();
-        if (types?.WORLD_INFO_ACTIVATED) events?.removeListener(types.WORLD_INFO_ACTIVATED, activated);
-        if (types?.CHAT_CHANGED) events?.removeListener(types.CHAT_CHANGED, changed);
-    });
+        }
+    } catch (failure) {
+        if (failure === TIMED_OUT) return '';
+        throw failure;
+    } finally { clearTimeout(timer); }
+    return `鱼忆的 ${seen.size} 个文件都能读取，但没有加载成功：${error?.message ?? error}。如果控制台里有 ERR_BLOCKED_BY_CLIENT，仍是拦截插件所致；否则可能是浏览器版本过旧。${userAgent ? `\n浏览器：${userAgent}` : ''}`;
+}
+
+/** Show the failure at once, then add the cause when the probe finishes. */
+export async function reportLoadFailure(error, { notify = globalThis.toastr, diagnose = () => '', log = console } = {}) {
+    const sticky = { timeOut: 0, extendedTimeOut: 0 };
+    log.error('[DynamicWorldMemory] 模块加载失败', error);
+    const first = notify?.error?.(`模块没有加载成功：${error?.message ?? error}。正在检查原因……`, '鱼忆未能加载', sticky);
+    let detail = '';
+    try { detail = await diagnose(); } catch { /* The original error is already visible. */ }
+    if (!detail) return '';
+    log.error('[DynamicWorldMemory]', detail);
+    if (first) notify?.clear?.(first);
+    notify?.error?.(detail, '鱼忆未能加载', sticky);
+    return detail;
 }
 
 if (typeof document !== 'undefined') {
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => boot().catch(showError), { once: true });
-    else boot().catch(showError);
-}
-function showError(error) {
-    console.error('[DynamicWorldMemory]', error);
-    globalThis.toastr?.error?.(`鱼忆未启动：${error.message}`);
+    const main = new URL('./main.js', import.meta.url);
+    import(main.href).catch(error => reportLoadFailure(error, { diagnose: () => diagnoseLoad(main, error) }));
 }

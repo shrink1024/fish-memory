@@ -1,3 +1,4 @@
+import { parseSupplementaryMemory } from '../core/transfer.js';
 import { buildRuleDocument, compileRules, formToScript } from '../rules/index.js';
 import { diffText } from './diff.js';
 import { createTraceViewer } from './trace-viewer.js';
@@ -30,6 +31,10 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
     const panelId = `dwm-workspace-${++panelSequence}`;
     let selected = null, search = '', kindFilter = '', sectionFilter = 'entries', tab = 'library';
     let localError = '', notice = '', busy = false, destroyed = false, cancelRequested = false;
+    let tierFilter = '', batchMode = false, batchTier = 'onDemand';
+    const batchSelection = new Set();
+    let transferDraft = null, transferBook = '', transferDownload = null;
+    const clearTransferDownload = () => { if (transferDownload) { transferDownload.api.revokeObjectURL(transferDownload.url); transferDownload = null; } };
     let mobileDetail = false, entryMode = 'read', visibleCount = 80, composing = false, queuedRender = false;
     let ruleNL = '', ruleScript = '', ruleOutput = '', ruleMatch = { field: 'title', op: 'contains', value: '', action: 'lock', limit: '' };
     let recentTurnsDraft = null, timeoutDraft = null, cadenceDraft = null, mvuDraft = null, connectionModeDraft = null, lastSaveId = null;
@@ -37,6 +42,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
     let applicationSelection = new Set(), applicationPositions = {}, applicationKey = null;
     const entryDrafts = new Map(), poolDrafts = new Map(), expanded = new Set(), scrollPositions = new Map();
     const connectionDraft = { endpoint: '', model: '', apiKey: '', maxOutputTokens: undefined };
+    let profileNameDraft = '';
     const h = (tag, className = '', content) => {
         const el = doc.createElement(tag);
         if (className) el.className = className;
@@ -128,7 +134,11 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
     function focusDetail() { container.querySelector('[data-detail-heading]')?.focus({ preventScroll: true }); }
     function captureInteraction() {
         const active = container.contains(doc.activeElement) ? doc.activeElement : null;
-        for (const el of container.querySelectorAll('[data-scroll]')) scrollPositions.set(el.dataset.scroll, [el.scrollTop, el.scrollLeft]);
+        for (const el of container.querySelectorAll('[data-scroll]')) {
+            // Hidden mobile lists report zero; keep their last visible position.
+            if (typeof el.getClientRects === 'function' && !el.getClientRects().length) continue;
+            scrollPositions.set(el.dataset.scroll, [el.scrollTop, el.scrollLeft]);
+        }
         return active ? { key: active.dataset.focus, start: active.selectionStart, end: active.selectionEnd, top: active.scrollTop } : null;
     }
     function restoreInteraction(state) {
@@ -153,7 +163,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         catch (error) { container.replaceChildren(h('p', 'dwm-error', error?.message || '无法读取当前状态')); return; }
         if (lastSaveId !== (view.save?.id ?? null)) {
             lastSaveId = view.save?.id ?? null; selected = null; mobileDetail = false; entryMode = 'read'; localPreview = null;
-            entryDrafts.clear(); poolDrafts.clear(); scrollPositions.clear();
+            entryDrafts.clear(); poolDrafts.clear(); scrollPositions.clear(); batchSelection.clear(); batchMode = false; transferDraft = null; transferBook = ""; clearTransferDownload();
         }
         promptPreview.setContext(`${view.save?.id ?? ''}:${view.sourceBook ?? ''}`);
         const root = h('div', 'dwm-panel');
@@ -268,10 +278,25 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         if (sectionFilter === 'inventory') { renderInventory(parent, view); return; }
         const layout = h('div', `dwm-browser ${mobileDetail ? 'dwm-show-detail' : ''}`);
         const sidebar = h('aside', 'dwm-sidebar'); sidebar.setAttribute('aria-label', '动态条目列表');
-        const searchControl = field('搜索资料', search, value => { search = value; visibleCount = 80; mobileDetail = false; render(); }, { type: 'search', placeholder: '名称、简介或正文', key: 'entry-search' });
-        sidebar.append(searchControl.wrap, selectField('类型', kindFilter, [['', '全部类型'], ...Object.entries(KIND_NAMES)], value => { kindFilter = value; visibleCount = 80; render(); }, 'kind-filter').wrap);
+        const searchControl = field('搜索资料', search, value => { search = value; visibleCount = 80; mobileDetail = false; batchSelection.clear(); render(); }, { type: 'search', placeholder: '名称、简介或正文', key: 'entry-search' });
+        sidebar.append(searchControl.wrap, selectField('类型', kindFilter, [['', '全部类型'], ...Object.entries(KIND_NAMES)], value => { kindFilter = value; visibleCount = 80; batchSelection.clear(); render(); }, 'kind-filter').wrap);
         const query = search.toLocaleLowerCase();
-        const matching = entries.filter(e => (!kindFilter || e.kind === kindFilter) && (!query || `${e.title} ${e.intro} ${textOf(e)}`.toLocaleLowerCase().includes(query)));
+        const matching = entries.filter(e => (!tierFilter || entryTier(e) === tierFilter) && (!kindFilter || e.kind === kindFilter) && (!query || `${e.title} ${e.intro} ${textOf(e)}`.toLocaleLowerCase().includes(query)));
+        sidebar.append(selectField('发送档位筛选', tierFilter, [['', '全部档位'], ['constant', '常驻（蓝灯）'], ['onDemand', '按需（绿灯）'], ['off', '关闭']], value => {
+            tierFilter = value; visibleCount = 80; batchSelection.clear(); render();
+        }).wrap);
+        sidebar.append(button(batchMode ? '结束多选' : '多选改档位', () => { batchMode = !batchMode; batchSelection.clear(); render(); }, { navigation: true }));
+        if (batchMode) {
+            for (const id of batchSelection) if (!entries.some(e => e.id === id)) batchSelection.delete(id);
+            sidebar.append(row(button('选择筛选结果（最多1000条）', () => { batchSelection.clear(); matching.slice(0, 1000).forEach(e => batchSelection.add(e.id)); render(); }, { navigation: true }),
+                button('取消选择', () => { batchSelection.clear(); render(); }, { navigation: true })));
+            sidebar.append(selectField('批量目标档位', batchTier, [['constant', '常驻'], ['onDemand', '按需'], ['off', '关闭']], value => { batchTier = value; render(); }).wrap);
+            const unscanned = entries.filter(e => batchSelection.has(e.id) && e.status === 'deferred').length;
+            sidebar.append(h('p', 'dwm-muted', `已选择 ${batchSelection.size} 条。${batchTier !== 'off' && unscanned ? `其中 ${unscanned} 条未扫描，启用时会调用辅助模型。` : '一次保存，不调用模型。'}`));
+            sidebar.append(button('应用批量档位', () => call(async () => {
+                const result = await controller.setEntryTiers([...batchSelection], batchTier); batchSelection.clear(); return result;
+            }), { disabled: !batchSelection.size || Boolean(view.activity) }));
+        }
         if (!matching.some(e => e.id === selected)) { selected = matching[0]?.id ?? null; entryMode = 'read'; }
         sidebar.append(h('p', 'dwm-list-count dwm-muted', `找到 ${matching.length} 条资料`));
         const list = h('div', 'dwm-list'); list.dataset.scroll = 'library-list';
@@ -284,7 +309,15 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
             else if (tier === 'off') meta.append(h('span', '', entry.status === 'deferred' ? '关闭 · 未扫描' : '关闭'));
             else if (tier === 'constant') meta.append(h('span', '', '常驻'));
             if (entry.tier) meta.append(h('span', '', '已手动调整'));
-            item.append(meta, h('strong', '', entry.title || '未命名条目'), h('span', 'dwm-entry-intro', entry.intro || '暂无简介')); list.append(item);
+            const protectedCount = entry.segments.filter(segment => !segment.writable).length;
+            if (protectedCount) meta.append(h('span', '', protectedCount === entry.segments.length ? '正文已保护' : '部分保护'));
+            item.append(meta, h('strong', '', entry.title || '未命名条目'), h('span', 'dwm-entry-intro', entry.intro || '暂无简介'));
+            if (batchMode) {
+                const choice = h('div', 'dwm-batch-entry');
+                choice.append(toggle(`选择 ${entry.title}`, batchSelection.has(entry.id), '', value => {
+                    if (value && batchSelection.size < 1000) batchSelection.add(entry.id); else batchSelection.delete(entry.id); render();
+                }), item); list.append(choice);
+            } else list.append(item);
         }
         if (matching.length > visibleCount) list.append(button(`再显示 ${Math.min(80, matching.length - visibleCount)} 条`, () => { visibleCount += 80; render(); }, { navigation: true }));
         if (!matching.length) list.append(h('p', 'dwm-empty', '没有匹配的资料，试试其他词或类型。'));
@@ -482,7 +515,59 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         for (const part of diffText(display(record.before), display(record.after))) diff.append(h(part.type === 'remove' ? 'del' : part.type === 'add' ? 'ins' : 'span', '', part.text));
         el.append(diff, h('p', 'dwm-muted', `依据消息：${(record.evidence ?? []).join('、') || '此记录没有消息引用'}`)); return el;
     }
+    function renderTransfer(parent, view) {
+        if (typeof controller.exportMemory !== 'function') return;
+        const panel = card('记忆迁移', '导出已保存的动态世界书和当前可读范围的剧情脉络，供新聊天使用。未补记的剧情不在导出内容里。');
+        const unavailable = !view.save?.initialized || Boolean(view.activity);
+        panel.append(button('导出当前剧情世界书', () => call(() => {
+            const book = controller.exportMemory(); clearTransferDownload();
+            const api = doc.defaultView?.URL ?? globalThis.URL, BlobType = doc.defaultView?.Blob ?? globalThis.Blob;
+            const url = api.createObjectURL(new BlobType([JSON.stringify(book, null, 2)], { type: 'application/json' }));
+            transferDownload = { api, url };
+        }, '已准备导出，请点击下载文件'), { disabled: unavailable }));
+        if (transferDownload) {
+            const link = h('a', 'dwm-button', '下载剧情世界书 JSON'); link.href = transferDownload.url; link.download = '鱼忆-剧情世界书.json'; panel.append(link);
+            panel.append(h('p', 'dwm-muted', '这是可导入酒馆的世界书，包含原书当前条目与剧情；不是完整聊天备份，也不恢复鱼忆的旧楼层处理进度。'));
+        }
+        const input = field('导入总结文件（世界书 JSON 或 TXT）', '', () => {}, { type: 'file', key: 'supplement-file' });
+        input.input.accept = '.json,.txt'; input.input.disabled = unavailable;
+        input.input.addEventListener('change', () => {
+            const file = input.input.files?.[0]; if (!file) return;
+            const saveId = view.save.id, scopeId = view.save.data.scopeContext?.activeScopeId ?? 'global';
+            call(async () => {
+                if (file.size > 10000000) throw new Error('文件过大，请选择小于 10 MB 的总结文件');
+                const result = parseSupplementaryMemory(await file.text(), { name: file.name.replace(/\.(json|txt)$/i, ''), json: /\.json$/i.test(file.name) });
+                if (controller.view().save?.id !== saveId) throw new Error('存档已切换，请重新选择文件');
+                transferDraft = { ...result, saveId, scopeId, name: file.name };
+            }, '已读取文件，请核对后确认导入');
+        }); panel.append(input.wrap);
+        const names = controller.supplementaryBooks?.() ?? [];
+        if (names.length) {
+            if (!names.includes(transferBook)) transferBook = names[0];
+            panel.append(selectField('从当前附加世界书读取总结', transferBook, names.map(name => [name, name]), value => { transferBook = value; }).wrap,
+                h('p', 'dwm-muted', '附加世界书导入后仍会按酒馆规则照常发送；不想同样的内容发两遍，可在酒馆里解除这本书的附加绑定。'));
+            panel.append(button('读取选中的附加世界书', () => call(async () => {
+                const saveId = view.save.id, scopeId = view.save.data.scopeContext?.activeScopeId ?? 'global', name = transferBook;
+                const result = await controller.readSupplementaryBook(name);
+                if (controller.view().save?.id !== saveId) throw new Error('存档已切换，请重新选择');
+                transferDraft = { ...result, saveId, scopeId, name };
+            }, '已读取附加世界书，请核对后确认导入'), { disabled: unavailable }));
+        }
+        panel.append(h('p', 'dwm-muted', '补充记忆导入当前档，不换主书。仅接收启用的文本条目，跳过规则和模板脚本；导入后默认常驻、正文受保护，可在资料里调整。无需调用模型。新聊天请先初始化，再导入旧总结。'));
+        if (transferDraft) {
+            const draft = transferDraft;
+            panel.append(h('p', '', `${draft.name}：待导入 ${draft.entries.length} 条，跳过 ${draft.skipped.length} 条。`));
+            const preview = details('核对导入内容', 'supplement-preview');
+            for (const entry of draft.entries) { preview.append(h('strong', '', entry.title), h('pre', 'dwm-preset-source', entry.content)); }
+            for (const entry of draft.skipped) preview.append(h('p', 'dwm-muted', `跳过：${entry.title}（${entry.reason}）`));
+            panel.append(preview, row(button('确认导入补充记忆', () => call(async () => {
+                await controller.importSupplementaryMemory(draft.entries, draft.saveId, draft.scopeId); transferDraft = null;
+            }, '补充记忆已导入；同名同正文的重复条目已跳过'), { disabled: unavailable }), button('取消导入', () => { transferDraft = null; render(); }, { navigation: true })));
+        }
+        parent.append(panel);
+    }
     function renderActivity(parent, view) {
+        renderTransfer(parent, view);
         const tasks = card('维护与补记', '后台失败时保留缺口，已保存的资料仍然可读。');
         tasks.append(row(button('补记新剧情', () => call(() => controller.maintain(), '补记完成'), { primary: true, disabled: !view.save?.initialized }), button('整理事件记忆', () => call(() => controller.compact(), '整理完成'), { disabled: !view.save?.initialized })));
         if (view.progress) tasks.append(h('p', 'dwm-muted', progressText(view.progress)));
@@ -648,6 +733,7 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         if (view.connectionMode === 'test') { panel.append(h('p', 'dwm-notice', '演示模式 · 当前使用模拟模型，没有真实 API 请求。')); parent.append(panel); return; }
         const mode = connectionModeDraft ?? view.connectionMode?.mode ?? view.connectionMode ?? 'raw';
         panel.append(h('p', 'dwm-muted', `当前生效：${view.connectionMode === 'compatible' ? `单独接口 · ${view.connection?.model || '未指定模型'}` : '沿用酒馆连接'}。下方修改在应用后生效。`));
+        renderConnectionProfiles(panel, view);
         const modeField = selectField('连接方式', mode, [['raw', '沿用酒馆连接'], ['compatible', '单独的兼容接口']], value => { connectionModeDraft = value; render(); }); panel.append(modeField.wrap);
         if (mode === 'compatible') {
             panel.append(field('接口基础地址', connectionDraft.endpoint, value => { connectionDraft.endpoint = value; }, { placeholder: 'https://…/v1', hint: '鱼忆会在地址后添加 /chat/completions。' }).wrap,
@@ -663,6 +749,26 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
         panel.append(button('应用连接', () => call(async () => {
             await controller.updateConnection({ mode, endpoint: connectionDraft.endpoint.trim(), model: connectionDraft.model.trim(), apiKey: connectionDraft.apiKey, maxOutputTokens: connectionDraft.maxOutputTokens }); connectionDraft.apiKey = ''; connectionModeDraft = null;
         }, '连接已应用；下一次辅助任务将使用此连接'), { disabled: Boolean(view.activity) })); parent.append(panel);
+    }
+    function renderConnectionProfiles(parent, view) {
+        const profiles = view.connectionProfiles ?? [], running = Boolean(view.activity);
+        const box = details(`已保存的连接配置（${profiles.length}）`, 'connection-profiles');
+        box.append(h('p', 'dwm-muted', '可保存多套单独接口，之后一键切换。配置连同密钥只保存在本浏览器，不进入存档和问题导出。'));
+        const resetDraft = () => { Object.assign(connectionDraft, { endpoint: '', model: '', apiKey: '', maxOutputTokens: undefined }); connectionModeDraft = null; };
+        for (const profile of profiles) {
+            box.append(row(h('span', '', `${profile.name} · ${profile.model}`), ...(profile.active ? [badge('当前生效')] : []),
+                button('切换', () => call(async () => { const result = await controller.useConnectionProfile(profile.name); resetDraft(); return result; }),
+                    { disabled: profile.active || running, key: `profile-use-${profile.name}` }),
+                button('删除', () => {
+                    if (doc.defaultView?.confirm && !doc.defaultView.confirm(`删除配置「${profile.name}」？当前生效的连接不受影响，密钥需重新填写才能再用。`)) return;
+                    call(() => controller.deleteConnectionProfile(profile.name));
+                }, { danger: true, key: `profile-delete-${profile.name}` })));
+        }
+        const compatible = view.connectionMode === 'compatible';
+        box.append(field('配置名称', profileNameDraft, value => { profileNameDraft = value; }, { placeholder: '例如：DS 便宜档', hint: compatible ? '同名会覆盖原配置。' : '先在下方应用一个单独的兼容接口，再保存。' }).wrap,
+            button('保存当前生效的连接', () => call(async () => { const result = await controller.saveConnectionProfile(profileNameDraft); profileNameDraft = ''; return result; }),
+                { disabled: !compatible }));
+        parent.append(box);
     }
     function renderMvuState(parent, state = {}) {
         parent.append(h('p', 'dwm-muted', state.reason || state.status || (state.available ? '已检测到可用接口' : '尚未检测到可用 MVU 信息')));
@@ -734,6 +840,6 @@ export function mountPanel(container, controller, { exportProblem } = {}) {
     render();
     return { render, destroy() {
         if (destroyed) return;
-        destroyed = true; unsubscribe(); traceViewer.destroy(); promptPreview.destroy(); activityIndicator.destroy(); container.removeEventListener('compositionstart', onCompositionStart); container.removeEventListener('compositionend', onCompositionEnd); container.replaceChildren();
+        destroyed = true; clearTransferDownload(); unsubscribe(); traceViewer.destroy(); promptPreview.destroy(); activityIndicator.destroy(); container.removeEventListener('compositionstart', onCompositionStart); container.removeEventListener('compositionend', onCompositionEnd); container.replaceChildren();
     } };
 }

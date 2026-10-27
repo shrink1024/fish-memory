@@ -266,3 +266,5 @@
 @media (max-width: 600px) { .dwm-tabs { flex-wrap: wrap; } .dwm-tabs .dwm-button { flex: 1 0 30%; min-height: 44px; } }
 .dwm-preset-candidate .dwm-disclosure { margin: 0; padding: 0; border: 0; }
 .dwm-preset-candidate .dwm-disclosure > summary { min-height: 44px; padding: 10px 0; }
+.dwm-batch-entry { display: grid; grid-template-columns: minmax(60px, 0.4fr) minmax(0, 1fr); gap: 8px; align-items: center; }
+.dwm-batch-entry .dwm-toggle { padding: 6px; overflow-wrap: anywhere; }

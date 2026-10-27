@@ -74,6 +74,6 @@
 }
 @media (prefers-reduced-motion: reduce) { .dwm-floating-root * { transition: none !important; scroll-behavior: auto !important; } }
 
-#dwm-toolbar-entry { min-width: 0; }
+#dwm-toolbar-entry { display: flex; align-items: center; justify-content: center; min-width: 32px; }
 #dwm-toolbar-button { appearance: none; width: 100%; max-width: 44px; min-height: min(44px, var(--topBarBlockSize, 44px)); margin: 0; border: 0; border-radius: 4px; background: transparent; color: inherit; line-height: 1; }
 #dwm-toolbar-button:focus-visible { opacity: 1; outline: 2px solid currentColor; outline-offset: 2px; }

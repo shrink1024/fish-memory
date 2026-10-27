@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, webcrypto } from 'node:crypto';
 import { Controller } from '../src/runtime/controller.js';
-import { sha256Fingerprint } from '../src/core/fingerprint.js';
+import { sha256Fingerprint } from '../src/core/content-hash.js';
 import { uid } from '../src/core/util.js';
 
 const insecureCrypto = () => ({ getRandomValues: array => webcrypto.getRandomValues(array) });

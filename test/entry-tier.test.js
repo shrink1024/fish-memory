@@ -125,3 +125,52 @@ test('native activation follows the tier on the dynamic copy', async () => {
     assert.deepEqual(again.characterLore.map(e => [e.uid, e.constant, e.disable]), [[2, true, false], [3, true, false], [5, true, false]],
         'off wins over selection; a natively disabled entry turned on by the player is sent');
 });
+
+test('batch tiers save once, preserve original book and do not call the model for classified entries', async () => {
+    const original = book(), f = fixture(original), c = f.controller;
+    await c.start(); await c.initialize();
+    const ids = Object.values(c.store.state.data.entries).filter(e => e.status !== 'deferred').map(e => e.id);
+    const before = c.store.snapshot(), calls = f.calls.length;
+    await c.setEntryTiers(ids, 'onDemand');
+    assert.equal(c.store.state.revision, before.revision + 1);
+    assert.equal(c.store.state.journal.length, before.journal.length + 1);
+    assert.equal(f.calls.length, calls);
+    assert.ok(ids.every(id => entryTier(c.store.state.data.entries[id]) === 'onDemand'));
+    assert.deepEqual(original, book());
+    const restored = f.make(); await restored.start();
+    assert.ok(ids.every(id => entryTier(restored.store.state.data.entries[id]) === 'onDemand'));
+});
+test('batch tiers classify deferred entries before a single save and reject invalid selection atomically', async () => {
+    const f = fixture(book()), c = f.controller; await c.start(); await c.initialize();
+    const ids = Object.keys(c.store.state.data.entries), before = c.store.state.revision;
+    await assert.rejects(c.setEntryTiers([...ids, 'missing'], 'constant'), /不存在/);
+    assert.equal(c.store.state.revision, before);
+    await c.setEntryTiers(ids, 'constant');
+    assert.ok(ids.every(id => entryTier(c.store.state.data.entries[id]) === 'constant'));
+    assert.equal(byTitle(c, '密道').status, 'confirmed');
+    assert.equal(c.store.state.revision, before + 1);
+});
+
+test('supplement import adds protected facts without replacing main book or certifying unprocessed history', async () => {
+    const original = book(), f = fixture(original), c = f.controller; await c.start(); await c.initialize();
+    f.state.messages.push(msg('pending', 'assistant', '还没补记'));
+    const before = c.store.snapshot(), calls = f.calls.length;
+    await c.importSupplementaryMemory([{ title: '旧总结', content: '以前在北城生活。' }], before.id);
+    assert.equal(c.store.state.bookName, 'main'); assert.deepEqual(original, book());
+    assert.deepEqual(c.store.state.processed, before.processed);
+    const imported = byTitle(c, '旧总结'); assert.ok(imported.constant); assert.ok(imported.segments.every(s => !s.writable));
+    assert.equal(imported.source, null); assert.equal(f.calls.length, calls);
+    await c.importSupplementaryMemory([{ title: '旧总结', content: '以前在北城生活。' }], before.id);
+    assert.equal(Object.values(c.store.state.data.entries).filter(e => e.title === '旧总结').length, 1);
+    await assert.rejects(c.importSupplementaryMemory([{ title: 'x', content: 'y' }], 'another-save'), /存档已切换/);
+    await assert.rejects(c.importSupplementaryMemory([{ title: 'x', content: 'y' }], before.id, 'other-scope'), /范围已改变/);
+    const reload = f.make(); await reload.start(); assert.ok(byTitle(reload, '旧总结'));
+});
+
+test('failed bulk save leaves every selected entry unchanged', async () => {
+    const f = fixture(book()), c = f.controller; await c.start(); await c.initialize();
+    const before = c.store.snapshot();
+    c.store.storage.write = async () => { throw new Error('synthetic save failure'); };
+    await assert.rejects(c.setEntryTiers(Object.keys(before.data.entries), 'off'), /synthetic save failure/);
+    assert.deepEqual(c.store.snapshot(), before);
+});

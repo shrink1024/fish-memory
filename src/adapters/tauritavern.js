@@ -1,8 +1,9 @@
-/** TT-specific persistence contract. Standard ST never imports host TT modules. */
+/** ABI 1 (2.3) and ABI 2 (2.4) retain enqueueChatSave and cold-swipe record contracts.
+ * TT-specific persistence contract. Standard ST never imports host TT modules. */
 export async function tauriPersistence(deps, script) {
     const host = deps.tauriHost ?? globalThis.__TAURITAVERN__;
     if (!host) return null;
-    if (host.abiVersion !== 1 || typeof script.enqueueChatSave !== 'function') {
+    if (![1, 2].includes(host.abiVersion) || typeof script.enqueueChatSave !== 'function') {
         throw new Error('当前 TT 缺少鱼忆所需的保存队列接口，请使用受支持的 TT 版本');
     }
     const transport = deps.tauriTransport ?? await import('/scripts/chat-payload-transport.js');

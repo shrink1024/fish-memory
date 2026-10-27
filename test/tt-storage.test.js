@@ -2,13 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createSillyTavernHost } from '../src/adapters/sillytavern.js';
 
-async function fixture({ corrupt, beforeRead, gate } = {}) {
+async function fixture({ corrupt, beforeRead, gate, abiVersion = 1 } = {}) {
     const original = { swipes: ['older', 'selected'], swipe_info: [{ extra: { otherPlugin: 'keep', dwmCandidateKey: 'old-key' }, dwmCandidateKey: 'old-key' }, { extra: {} }] };
     const live = { chatId: 'test', characterId: 0, characters: [{ avatar: 'fixture.png', name: 'Fixture', data: { extensions: { world: 'main' } } }],
         chatMetadata: {}, getRequestHeaders: () => ({}), chat: [{ mes: 'selected', is_user: false, swipe_id: 1,
             swipes: [null, 'selected'], swipe_info: [null, { extra: {} }], extra: {}, tt_swipe_cold: { sourceId: 7, record: 1 } }] };
     let disk = [{ chat_metadata: {} }], writes = 0, inQueue = false;
-    const deps = { context: () => live, tauriHost: { abiVersion: 1 },
+    const deps = { context: () => live, tauriHost: { abiVersion },
         tauriTransport: { readColdSwipeRecord: async reference => {
             assert.deepEqual(reference, { sourceId: 7, record: 1 }); await beforeRead?.(live); return structuredClone(original);
         } },
@@ -135,3 +135,13 @@ test('TT legacy hidden metadata is restored when its cold candidate becomes acti
     assert.equal(f.disk[1].extra.otherPlugin, 'keep');
     assert.equal(f.disk[1].swipe_info[0].extra.otherPlugin, 'keep');
 });
+
+for (const abiVersion of [1, 2]) test(`TT ABI ${abiVersion} preserves cold swipes and rejects corrupted saves`, async () => {
+    const f = await fixture({ abiVersion });
+    await f.host.storage.write(f.host.snapshot().chatId, { revision: 1 }, 0);
+    assert.equal(f.writes, 1);
+    assert.deepEqual(f.disk[1].swipes, f.original.swipes);
+    const bad = await fixture({ abiVersion, corrupt: disk => { disk[1].mes = 'corrupted'; } });
+    await assert.rejects(bad.host.storage.write(bad.host.snapshot().chatId, { revision: 1 }, 0));
+});
+test('unknown TT ABI is still rejected', async () => { await assert.rejects(fixture({ abiVersion: 3 }), /保存队列/); });

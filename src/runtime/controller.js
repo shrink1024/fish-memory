@@ -1,9 +1,10 @@
+import { exportMemoryWorldbook, parseSupplementaryMemory } from '../core/transfer.js';
 import { applicationSnapshot, APPLICATION_SCAN, validateApplicationSelection, validateApplicationPositions, selectedApplicationEntries, applyPresetApplication } from '../agents/preset-application.js';
 import { throwIfAborted, combineSignals } from '../platform/abort.js';
 import { sourceBookChanges, nativeSwitchOverlay } from '../core/source-book.js';
 import { presetSnapshot, PREFERENCE_SCAN, validatePreferenceCandidates, selectedPreferences, applyAuxiliaryPreferences } from '../agents/preset-preferences.js';
 import { MemoryStore } from '../core/store.js';
-import { sha256Fingerprint } from '../core/fingerprint.js';
+import { sha256Fingerprint } from '../core/content-hash.js';
 import { DEFAULT_SETTINGS, MAINTENANCE_EVERY_MAX, templateHint, normalizeTimeoutSettings, validTimeout, makeSourceEntry, createEntry, sourceId, entryText, normalizeScopeId, entryScope, scopeSummary, scopeInventory, readableScopes, GLOBAL_SCOPE } from '../core/state.js';
 import { playerView, scopeRead, memoryMetrics } from '../core/views.js';
 import { clone, invariant, uid, isPrefix, SerialQueue } from '../core/util.js';
@@ -29,6 +30,24 @@ const SUMMARY_COMPACT_CHARS = 8000;
 
 // A player-set tier survives source updates; only the scanned flags refresh.
 const keepTier = used => used?.tier ? { tier: used.tier, enabled: used.tier !== 'off' } : {};
+
+const PROFILE_MAX = 20, PROFILE_NAME_MAX = 40;
+const sameConnection = (a, b) => Boolean(a && b) && a.endpoint === b.endpoint && a.model === b.model
+    && a.apiKey === b.apiKey && (a.maxOutputTokens ?? null) === (b.maxOutputTokens ?? null);
+// Stored profiles come from this browser; drop anything malformed rather than fail to start.
+function cleanProfiles(value) {
+    if (!Array.isArray(value)) return [];
+    const seen = new Set(), profiles = [];
+    for (const item of value) {
+        const name = typeof item?.name === 'string' ? item.name.trim() : '';
+        if (!name || name.length > PROFILE_NAME_MAX || seen.has(name) || typeof item.endpoint !== 'string' || !item.endpoint || typeof item.model !== 'string' || !item.model) continue;
+        const tokens = Number(item.maxOutputTokens);
+        seen.add(name);
+        profiles.push({ name, endpoint: item.endpoint, model: item.model, apiKey: typeof item.apiKey === 'string' ? item.apiKey : '',
+            maxOutputTokens: Number.isInteger(tokens) && tokens > 0 ? tokens : undefined });
+    }
+    return profiles.slice(0, PROFILE_MAX);
+}
 
 export class Controller {
     #listeners = new Set();
@@ -61,6 +80,7 @@ export class Controller {
     #initializationContextFingerprint = '';
     #initializationClassificationFingerprint = '';
     #connectionConfig = null;
+    #connectionProfiles = [];
     #modelList = null;
     // Story edits while background maintenance runs. Keys of the batch being
     // written let a later edit leave that request alone (see #storyChanged).
@@ -91,6 +111,8 @@ export class Controller {
                 const saved = connectionStore?.load?.();
                 if (saved?.mode === 'compatible' && saved.endpoint && saved.model) this.#applyConnection('compatible', saved);
             } catch { /* Keep the ST connection when the stored value is unusable. */ }
+            try { this.#connectionProfiles = cleanProfiles(connectionStore?.loadProfiles?.()); }
+            catch { this.#connectionProfiles = []; }
         }
     }
     #applyConnection(mode, { endpoint, model, apiKey = '', maxOutputTokens } = {}) {
@@ -663,6 +685,8 @@ export class Controller {
             save: this.store?.state ? playerView(this.store.state) : null,
             sourceBook: this.store?.state?.bookName ?? '', connectionMode: this.connectionMode,
             connection: { mode: this.connectionMode, endpoint: this.#connectionConfig?.endpoint ?? '', model: this.#connectionConfig?.model ?? '', maxOutputTokens: this.#connectionConfig?.maxOutputTokens, hasApiKey: Boolean(this.#connectionConfig?.apiKey) },
+            connectionProfiles: this.#connectionProfiles.map(profile => ({ name: profile.name, endpoint: profile.endpoint, model: profile.model,
+                maxOutputTokens: profile.maxOutputTokens, hasApiKey: Boolean(profile.apiKey), active: sameConnection(profile, this.#connectionConfig) })),
             modelList: clone(this.#modelList),
             mvu: clone(this.mvu), diagnostics: { ...clone(this.diagnostics), memory: memoryMetrics(this.store?.state),
                 pendingCount: Math.max(0, this.host.snapshot().messages.length - (this.store?.state.processed.length ?? 0)) } };
@@ -842,11 +866,47 @@ export class Controller {
         // forward an existing credential when changing to a different server.
         const normalizedEndpoint = endpoint?.trim().replace(/\/$/, '');
         const retainedKey = normalizedEndpoint && normalizedEndpoint === this.#connectionConfig?.endpoint ? this.#connectionConfig.apiKey : '';
-        const config = this.#applyConnection(mode, { endpoint: normalizedEndpoint, model, apiKey: apiKey || retainedKey, maxOutputTokens });
+        this.#commitConnection(mode, { endpoint: normalizedEndpoint, model, apiKey: apiKey || retainedKey, maxOutputTokens });
+    }
+    #commitConnection(mode, input) {
+        const config = this.#applyConnection(mode, input);
         try { this.connectionStore?.save?.(['raw', 'tavern'].includes(mode) ? null : { mode: 'compatible', ...config }); }
         catch { this.#state('连接已更新；本机保存失败，刷新后需重新填写'); this.readinessChanged(); return; }
         this.#state('连接已更新');
         this.readinessChanged();
+    }
+    /** Named separate connections kept in this browser, keys included, so a
+     * player can switch between services without retyping them. */
+    async saveConnectionProfile(name) {
+        const label = String(name ?? '').trim();
+        invariant(label && label.length <= PROFILE_NAME_MAX, `配置名称应为 1–${PROFILE_NAME_MAX} 个字`);
+        invariant(this.connectionMode === 'compatible' && this.#connectionConfig, '请先应用一个单独的兼容接口，再保存为配置');
+        const replacing = this.#connectionProfiles.some(profile => profile.name === label);
+        invariant(replacing || this.#connectionProfiles.length < PROFILE_MAX, `最多保存 ${PROFILE_MAX} 套配置，请先删除不用的`);
+        const profile = { name: label, ...clone(this.#connectionConfig) };
+        this.#storeProfiles(replacing ? this.#connectionProfiles.map(item => item.name === label ? profile : item) : [...this.#connectionProfiles, profile]);
+        return { executed: true, message: replacing ? `已更新配置「${label}」` : `已保存配置「${label}」` };
+    }
+    async useConnectionProfile(name) {
+        const profile = this.#connectionProfiles.find(item => item.name === name);
+        invariant(profile, '没有找到这套配置');
+        invariant(!this.view().activity, '请先停止或等待当前任务完成，再切换连接；当前任务继续运行。');
+        // A profile is a full snapshot: restore its key exactly, even when empty.
+        // The form's "blank keeps the saved key" rule does not apply here.
+        const { name: label, ...config } = profile;
+        this.#commitConnection('compatible', config);
+        return { executed: true, message: `已切换到「${label}」；下一次辅助任务将使用此连接` };
+    }
+    async deleteConnectionProfile(name) {
+        invariant(this.#connectionProfiles.some(item => item.name === name), '没有找到这套配置');
+        this.#storeProfiles(this.#connectionProfiles.filter(item => item.name !== name));
+        return { executed: true, message: `已删除配置「${name}」；当前生效的连接不变` };
+    }
+    #storeProfiles(profiles) {
+        try { this.connectionStore?.saveProfiles?.(profiles); }
+        catch { throw new Error('本机保存失败，配置没有改变；可检查浏览器是否禁止网站存储'); }
+        this.#connectionProfiles = profiles;
+        this.#notify();
     }
     async setSaveEnabled(enabled) {
         invariant(this.store, '请等待当前存档载入完成');
@@ -1666,6 +1726,61 @@ export class Controller {
         } catch (error) {
             if (epoch === this.#epoch && !signal.aborted) this.#state('原书同步未完成，原资料保留', error.message);
             throw error;
+        } finally { this.#endActivity(activity); }
+    }
+    exportMemory() {
+        invariant(this.store?.state.initialized && !this.#initializing && !this.view().activity, '请等待当前任务完成后导出');
+        return exportMemoryWorldbook(this.store.snapshot());
+    }
+    supplementaryBooks() { return this.host.supplementaryBooks?.() ?? []; }
+    async readSupplementaryBook(name) {
+        invariant(this.supplementaryBooks().includes(name) && typeof this.host.readSupplementaryBook === 'function', '请选择当前聊天绑定的附加世界书');
+        const epoch = this.#epoch, chatId = this.host.snapshot().chatId;
+        const book = await this.host.readSupplementaryBook(name);
+        this.#assertCurrent(epoch, chatId);
+        return parseSupplementaryMemory(JSON.stringify(book), { name, json: true });
+    }
+    async importSupplementaryMemory(entries, saveId, scopeId = GLOBAL_SCOPE) {
+        invariant(this.store?.state.initialized && !this.#initializing && !this.view().activity, '请先完成初始化并等待当前任务结束');
+        invariant(this.store.state.id === saveId, '存档已切换，请重新选择导入材料');
+        invariant(normalizeScopeId(scopeId) === normalizeScopeId(this.store.state.data.scopeContext?.activeScopeId), '资料范围已改变，请重新选择导入材料');
+        // Revalidate the preview at the write boundary. Import never marks old floors processed.
+        const parsed = parseSupplementaryMemory(JSON.stringify({ entries: entries.map(e => ({ comment: e.title, content: e.content })) }), { json: true });
+        const store = this.store, activity = this.#beginActivity('import', '正在导入补充记忆');
+        try {
+            await this.#saveActivity(activity, () => store.manual({ type: 'import-memory', entries: parsed.entries,
+                scopeId: store.state.data.scopeContext?.activeScopeId ?? GLOBAL_SCOPE }, this.host.snapshot().messages.map(m => m.key)));
+            this.#assertActivity(activity); this.host.clearPlan();
+            this.#state('补充记忆已导入；重复的同名同正文条目已跳过');
+        } finally { this.#endActivity(activity); }
+    }
+    async setEntryTiers(ids, tier) {
+        invariant(this.store?.state.initialized && !this.view().activity && !this.#initializing, '请等待当前任务完成后批量调整');
+        invariant(['constant', 'onDemand', 'off'].includes(tier) && Array.isArray(ids) && ids.length > 0 && ids.length <= 1000
+            && new Set(ids).size === ids.length, '请选择 1–1000 个不同条目和有效档位');
+        const store = this.store, entries = ids.map(id => store.state.data.entries[id]);
+        invariant(entries.every(Boolean), '部分条目已不存在，请重新选择');
+        const items = entries.map(e => ({ id: e.id, expectedVersion: e.version }));
+        const pending = tier === 'off' ? [] : entries.filter(e => e.status === DEFERRED);
+        const activity = this.#beginActivity('classify', pending.length ? '正在扫描待启用条目' : '正在批量调整档位');
+        try {
+            if (pending.length) {
+                await this.#loadRules(activity.epoch, activity.chatId, activity.signal);
+                invariant(!this.sourceChanges.changed, '原世界书已变化，请先同步变化的条目再批量启用');
+                for (const group of batches(pending, this.settings.batchChars, entryText, INITIALIZATION_BATCH_ITEMS)) {
+                    const result = await classifyEntries(this.client, group, this.rules.naturalLanguage, activity.signal);
+                    this.#assertActivity(activity);
+                    for (const entry of applyRules(result.entries, this.compiledRules).entries) {
+                        const item = items.find(item => item.id === entry.id);
+                        invariant(item, '扫描结果包含未知条目'); item.classified = { ...entry, status: 'confirmed' };
+                    }
+                }
+            }
+            this.#assertActivity(activity);
+            await this.#saveActivity(activity, () => store.manual({ type: 'tiers', tier, items }, this.host.snapshot().messages.map(m => m.key)));
+            this.#assertActivity(activity); this.host.clearPlan();
+            this.#state(`已一次保存 ${items.length} 条的档位`);
+            return { executed: true, message: this.status };
         } finally { this.#endActivity(activity); }
     }
     async manual(action) {

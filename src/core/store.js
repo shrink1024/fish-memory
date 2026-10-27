@@ -29,7 +29,7 @@ function reapplyManualField(previous, edited, current, conflict) {
 function reapplyManualEntry(previous, edited, current) {
     let needsReview = false;
     const conflict = () => { needsReview = true; };
-    for (const key of ['title', 'kind', 'intro', 'retrieveWhen', 'important', 'needsReview', 'enabled']) {
+    for (const key of ['title', 'kind', 'intro', 'retrieveWhen', 'important', 'needsReview', 'enabled', 'tier']) {
         current[key] = reapplyManualField(previous[key], edited[key], current[key], conflict);
     }
     const ids = segments => segments.map(segment => segment.id).join('\0');
@@ -97,6 +97,10 @@ function replayOnPath(state, sourceKeys) {
                     corrected.entries[id].lastEvidence = value.lastEvidence.filter(key => sourceKeys.slice(0, common).includes(key));
                     continue;
                 }
+                if (!current && !previous && value?.origin === 'import' && !value.source) {
+                    corrected.entries[id] = createEntry({ ...clone(value), evidence: [], lastEvidence: [] });
+                    continue;
+                }
                 if (!current || !previous || !value) continue;
                 corrected.entries[id] = reapplyManualEntry(previous, value, current);
             }
@@ -130,7 +134,7 @@ function replayOnPath(state, sourceKeys) {
     for (const commit of journal) retainedLength = Math.max(retainedLength, commit.anchorLength);
     next.storyKeys = sourceKeys.slice(0, retainedLength);
     next.inventoryDisabledAt = inventoryDisabledAt;
-    const manualReasons = new Set(['edit', 'reset', 'classify', 'promote', 'promote-from-pool']);
+    const manualReasons = new Set(['edit', 'reset', 'classify', 'promote', 'promote-from-pool', 'tier', 'tier-reset', 'tiers', 'import-memory']);
     next.audit = state.audit.filter(item => manualReasons.has(item.reason) && data.entries[item.entryId]);
     return next;
 }
@@ -291,7 +295,29 @@ export class MemoryStore {
             const baseline = isPrefix(this.state.storyKeys, sourceKeys) ? this.snapshot() : replayOnPath(this.state, sourceKeys);
             const data = clone(baseline.data);
             const entry = data.entries[action.id];
-            if (action.type === 'inventory-toggle') {
+            if (action.type === 'import-memory') {
+                invariant(Array.isArray(action.entries) && action.entries.length > 0 && action.entries.length <= 1000, '补充记忆数量无效');
+                for (const row of action.entries) {
+                    const title = plainText(row.title, '条目名称', 500), text = plainText(row.content, '补充正文', 100000);
+                    const scopeId = normalizeScopeId(action.scopeId);
+                    if (Object.values(data.entries).some(e => normalizeScopeId(e.scopeId) === scopeId && e.title === title && e.segments.map(s => s.text).join('') === text)) continue;
+                    const imported = createEntry({ id: uid('entry'), title, kind: 'fact', scopeId, constant: true, enabled: true, origin: 'import',
+                        intro: text.slice(0, 300), retrieveWhen: '玩家导入的既往剧情，作为已提供的背景参考。',
+                        segments: [{ id: 'body', text, writable: false }] });
+                    data.entries[imported.id] = imported;
+                }
+            } else if (action.type === 'tiers') {
+                invariant(TIERS.includes(action.tier) && Array.isArray(action.items) && action.items.length > 0 && action.items.length <= 1000, '批量档位参数无效，最多 1000 条');
+                invariant(new Set(action.items.map(item => item.id)).size === action.items.length, '批量条目不能重复');
+                for (const item of action.items) {
+                    const current = data.entries[item.id];
+                    invariant(current && current.version === item.expectedVersion, '条目已变化，请重新选择后应用');
+                    invariant(action.tier === 'off' || current.status !== 'deferred' || item.classified, '未扫描条目需要先分类');
+                    data.entries[item.id] = createEntry({ ...current, ...(item.classified ?? {}), id: current.id,
+                        source: current.source, scopeId: current.scopeId, evidence: current.evidence, lineage: current.lineage,
+                        tier: action.tier, enabled: action.tier !== 'off', version: current.version + 1 });
+                }
+            } else if (action.type === 'inventory-toggle') {
                 data.inventoryEnabled = Boolean(action.enabled);
             } else if (action.type === 'scope-context') {
                 data.scopeContext = clone(action.context);
