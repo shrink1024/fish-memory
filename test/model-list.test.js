@@ -77,12 +77,13 @@ test('the connection card fetches models and fills the model name from the list'
     const panel = mountPanel(root, controller); t.after(() => panel.destroy());
     const find = predicate => walk(root).find(predicate);
     find(node => node.tagName === 'BUTTON' && node.textContent === '设置').click();
+    find(node => node.tagName === 'BUTTON' && node.textContent === '辅助模型').click();
     find(node => node.tagName === 'BUTTON' && node.textContent === '获取模型列表').click(); await tick();
     assert.deepEqual(requests, [{ endpoint: 'https://aux.example/v1', apiKey: '' }]);
     const list = find(node => node.tagName === 'SELECT' && node.dataset.focus === 'model-list');
     assert.ok(list, 'the fetched list is offered');
     assert.deepEqual(list.children.map(option => option.value), ['', 'alpha', 'beta']);
     list.value = 'beta'; list.dispatch('change');
-    const label = find(node => node.tagName === 'LABEL' && node.textContent.startsWith('模型名称'));
+    const label = find(node => node.tagName === 'LABEL' && node.textContent.startsWith('模型'));
     assert.equal(label.children.find(node => node.tagName === 'INPUT').value, 'beta');
 });

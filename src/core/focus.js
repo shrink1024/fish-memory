@@ -1,4 +1,4 @@
-import { entryScope, normalizeScopeId } from './state.js';
+import { entryScope, entryTier, gatedTier, normalizeScopeId } from './state.js';
 
 /** Writable memory sent in full with one maintenance batch. Above this, only
  * the entries the batch plausibly touches go in full; the rest is a catalog. */
@@ -35,14 +35,36 @@ export function recentlyTouched(save, commits = 3) {
         .flatMap(commit => Object.keys(commit.patch?.entries ?? {})));
 }
 
-/** Messages read for author `trigger` rules besides the player's input. */
+/** Messages read for author keyword rules besides the player's input. */
 export const TRIGGER_SCAN_MESSAGES = 4;
+const keywordText = (messages, userInput) => matchText([userInput ?? '', ...messages.slice(-TRIGGER_SCAN_MESSAGES).map(m => String(m.content ?? ''))].join('\n'));
+const keywordHit = (entry, text) => Boolean(text.raw.trim()) && matcher(entry, { titles: false, minKeyLength: 1 })(text) > 0;
 /** Author `trigger` rules: entries whose original-book keywords appear in the
  * player's input or the latest messages are sent, without asking the model. */
 export function triggeredIds(save, messages, userInput, { rules, eligible = () => true }) {
-    const text = matchText([userInput ?? '', ...messages.slice(-TRIGGER_SCAN_MESSAGES).map(m => String(m.content ?? ''))].join('\n'));
-    if (!text.raw.trim()) return [];
-    return Object.values(save.data.entries).filter(e => e.enabled && eligible(e) && rules(e).trigger && matcher(e, { titles: false, minKeyLength: 1 })(text) > 0).map(e => e.id);
+    const text = keywordText(messages, userInput);
+    return Object.values(save.data.entries).filter(e => e.enabled && eligible(e) && rules(e).trigger && keywordHit(e, text)).map(e => e.id);
+}
+/** Author `gate` rules, the converse of `trigger`: until one of its original-
+ * book keywords appears in the same text, an entry stays out of this turn's
+ * selection catalog. A source blue lamp or a player-set constant is sent anyway;
+ * an entry the scan only judged important is gated like the rest. */
+export function gatedIds(save, messages, userInput, { rules }) {
+    const text = keywordText(messages, userInput);
+    return Object.values(save.data.entries).filter(e => e.enabled && gatedTier(e) !== 'constant' && rules(e).gate && !keywordHit(e, text)).map(e => e.id);
+}
+/** Author `gate` rules as selection and sending apply them: the entries held
+ * back this turn, and a save where a gate entry stands at its gatedTier, so an
+ * entry the scan only judged important is on demand there as in the panel.
+ * Entries without a gate keep their tier. */
+export function applyGate(save, messages, userInput, { rules }) {
+    const gated = new Set(gatedIds(save, messages, userInput, { rules }));
+    let entries = null;
+    for (const e of Object.values(save.data.entries)) {
+        if (!rules(e).gate || gatedTier(e) === entryTier(e)) continue;
+        (entries ??= { ...save.data.entries })[e.id] = { ...e, tier: gatedTier(e) };
+    }
+    return { gated, save: entries ? { ...save, data: { ...save.data, entries } } : save };
 }
 
 /** Returns null when the whole writable memory fits; otherwise a Set of ids. */

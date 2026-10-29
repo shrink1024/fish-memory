@@ -61,7 +61,7 @@ const controller = new Controller(host, { model, settings: { enabled: true } });
 const manager = createFloatingManager(document);
 document.body.append(manager.element);
 manager.body.append(document.querySelector('#app'));
-mountPanel(document.querySelector('#app'), controller);
+mountPanel(document.querySelector('#app'), controller, { statusSlot: manager.statusSlot, titleSlot: manager.titleSlot, appearance: { dock: () => manager.dock(), setDock: patch => manager.setDock(patch) } });
 manager.bindEntry(document.querySelector('#open-memory'));
 controller.subscribe(() => manager.render(controller.uiStatus()));
 manager.render(controller.uiStatus());

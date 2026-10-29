@@ -189,9 +189,21 @@ export function assertCompleteModelResponse(payload) {
     if (['length', 'max_tokens', 'max_output_tokens'].includes(reason) || payload?.stopped_limit === true) {
         throw Object.assign(new Error('辅助模型达到输出长度上限，返回结果已截断或未生成正文，本次未采用。请提高输出上限、调低思考强度、减少每批扫描量或改用支持更长输出的辅助模型后重试。'), { name: 'OutputLimitError' });
     }
-    if (reason === 'content_filter') {
-        throw Object.assign(new Error('辅助模型接口未提供完整结果（content_filter），本次未采用。请检查接口返回与模型设置后重试。'), { name: 'OutputBlockedError' });
+    if (BLOCK_FINISH.has(reason) || payload?.promptFeedback?.blockReason || payload?.prompt_feedback?.block_reason) {
+        throw blockedResponse(payload?.promptFeedback?.blockReason ?? payload?.prompt_feedback?.block_reason
+            ?? /\bblockReason:\s*([A-Z_]+)/.exec(String(payload?.choices?.[0]?.message?.content ?? ''))?.[1] ?? (reason === 'content_filter' ? '' : reason.toUpperCase()));
     }
+}
+
+/** Finish reasons that mean the provider's content review stopped the request. */
+const BLOCK_FINISH = new Set(['content_filter', 'safety', 'prohibited_content', 'blocklist', 'spii', 'image_safety', 'refusal']);
+/** The provider refused this material. Resending it unchanged is refused
+ * again, so callers that can narrow the material (book scans) split it. Only
+ * a fixed-vocabulary reason code is shown, never the provider's text. */
+export function blockedResponse(reason = '') {
+    const code = /^[A-Z][A-Z_]{1,39}$/.test(String(reason)) ? String(reason) : '';
+    return Object.assign(new Error(`辅助模型的服务方拦下了这次请求（内容审核${code ? `：${code}` : ''}），没有生成结果。这是模型服务方的审核，原样重试通常还会被拦；可以在“设置 → 辅助模型”给鱼忆换一个审核较宽松的接口后再试。`),
+        { name: 'OutputBlockedError', dwmBlocked: true, ...(code ? { blockReason: code } : {}) });
 }
 
 /** Return fixed, useful error categories without exposing server text/secrets. */
@@ -199,6 +211,9 @@ export function modelApiError(payload, status) {
     const raw = typeof payload?.error === 'string' ? payload.error : payload?.error?.message ?? payload?.message ?? '';
     const message = String(raw), http = Number.isInteger(status) ? `（HTTP ${status}）` : '';
     if (/candidate text empty/i.test(message)) return missingResponse('empty');
+    if (/prompt was blocked|block_?reason|PROHIBITED_CONTENT|content[_ ]?filter|content_policy_violation|ResponsibleAIPolicyViolation/i.test(message)) {
+        return blockedResponse(/\b(PROHIBITED_CONTENT|SAFETY|BLOCKLIST|SPII|IMAGE_SAFETY|OTHER)\b/.exec(message)?.[1] ?? '');
+    }
     if (status === 401) return new Error(`辅助模型连接鉴权失败${http}。请检查辅助连接的 API 密钥是否填写正确、是否已失效，再重试。`);
     if (status === 403) return new Error(`辅助模型连接被拒绝${http}。请检查 API 密钥、账户和所选模型的访问权限，再重试。`);
     if (status === 429) return new Error(`辅助模型请求受到频率或额度限制${http}。请检查账户额度或稍后重试。`);

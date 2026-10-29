@@ -4,6 +4,7 @@ import { initializeRequest, strategyRequest, maintainRequest, selectRequest, com
 import { sourceSegments } from './source-segments.js';
 import { restoreProtectedReferences } from '../core/views.js';
 import { SOURCE_MERGE } from './prompts.js';
+import { DEFERRED } from './prescan.js';
 
 // The controller keeps the trace open until task validation finishes. Simple
 // standalone clients can still execute the same task without diagnostics.
@@ -35,12 +36,43 @@ export async function classifyEntries(client, entries, naturalLanguage = '', sig
                 invariant(item, `初始化漏掉了条目 ${source.title}`);
                 const rebuilt = sourceSegments(entryText(source), item.segments);
                 const next = createEntry({ ...source, kind: item.kind, intro: item.intro, retrieveWhen: item.retrieveWhen,
-                    important: item.important, needsReview: item.needsReview || rebuilt.needsReview, segments: rebuilt.segments });
+                    important: item.important, needsReview: item.needsReview || rebuilt.needsReview, segments: rebuilt.segments, scanBlocked: false });
                 invariant(entryText(next) === entryText(source), '初始化分类不得改写原文');
                 return next;
             }),
         };
     });
+}
+/** How many times one book scan may halve a refused batch. Each halving sends
+ * two sub-requests, so a scan adds at most 32 requests beyond its original
+ * batches, and a provider that refuses everything costs a bounded number of calls. */
+export const SCAN_REFUSAL_BUDGET = 16;
+export const scanBudget = () => ({ refusals: SCAN_REFUSAL_BUDGET });
+/** Left for the host to send as the original book does (see prescan). */
+export function blockedEntry(source) {
+    return createEntry({ ...source, kind: 'fact', intro: '', retrieveWhen: '', important: false, needsReview: false, enabled: false,
+        segments: source.segments.map(segment => ({ ...segment, writable: false })), status: DEFERRED, scanBlocked: true });
+}
+/** Book entries are independent, so a batch the provider's content review
+ * refused is halved and resent; entries refused on their own stay unscanned
+ * instead of failing the whole scan. Any other error still fails it. */
+export async function classifyOrDefer(client, entries, naturalLanguage = '', signal, budget = scanBudget()) {
+    try {
+        const result = await classifyEntries(client, entries, naturalLanguage, signal);
+        return { ...result, blocked: [] };
+    } catch (error) {
+        if (!error?.dwmBlocked) throw error;
+        if (entries.length === 1 || budget.refusals <= 0) return { entries: entries.map(blockedEntry), strategy: '', blocked: entries.map(entry => entry.id) };
+        budget.refusals--;
+        // The checkpoint keeps one strategy per original batch; halves of one
+        // batch read the same book, so the first one stands for both.
+        const middle = Math.ceil(entries.length / 2), out = { entries: [], strategy: '', blocked: [] };
+        for (const part of [entries.slice(0, middle), entries.slice(middle)]) {
+            const result = await classifyOrDefer(client, part, naturalLanguage, signal, budget);
+            out.entries.push(...result.entries); out.blocked.push(...result.blocked); out.strategy ||= result.strategy;
+        }
+        return out;
+    }
 }
 export async function alignStrategy(client, strategies, entries, naturalLanguage, signal) {
     const distinct = [...new Set(strategies.filter(Boolean))];

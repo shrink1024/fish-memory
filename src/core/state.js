@@ -77,6 +77,12 @@ export function scannedTier(entry) {
 }
 export function entryTier(entry) { return TIERS.includes(entry?.tier) ? entry.tier : scannedTier(entry); }
 export const alwaysSent = entry => entryTier(entry) === 'constant';
+/** Tier under an author `gate`: the gate yields to a source blue lamp or a
+ * player-set constant, not to the scan's guess that an entry is important. */
+export function gatedTier(entry) {
+    const tier = entryTier(entry);
+    return tier === 'constant' && !entry.tier && !entry.constant ? 'onDemand' : tier;
+}
 
 export function createEntry(input) {
     invariant(input && typeof input === 'object', '条目不能为空');
@@ -102,6 +108,8 @@ export function createEntry(input) {
         ...(TIERS.includes(input.tier) ? { tier: input.tier } : {}),
         // Player-imported history: not generated from any reply, so it survives rerolls.
         ...(input.origin === 'import' ? { origin: 'import' } : {}),
+        // The auxiliary provider refused to scan it; sent as the original book does.
+        ...(input.scanBlocked === true ? { scanBlocked: true } : {}),
     };
     invariant(KINDS.includes(entry.kind), `未知条目类型：${entry.kind}`);
     invariant(typeof entry.id === 'string' && entry.id.length < 1000, '无效条目身份');

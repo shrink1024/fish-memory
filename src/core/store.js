@@ -315,6 +315,8 @@ export class MemoryStore {
                     invariant(action.tier === 'off' || current.status !== 'deferred' || item.classified, '未扫描条目需要先分类');
                     data.entries[item.id] = createEntry({ ...current, ...(item.classified ?? {}), id: current.id,
                         source: current.source, scopeId: current.scopeId, evidence: current.evidence, lineage: current.lineage,
+                        // A successful rescan clears an earlier refusal; createEntry drops the false marker.
+                        scanBlocked: item.classified ? false : current.scanBlocked,
                         tier: action.tier, enabled: action.tier !== 'off', version: current.version + 1 });
                 }
             } else if (action.type === 'inventory-toggle') {
@@ -355,6 +357,8 @@ export class MemoryStore {
                     data.entries[entry.id] = createEntry({ ...entry, kind: action.kind ?? entry.kind, segments: action.segments ?? entry.segments, needsReview: false });
                 } else if (action.type === 'promote') {
                     invariant(entry.kind === 'npc', '只能晋升 NPC 条目'); entry.important = true;
+                    // The player's choice, so it counts as a player-set constant (an author gate yields to it).
+                    if (entry.enabled) entry.tier = 'constant';
                 } else if (action.type === 'promote-from-pool') {
                     invariant(entry.kind === 'npc_pool' && entry.enabled && entry.segments.every(s => s.writable),
                         '只能从可维护的路人合集建立独立人物');

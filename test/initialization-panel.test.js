@@ -48,15 +48,15 @@ function fixture(extra = {}) {
 
 test('building memory skips the optional preset scan even when it is available and would fail', async t => {
     const f = fixture(); t.after(() => f.panel.destroy());
-    assert.match(f.root.textContent, /预设可在“预设应用”中选择或扫描推荐，不影响建立记忆/);
+    assert.match(f.root.textContent, /预设可在“设置 → 预设应用”中选择或扫描推荐，不影响建立记忆/);
     f.button('建立此存档记忆').click(); await tick();
     assert.deepEqual(f.calls, { initialize: 1, preset: 0 });
     assert.match(f.root.textContent, /合成建档完成/);
-    f.button('预设应用').click();
-    f.button('扫描推荐开关（调用模型）').click(); await tick();
+    f.button('设置').click(); f.button('预设应用').click();
+    f.button('让模型推荐').click(); await tick();
     assert.deepEqual(f.calls, { initialize: 1, preset: 1 });
     assert.match(f.root.textContent, /合成可选预设扫描格式错误/);
-    f.button('设置').click();
+    f.button('高级').click();
     f.button('初始化存档').click(); await tick();
     assert.deepEqual(f.calls, { initialize: 2, preset: 1 });
     assert.match(f.root.textContent, /合成建档完成/);
@@ -96,16 +96,14 @@ test('worldbook diagnosis and a separate check action are available before initi
 
 test('preset application draft switches never transfer to a different chat with the same preset', t => {
     const f = fixture(); t.after(() => f.panel.destroy());
-    f.button('预设应用').click();
-    let input = walk(f.root).find(n => n.tagName === 'INPUT' && n.type === 'checkbox');
-    assert.equal(input.checked, false);
-    input.checked = true; for (const callback of input.events.change) callback();
-    assert.equal(walk(f.root).find(n => n.tagName === 'INPUT' && n.type === 'checkbox').checked, true);
+    f.button('设置').click(); f.button('预设应用').click();
+    const presetSwitch = () => walk(f.root).find(n => n.attributes.role === 'switch');
+    assert.equal(presetSwitch().attributes['aria-checked'], 'false');
+    presetSwitch().click();
+    assert.equal(presetSwitch().attributes['aria-checked'], 'true');
     f.view.chatId = 'another-chat'; f.view.save = { ...f.view.save, id: 'another-save' };
     for (const callback of f.listeners) callback();
-    input = walk(f.root).find(n => n.tagName === 'INPUT' && n.type === 'checkbox');
-    assert.equal(input.checked, false);
-    assert.match(f.root.textContent, /当前勾选 0 条/);
+    assert.equal(presetSwitch().attributes['aria-checked'], 'false');
 });
 
 
@@ -130,6 +128,6 @@ test('mobile hidden list retains its previous scroll offset when detail rerender
     prepare();
     for (const callback of f.listeners) callback();
     prepare();
-    f.button('返回资料列表').click();
+    f.button('列表').click();
     assert.equal(walk(f.root).find(n => n.dataset.scroll === 'library-list').scrollTop, 320);
 });

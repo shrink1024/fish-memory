@@ -15,6 +15,7 @@ export function assemblePromptPlan(save, ids, { eligible, compiledRules, configE
     return {
         entries: Object.values(save.data.entries).map(entry => ({ ...clone(entry), enabled: entry.enabled && scopes.has(entryScope(entry)) })),
         selectedIds,
+        mandatoryIds: mandatory,
         details: frontRead(save, selectedIds.filter(id => !save.data.entries[id].source), eligible)
             .map(e => `【${e.title}｜${e.kind}${e.scopeId === GLOBAL_SCOPE ? '' : `｜范围 ${e.scopeId}`}】\n${e.content}`).join('\n\n'),
         summary: [...scopes].map(scopeId => { const text = scopeSummary(save.data, scopeId); return text ? (scopeId === GLOBAL_SCOPE ? text : `【范围 ${scopeId}】\n${text}`) : ''; }).filter(Boolean).join('\n\n'),

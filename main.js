@@ -10,7 +10,7 @@ import { createProblemExporter } from './src/diagnostics/problem-export.js';
 import { createFloatingManager } from './src/ui/floating-manager.js';
 
 // Loaded by index.js. Keep in step with manifest.json; test/version.test.js checks it.
-const PLUGIN_VERSION = '0.3.3';
+const PLUGIN_VERSION = '0.4.0';
 
 async function boot() {
     if (!globalThis.SillyTavern?.getContext || document.getElementById('dynamic-world-memory')) return;
@@ -105,7 +105,8 @@ async function boot() {
         return { chatId: live.getCurrentChatId?.() ?? live.chatId ?? '', character: live.name2 ?? '', memoryChatId: host.snapshot().chatId,
             pluginVersion: PLUGIN_VERSION, mainApi: live.mainApi, browser: navigator.userAgent };
     } });
-    const panel = mountPanel(mount, controller, { exportProblem: () => problems.export() });
+    const panel = mountPanel(mount, controller, { exportProblem: () => problems.export(),
+        statusSlot: manager.statusSlot, titleSlot: manager.titleSlot, appearance: { dock: () => manager.dock(), setDock: patch => manager.setDock(patch) } });
     const renderManagerStatus = () => manager.render(controller.uiStatus());
     const unsubscribeManager = controller.subscribe(renderManagerStatus);
     renderManagerStatus();

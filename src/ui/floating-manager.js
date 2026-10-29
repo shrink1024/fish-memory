@@ -1,8 +1,10 @@
 const POSITION_KEY = 'dwm.floating-position.v1';
+const WINDOW_KEY = 'dwm.floating-window.v1';
+const MIN_WIDTH = 560, MIN_HEIGHT = 420, COMPACT_WIDTH = 720;
 const clamp = (value, min, max) => Math.min(Math.max(value, min), Math.max(min, max));
 
 /** A persistent, nonmodal workspace. It never reparents or remounts its contents. */
-export function createFloatingManager(doc, { window: win = doc.defaultView, storage, storageKey = POSITION_KEY } = {}) {
+export function createFloatingManager(doc, { window: win = doc.defaultView, storage, storageKey = POSITION_KEY, windowKey = WINDOW_KEY } = {}) {
     const make = (tag, className, text) => {
         const node = doc.createElement(tag); node.className = className;
         if (text !== undefined) node.textContent = text;
@@ -29,43 +31,42 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
         bubble.dataset.ttMobileSurface = 'free-window';
     }
     panel.setAttribute('role', 'dialog'); panel.setAttribute('aria-label', '鱼忆管理窗口'); panel.setAttribute('aria-modal', 'false');
+    // One title bar: drag it to move; the panel fills titleSlot and statusSlot.
     const chrome = make('header', 'dwm-management-chrome');
     const heading = make('div', 'dwm-management-heading');
-    heading.append(make('strong', '', '鱼忆管理'), make('span', '', '收起后，点鱼忆继续'));
-    const positionLabel = make('label', 'dwm-bubble-position-label');
-    positionLabel.append(make('span', 'dwm-visually-hidden', '收起后的气泡位置'));
-    const positionSelect = make('select', 'dwm-bubble-position');
-    for (const [edge, label] of [['left', '左'], ['right', '右']]) {
-        for (const [fraction, name] of [[0.2, '上'], [0.5, '中'], [0.8, '下']]) {
-            const option = make('option', '', `气泡 · ${label}${name}`); option.value = `${edge}:${fraction}`; positionSelect.append(option);
-        }
-    }
-    positionLabel.append(positionSelect);
-    // Players run several floating tools; the default bubble is a small icon.
-    const sizeLabel = make('label', 'dwm-bubble-position-label');
-    sizeLabel.append(make('span', 'dwm-visually-hidden', '收起后的气泡大小'));
-    const sizeSelect = make('select', 'dwm-bubble-position');
-    for (const [value, name] of [['compact', '气泡 · 小图标'], ['full', '气泡 · 带文字']]) {
-        const option = make('option', '', name); option.value = value; sizeSelect.append(option);
-    }
-    sizeLabel.append(sizeSelect);
-    const closeButton = make('button', 'dwm-management-close'); closeButton.type = 'button';
+    const titleSlot = make('span', 'dwm-management-subtitle');
+    heading.append(icon('M3 12c3-6 11-7 15 0-4 7-12 6-15 0zm0 0-2-3v6zM15 11h.01', 'dwm-management-logo'), make('strong', '', '鱼忆'), titleSlot);
+    const statusSlot = make('div', 'dwm-management-status');
+    const maximizeButton = make('button', 'dwm-management-icon dwm-management-maximize'); maximizeButton.type = 'button';
+    maximizeButton.setAttribute('aria-label', '最大化'); maximizeButton.title = '最大化';
+    maximizeButton.append(icon('M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5'));
+    const closeButton = make('button', 'dwm-management-close dwm-management-icon'); closeButton.type = 'button';
     closeButton.setAttribute('aria-label', '收起鱼忆管理窗口'); closeButton.title = '收起，保留当前页面与草稿';
-    closeButton.append(icon('M5 12h14'), make('span', '', '收起'));
-    chrome.append(heading, positionLabel, sizeLabel, closeButton);
-    const body = make('div', 'dwm-management-body'); panel.append(chrome, body); element.append(panel, bubble); doc.body.append(element);
+    closeButton.append(icon('M5 12h14'));
+    chrome.append(heading, statusSlot, maximizeButton, closeButton);
+    const body = make('div', 'dwm-management-body'); panel.append(chrome, body);
+    const handles = ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'].map(edge => {
+        const handle = make('div', `dwm-resize dwm-resize-${edge}`); handle.dataset.edge = edge; handle.setAttribute('aria-hidden', 'true'); panel.append(handle); return handle;
+    });
+    element.append(panel, bubble); doc.body.append(element);
 
     let opened = false, destroyed = false, opener = null, drag = null, suppressClick = false, observedComposer = null;
     let dock = { edge: 'right', fraction: 0.65, size: 'compact' };
+    let frame = null, maximized = false, moving = null;
     try { storage ??= win?.localStorage; const saved = JSON.parse(storage?.getItem(storageKey) ?? 'null');
         if (['left', 'right'].includes(saved?.edge) && Number.isFinite(saved.fraction)) dock = { ...dock, edge: saved.edge, fraction: clamp(saved.fraction, 0, 1) };
         if (['compact', 'full'].includes(saved?.size)) dock.size = saved.size;
     } catch { /* Browser storage may be blocked; the manager remains usable. */ }
+    try { const saved = JSON.parse(storage?.getItem(windowKey) ?? 'null');
+        if (['x', 'y', 'width', 'height'].every(key => Number.isFinite(saved?.[key]))) frame = { x: saved.x, y: saved.y, width: saved.width, height: saved.height };
+        maximized = saved?.maximized === true;
+    } catch { /* A broken window size falls back to the default frame. */ }
     const listeners = [], entries = new Set();
     const listen = (target, type, fn, options) => {
         target?.addEventListener(type, fn, options); listeners.push(() => target?.removeEventListener(type, fn, options));
     };
     const save = () => { try { storage?.setItem(storageKey, JSON.stringify(dock)); } catch { /* Position memory is optional. */ } };
+    const saveFrame = () => { try { storage?.setItem(windowKey, JSON.stringify({ ...frame, maximized })); } catch { /* Size memory is optional. */ } };
     const viewport = () => {
         if (ttSnapshot) {
             const { viewport: v, ime } = ttSnapshot;
@@ -91,9 +92,19 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
         if (rect?.height > 0 && rect.width > 0 && rect.top >= v.top && rect.top < v.top + v.height) bottom = Math.min(bottom, rect.top - v.top - 8);
         return { ...v, minX, maxX, minY, maxY: Math.max(minY, bottom - height), bubbleWidth: width };
     };
-    const reflectDock = () => {
-        const nearest = [0.2, 0.5, 0.8].reduce((best, value) => Math.abs(dock.fraction - value) < Math.abs(dock.fraction - best) ? value : best, 0.5);
-        positionSelect.value = `${dock.edge}:${nearest}`;
+    // The window frame, clamped into the reachable viewport. Narrow screens use the full surface.
+    const placeWindow = () => {
+        const v = viewport(), compact = v.width <= COMPACT_WIDTH;
+        panel.dataset.layout = compact ? 'compact' : maximized ? 'maximized' : 'window';
+        maximizeButton.hidden = compact;
+        maximizeButton.title = maximized ? '还原' : '最大化'; maximizeButton.setAttribute('aria-label', maximizeButton.title);
+        if (compact || maximized) { for (const key of ['left', 'top', 'width', 'height']) panel.style[key] = ''; return; }
+        const margin = 12;
+        const width = clamp(frame?.width ?? Math.min(1040, v.width - margin * 2), Math.min(MIN_WIDTH, v.width - margin * 2), v.width - margin * 2);
+        const height = clamp(frame?.height ?? Math.min(780, v.height * 0.78), Math.min(MIN_HEIGHT, v.height - margin * 2), v.height - margin * 2);
+        const x = clamp(frame?.x ?? v.width - width - margin, margin, v.width - width - margin);
+        const y = clamp(frame?.y ?? margin, margin, v.height - height - margin);
+        Object.assign(panel.style, { left: `${x}px`, top: `${y}px`, width: `${width}px`, height: `${height}px` });
     };
     function layout() {
         if (destroyed) return;
@@ -104,7 +115,8 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
             bubble.style.left = `${dock.edge === 'left' ? bounds.minX : bounds.maxX}px`;
             bubble.style.top = `${bounds.minY + dock.fraction * (bounds.maxY - bounds.minY)}px`;
         }
-        element.dataset.edge = dock.edge; element.dataset.bubbleSize = dock.size; sizeSelect.value = dock.size;
+        element.dataset.edge = dock.edge; element.dataset.bubbleSize = dock.size;
+        if (!moving) placeWindow();
         // Scroll only our inner surface when a keyboard covers its focused field.
         const active = doc.activeElement;
         if (opened && active && body.contains(active)) {
@@ -147,14 +159,35 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
     listen(doc, 'keydown', event => {
         if (opened && event.key === 'Escape' && !event.defaultPrevented && !doc.querySelector('dialog[open]')) { event.preventDefault(); close(); }
     });
-    listen(positionSelect, 'change', () => {
-        const [edge, fraction] = positionSelect.value.split(':');
-        if (!['left', 'right'].includes(edge) || !Number.isFinite(Number(fraction))) return;
-        dock = { ...dock, edge, fraction: clamp(Number(fraction), 0, 1) }; save(); layout();
+    listen(maximizeButton, 'click', () => { maximized = !maximized; saveFrame(); layout(); });
+    // Move by the title bar, resize by any edge or corner. Both stop at the viewport.
+    const startFrame = (event, edge) => {
+        if (event.isPrimary === false || event.button !== 0 || panel.dataset.layout !== 'window') return;
+        if (!edge && event.target?.closest?.('button, select, input, a')) return;
+        const rect = panel.getBoundingClientRect();
+        moving = { id: event.pointerId, edge, x: event.clientX, y: event.clientY, rect: { x: rect.left - viewport().left, y: rect.top - viewport().top, width: rect.width, height: rect.height } };
+        event.preventDefault();
+        try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /* Capture is optional. */ }
+    };
+    listen(chrome, 'pointerdown', event => startFrame(event, ''));
+    for (const handle of handles) listen(handle, 'pointerdown', event => startFrame(event, handle.dataset.edge));
+    listen(win, 'pointermove', event => {
+        if (!moving || event.pointerId !== moving.id) return;
+        const v = viewport(), dx = event.clientX - moving.x, dy = event.clientY - moving.y, r = moving.rect, margin = 12;
+        let { x, y, width, height } = r;
+        if (!moving.edge) { x = clamp(r.x + dx, margin, v.width - r.width - margin); y = clamp(r.y + dy, margin, v.height - r.height - margin); }
+        if (moving.edge.includes('e')) width = clamp(r.width + dx, MIN_WIDTH, v.width - r.x - margin);
+        if (moving.edge.includes('s')) height = clamp(r.height + dy, MIN_HEIGHT, v.height - r.y - margin);
+        if (moving.edge.includes('w')) { width = clamp(r.width - dx, MIN_WIDTH, r.x + r.width - margin); x = r.x + r.width - width; }
+        if (moving.edge.includes('n')) { height = clamp(r.height - dy, MIN_HEIGHT, r.y + r.height - margin); y = r.y + r.height - height; }
+        frame = { x, y, width, height };
+        Object.assign(panel.style, { left: `${x}px`, top: `${y}px`, width: `${width}px`, height: `${height}px` });
     });
-    listen(sizeSelect, 'change', () => {
-        dock = { ...dock, size: sizeSelect.value === 'full' ? 'full' : 'compact' }; save(); layout();
-    });
+    const finishFrame = event => {
+        if (!moving || event.pointerId !== moving.id) return;
+        moving = null; saveFrame(); layout();
+    };
+    listen(win, 'pointerup', finishFrame); listen(win, 'pointercancel', finishFrame);
     listen(bubble, 'keydown', event => {
         if (!event.shiftKey || !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return;
         event.preventDefault();
@@ -162,7 +195,7 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
         if (event.key === 'ArrowRight') dock.edge = 'right';
         if (event.key === 'ArrowUp') dock.fraction = clamp(dock.fraction - 0.1, 0, 1);
         if (event.key === 'ArrowDown') dock.fraction = clamp(dock.fraction + 0.1, 0, 1);
-        save(); reflectDock(); layout();
+        save(); layout();
     });
     listen(bubble, 'pointerdown', event => {
         if (event.isPrimary === false || event.button !== 0 || opened) return;
@@ -187,7 +220,7 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
                 const bounds = measure(), left = parseFloat(bubble.style.left), top = parseFloat(bubble.style.top);
                 dock = { edge: left + bounds.bubbleWidth / 2 < bounds.width / 2 ? 'left' : 'right',
                     fraction: bounds.maxY > bounds.minY ? clamp((top - bounds.minY) / (bounds.maxY - bounds.minY), 0, 1) : 0.5 };
-                save(); reflectDock();
+                save();
             }
         }
         try { bubble.releasePointerCapture(drag.id); } catch { /* A cancelled pointer may already have released capture. */ }
@@ -209,7 +242,7 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
         bubble.title = `鱼忆 · ${text}；点开管理，拖动可换位置`;
         layout();
     };
-    reflectDock(); render({ initialized: true });
+    render({ initialized: true });
     if (ttHost) {
         const report = error => win?.console?.warn?.('鱼忆：TT 布局订阅不可用，继续使用浏览器视口。', error);
         const release = fn => { try { Promise.resolve(fn?.()).catch(report); } catch (error) { report(error); } };
@@ -233,7 +266,14 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
             else releaseTt = () => release(unsubscribe);
         }).catch(report);
     }
-    return { element, panel, body, bubble, bindEntry, open, close, toggle: () => opened ? close() : open(), render,
+    const setDock = patch => {
+        if (['left', 'right'].includes(patch?.edge)) dock = { ...dock, edge: patch.edge };
+        if (Number.isFinite(patch?.fraction)) dock = { ...dock, fraction: clamp(patch.fraction, 0, 1) };
+        if (['compact', 'full'].includes(patch?.size)) dock = { ...dock, size: patch.size };
+        save(); layout();
+    };
+    return { element, panel, body, bubble, titleSlot, statusSlot, bindEntry, open, close, toggle: () => opened ? close() : open(), render,
+        dock: () => ({ ...dock }), setDock,
         destroy() {
             if (destroyed) return;
             if (opened && element.contains(doc.activeElement)) close();

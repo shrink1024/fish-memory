@@ -79,7 +79,7 @@ test('small pointer movements remain taps, while dragging snaps, persists and do
 
 test('keyboard and single tap position controls work without dragging', () => {
     const f = fixture(); f.ui.open();
-    const position = f.get('dwm-bubble-position'); position.value = 'left:0.2'; position.fire('change');
+    f.ui.setDock({ edge: 'left', fraction: 0.2 });
     assert.equal(f.writes.at(-1).value.edge, 'left'); assert.equal(f.writes.at(-1).value.fraction, 0.2);
     f.ui.close(); f.ui.bubble.fire('keydown', { key: 'ArrowRight', shiftKey: true });
     assert.equal(f.writes.at(-1).value.edge, 'right'); f.ui.destroy();
@@ -189,4 +189,40 @@ test('TT keyboard layout scrolls only the manager body to reveal its focused fie
     assert.equal(f.ui.body.scrollTop, 82);
     assert.equal(f.doc.body.scrollTop, undefined);
     f.ui.destroy();
+});
+
+test('the window moves by its title bar, resizes from an edge, maximizes and remembers its frame', () => {
+    const f = fixture(); Object.assign(f.win, { innerWidth: 1440, innerHeight: 900 }); Object.assign(f.win.visualViewport, { width: 1440, height: 900 });
+    f.ui.open();
+    const panel = f.ui.panel, frame = () => ['left', 'top', 'width', 'height'].map(key => parseFloat(panel.style[key]));
+    assert.equal(panel.dataset.layout, 'window');
+    assert.deepEqual(frame(), [388, 12, 1040, 702], 'the default frame sits at the top right');
+    panel.getBoundingClientRect = () => { const [left, top, width, height] = frame(); return { left, top, width, height, right: left + width, bottom: top + height }; };
+    const chrome = f.get('dwm-management-chrome');
+    chrome.fire('pointerdown', { pointerId: 1, button: 0, clientX: 600, clientY: 30, target: { closest: () => null } });
+    f.win.fire('pointermove', { pointerId: 1, clientX: 400, clientY: 80 }); f.win.fire('pointerup', { pointerId: 1 });
+    assert.deepEqual(frame(), [188, 62, 1040, 702]);
+    const corner = f.get('dwm-resize-se');
+    corner.fire('pointerdown', { pointerId: 2, button: 0, clientX: 1228, clientY: 764 });
+    f.win.fire('pointermove', { pointerId: 2, clientX: 600, clientY: 300 }); f.win.fire('pointerup', { pointerId: 2 });
+    assert.deepEqual(frame(), [188, 62, 560, 420], 'resizing stops at the minimum size');
+    assert.deepEqual(f.writes.at(-1), { key: 'dwm.floating-window.v1', value: { x: 188, y: 62, width: 560, height: 420, maximized: false } });
+    f.get('dwm-management-maximize').fire('click');
+    assert.equal(panel.dataset.layout, 'maximized'); assert.equal(panel.style.width, '');
+    f.get('dwm-management-maximize').fire('click');
+    assert.deepEqual(frame(), [188, 62, 560, 420], 'restoring returns to the saved frame');
+    f.ui.destroy();
+});
+
+test('a saved frame is clamped into a smaller viewport, and phones use the full surface', () => {
+    const saved = JSON.stringify({ x: 900, y: 600, width: 1200, height: 800, maximized: false });
+    let value = saved;
+    const storage = { getItem: key => key === 'dwm.floating-window.v1' ? value : null, setItem: (key, next) => { value = next; } };
+    const g = fixture(); g.ui.destroy();
+    Object.assign(g.win, { innerWidth: 1000, innerHeight: 700 }); Object.assign(g.win.visualViewport, { width: 1000, height: 700 });
+    const ui = createFloatingManager(g.doc, { window: g.win, storage }); ui.open();
+    assert.deepEqual(['left', 'top', 'width', 'height'].map(key => parseFloat(ui.panel.style[key])), [12, 12, 976, 676]);
+    Object.assign(g.win.visualViewport, { width: 375, height: 812 }); g.win.fire('resize');
+    assert.equal(ui.panel.dataset.layout, 'compact'); assert.equal(ui.panel.style.width, '');
+    ui.destroy();
 });

@@ -115,9 +115,9 @@ test('trace tab works before initialization and trace updates do not redraw othe
     const initialRoot = container.children[0];
     f.store.notify(); await new Promise(resolve => setTimeout(resolve, 120));
     assert.equal(container.children[0], initialRoot); assert.equal(viewReads, 1); assert.equal(f.reads(), 0);
-    findButton(container, '收发').click();
+    findButton(container, '记录').click(); findButton(container, '收发').click();
     assert.match(container.textContent, /未初始化也可查看/);
-    assert.equal(walk(container).filter(node => node.attributes.role === 'tab').length, 6);
+    assert.equal(walk(container).filter(node => node.attributes.role === 'tab').length, 4);
     const readCount = viewReads; f.store.records.push({ id: 'next', request: { prompt: '新请求' } }); f.store.notify();
     await new Promise(resolve => setTimeout(resolve, 120)); assert.equal(viewReads, readCount);
     panel.destroy(); assert.equal(f.listeners.size, 0);

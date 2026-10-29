@@ -39,8 +39,9 @@ export function sourceBookChanges(save, raw, configEntryUids = []) {
     for (const uid of new Set([...baseline.keys(), ...live.keys()])) if (!current.has(uid)) removed.push(String((baseline.get(uid) ?? live.get(uid)).metadata?.comment || uid));
     // Entries skipped at scan time (off in the book) that the book now turns on:
     // sent natively until scanned; offered for an optional sync, never blocking.
+    // Entries the auxiliary provider refused are not offered again: the same scan would be refused.
     const pendingScan = Object.values(save.data?.entries ?? {}).filter(entry => entry.status === 'deferred' && entry.source
-        && !entry.tier && current.get(String(entry.source.uid)) && !current.get(String(entry.source.uid)).disable).map(entry => entry.title);
+        && !entry.tier && !entry.scanBlocked && current.get(String(entry.source.uid)) && !current.get(String(entry.source.uid)).disable).map(entry => entry.title);
     return { changed: Boolean(added.length || removed.length || updated.length), added, removed, updated, pendingScan };
 }
 

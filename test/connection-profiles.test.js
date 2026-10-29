@@ -107,9 +107,9 @@ class Node {
 const walk = node => [node, ...node.children.flatMap(walk)];
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
-test('FM-025: the connection card lists profiles and switches with one click', async t => {
+test('FM-025: the connection picker switches profiles and saves a new one by name', async t => {
     const doc = { createElement(tag) { return new Node(tag, this); }, defaultView: {} };
-    const root = new Node('main', doc), used = [], saved = [];
+    const root = new Node('main', doc), used = [], saved = [], applied = [];
     const view = { chatId: 'c', enabled: true, status: '', settings: { ...DEFAULT_SETTINGS }, save: { id: 's', initialized: false, processedCount: 0 },
         sourceBook: 'main', readiness: { chat: true, book: true, template: true, single: true }, diagnostics: { pendingCount: 0 },
         presetApplication: { entries: [] }, connectionMode: 'compatible', modelList: null,
@@ -117,17 +117,48 @@ test('FM-025: the connection card lists profiles and switches with one click', a
         connectionProfiles: [{ name: '便宜档', model: 'cheap', active: true }, { name: '聪明档', model: 'smart', active: false }] };
     const controller = { view: () => view, subscribe: () => () => {},
         useConnectionProfile: async name => { used.push(name); view.connection = { mode: 'compatible', endpoint: 'https://b.example/v1', model: 'smart', hasApiKey: true }; return { executed: true, message: 'ok' }; },
+        updateConnection: async input => { applied.push(input); },
         saveConnectionProfile: async name => { saved.push(name); return { executed: true, message: 'ok' }; } };
     const panel = mountPanel(root, controller); t.after(() => panel.destroy());
     const find = predicate => walk(root).find(predicate);
-    find(node => node.tagName === 'BUTTON' && node.textContent === '设置').click();
-    assert.equal(find(node => node.dataset.focus === 'profile-use-便宜档').disabled, true, 'the live profile cannot be re-applied');
-    find(node => node.dataset.focus === 'profile-use-聪明档').click(); await tick();
+    const button = label => find(node => node.tagName === 'BUTTON' && node.textContent === label);
+    const input = label => find(node => node.tagName === 'LABEL' && node.textContent.startsWith(label)).children.find(node => node.tagName === 'INPUT');
+    const picker = () => find(node => node.dataset.focus === 'connection-choice');
+    button('设置').click(); button('辅助模型').click();
+    assert.equal(picker().value, 'profile:便宜档', 'the live profile is the current choice');
+    assert.deepEqual(picker().children.map(option => option.value), ['raw', 'profile:便宜档', 'profile:聪明档', 'new']);
+    assert.ok(button('删除这套'), 'the live profile can be edited or deleted');
+    picker().value = 'profile:聪明档'; picker().dispatch('change'); await tick();
     assert.deepEqual(used, ['聪明档']);
-    const endpoint = find(node => node.tagName === 'LABEL' && node.textContent.startsWith('接口基础地址')).children.find(node => node.tagName === 'INPUT');
-    assert.equal(endpoint.value, 'https://b.example/v1', 'the form shows the switched connection, not the old draft');
-    const name = find(node => node.tagName === 'LABEL' && node.textContent.startsWith('配置名称')).children.find(node => node.tagName === 'INPUT');
-    name.value = '新档'; name.dispatch('input');
-    find(node => node.tagName === 'BUTTON' && node.textContent === '保存当前生效的连接').click(); await tick();
+    assert.equal(input('接口地址').value, 'https://b.example/v1', 'the form shows the switched connection, not the old draft');
+    picker().value = 'new'; picker().dispatch('change');
+    assert.equal(input('接口地址').value, '', 'a new connection starts empty');
+    for (const [label, value] of [['配置名称', '新档'], ['接口地址', 'https://c.example/v1'], ['模型', 'm']]) { const field = input(label); field.value = value; field.dispatch('input'); }
+    button('保存并使用').click(); await tick();
+    assert.equal(applied[0].endpoint, 'https://c.example/v1');
     assert.deepEqual(saved, ['新档']);
+});
+
+test('review 10-29: an unsaved key stays put across a refresh but never follows a switch to a same-address profile', async t => {
+    // Fake keys only. Profiles A and B share address, model and output limit.
+    const store = memoryStore(), controller = new Controller(host(), { connectionStore: store });
+    for (const [name, apiKey] of [['A', 'fake-a'], ['B', 'fake-b']]) {
+        await controller.updateConnection({ mode: 'compatible', endpoint: 'https://example.invalid/v1', model: 'm', apiKey });
+        await controller.saveConnectionProfile(name);
+    }
+    await controller.useConnectionProfile('A');
+    const doc = { createElement(tag) { return new Node(tag, this); }, defaultView: {} };
+    const root = new Node('main', doc), panel = mountPanel(root, controller); t.after(() => panel.destroy());
+    const find = predicate => walk(root).find(predicate);
+    const button = label => find(node => node.tagName === 'BUTTON' && node.textContent === label);
+    const key = () => find(node => node.dataset.focus === '密钥');
+    button('设置').click(); button('辅助模型').click();
+    key().value = 'fake-unsaved-a'; key().dispatch('input');
+    panel.render();
+    assert.equal(key().value, 'fake-unsaved-a', 'a background refresh keeps what the player is typing');
+    const picker = find(node => node.dataset.focus === 'connection-choice');
+    picker.value = 'profile:B'; picker.dispatch('change'); await tick();
+    assert.equal(key().value, '', 'switching profiles starts the form afresh');
+    button('应用连接').click(); await tick();
+    assert.equal(store.data.profiles.find(profile => profile.name === 'B').apiKey, 'fake-b', 'B keeps its own key');
 });

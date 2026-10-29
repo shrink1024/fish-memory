@@ -162,8 +162,9 @@ export function createTraceViewer(doc, store, { exportProblem } = {}) {
         } catch { clearDownload(); feedback.textContent = '当前环境无法下载记录。'; return false; }
     }
     const exportCurrent = button('导出这一条', () => { const record = current(); if (record) download(record, `鱼忆-收发-${String(record.id).replace(/[^\w-]/g, '_')}.json`); });
+    let problemButton = null;
     if (typeof exportProblem === 'function') {
-        const problemButton = button('导出本次问题', async () => {
+        problemButton = button('导出本次问题', async () => {
             clearDownload();
             problemButton.disabled = true; feedback.textContent = '正在整理当前存档的诊断，文件包含相关剧情与提示词。';
             try { download(await exportProblem(), '鱼忆-本次问题.json'); }
@@ -319,5 +320,6 @@ export function createTraceViewer(doc, store, { exportProblem } = {}) {
         if (!active || destroyed || refreshTimer !== null) return;
         refreshTimer = setTimeout(() => { refreshTimer = null; refresh(); }, 100);
     }) ?? (() => {});
-    return { element, refresh, setActive(value) { active = value; if (active) refresh(); }, destroy() { destroyed = true; clearDownload(); clearTimeout(refreshTimer); unsubscribe(); element.remove(); } };
+    // Other views start the same export here, where its download link and notes appear.
+    return { element, refresh, exportProblem() { if (problemButton && !problemButton.disabled) problemButton.click(); }, setActive(value) { active = value; if (active) refresh(); }, destroy() { destroyed = true; clearDownload(); clearTimeout(refreshTimer); unsubscribe(); element.remove(); } };
 }

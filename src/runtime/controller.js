@@ -9,10 +9,10 @@ import { DEFAULT_SETTINGS, MAINTENANCE_EVERY_MAX, templateHint, normalizeTimeout
 import { playerView, scopeRead, memoryMetrics } from '../core/views.js';
 import { clone, invariant, uid, isPrefix, SerialQueue } from '../core/util.js';
 import { planWindow } from '../core/window.js';
-import { maintenanceFocus, triggeredIds } from '../core/focus.js';
+import { maintenanceFocus, triggeredIds, applyGate } from '../core/focus.js';
 import { applyMaintenance } from '../core/operations.js';
-import { AgentClient, compatibleConnection, listModels, untilAborted, serializeAgentInput, requestMessages, REASONING_EFFORTS } from '../agents/client.js';
-import { classifyEntries, alignStrategy, maintain, select, compact, mergeSourceUpdates } from '../agents/tasks.js';
+import { AgentClient, compatibleConnection, listModels, untilAborted, serializeAgentInput, requestMessages, REASONING_EFFORTS, blockedResponse } from '../agents/client.js';
+import { classifyEntries, classifyOrDefer, scanBudget, alignStrategy, maintain, select, compact, mergeSourceUpdates } from '../agents/tasks.js';
 import { prescan, DEFERRED } from '../agents/prescan.js';
 import { discoverRules, compileRules, applyRules, evaluateRules } from '../rules/index.js';
 import { createTraceStore } from '../diagnostics/trace-store.js';
@@ -683,6 +683,7 @@ export class Controller {
             worldbook: this.host.worldbookStatus?.() ?? null,
             worldbookChecking: Boolean(this.#worldbookCheck && this.#worldbookCheck.target.chatId === snapshot.chatId && this.#worldbookCheck.target.bookName === snapshot.bookName),
             save: this.store?.state ? playerView(this.store.state) : null,
+            gateIds: this.store?.state ? Object.values(this.store.state.data.entries).filter(entry => evaluateRules(this.compiledRules, entry).gate).map(entry => entry.id) : [],
             sourceBook: this.store?.state?.bookName ?? '', connectionMode: this.connectionMode,
             connection: { mode: this.connectionMode, endpoint: this.#connectionConfig?.endpoint ?? '', model: this.#connectionConfig?.model ?? '', maxOutputTokens: this.#connectionConfig?.maxOutputTokens, hasApiKey: Boolean(this.#connectionConfig?.apiKey) },
             connectionProfiles: this.#connectionProfiles.map(profile => ({ name: profile.name, endpoint: profile.endpoint, model: profile.model,
@@ -1107,12 +1108,12 @@ export class Controller {
             // checkpoint them strictly in order so progress stays a contiguous
             // prefix and one slow batch never holds back saving finished ones.
             const wave = Math.max(1, Math.min(6, Number.isInteger(this.settings.scanConcurrency) ? this.settings.scanConcurrency : 1));
-            const inFlight = new Map();
+            const inFlight = new Map(), budget = scanBudget();
             let nextBatch = checkpoint.classifiedBatches;
             const launch = () => {
                 while (nextBatch < groups.length && inFlight.size < wave) {
                     const index = nextBatch++;
-                    const request = classifyEntries(this.client, groups[index], this.rules.naturalLanguage, signal);
+                    const request = classifyOrDefer(this.client, groups[index], this.rules.naturalLanguage, signal, budget);
                     request.catch(() => {}); // Observed in order below; never an unhandled rejection.
                     inFlight.set(index, request);
                 }
@@ -1202,8 +1203,9 @@ export class Controller {
             await this.#saveActivity(activity, () => this.#syncWindow({ duringInitialization: true }));
             this.#assertActivity(activity);
             const reviewCount = Object.values(targetStore.state.data.entries).filter(entry => entry.needsReview).length;
+            const blockedCount = Object.values(targetStore.state.data.entries).filter(entry => entry.scanBlocked).length;
             const completed = this.#enabled() ? '存档扫描已完成，记忆已启用' : '存档扫描已完成；记忆尚未启用';
-            this.#state(`${completed}${reviewCount ? `；其中 ${reviewCount} 条待核对，请在“资料”查看` : ''}`);
+            this.#state(`${completed}${reviewCount ? `；其中 ${reviewCount} 条待核对，请在“资料”查看` : ''}${blockedCount ? `；${blockedCount} 条被辅助接口的内容审核拒收，暂按原世界书发送` : ''}`);
             this.#initializationNotice(null);
             return { executed: true, message: this.status };
         } catch (error) {
@@ -1436,8 +1438,11 @@ export class Controller {
         unchanged();
         const observedState = this.#observedState(projection, snapshot, snapshot.messages);
         const scopes = readableScopes(save?.data.scopeContext);
-        const eligible = entry => scopes.has(entryScope(entry)) && (this.host.previewEligible ? this.host.previewEligible(entry) : entry.enabled);
-        const result = buildPromptPreview({ snapshot, save, selectionSave: liveSave, settings, rules, compiledRules, rawEntries, eligible,
+        // The same gate as sending, so the preview's catalog and must-send list agree with it.
+        const gate = liveSave?.initialized ? applyGate(liveSave, snapshot.messages.filter(isReadableMessage), snapshot.userInput, { rules: entry => evaluateRules(compiledRules, entry) })
+            : { gated: new Set(), save: liveSave };
+        const eligible = entry => scopes.has(entryScope(entry)) && !gate.gated.has(entry.id) && (this.host.previewEligible ? this.host.previewEligible(entry) : entry.enabled);
+        const result = buildPromptPreview({ snapshot, save, selectionSave: gate.save, settings, rules, compiledRules, rawEntries, eligible,
             connectionMode: this.connectionMode, observedState,
             busy: { initializing: this.#initializing, maintaining: Boolean(this.#maintenance), compacting: this.#compacting } });
         const sourceWarning = '原书已变化：旧基准的前置、后置和记忆注入暂不可用。请先导出聊天 JSONL 备份并重新扫描，或在发送时明确选择按原书发送。';
@@ -1448,7 +1453,7 @@ export class Controller {
             }
         }
         const currentSave = !sourceChanged && save?.chatId === snapshot.chatId && save?.bookName === snapshot.bookName
-            && isPrefix(save.processed, snapshot.messages.map(m => m.key)) ? liveSave : null;
+            && isPrefix(save.processed, snapshot.messages.map(m => m.key)) ? gate.save : null;
         const narration = previewNarration(currentSave, { eligible, compiledRules, configEntryUids: rules.configEntryUids });
         if (sourceChanged) { narration.status = 'unavailable'; narration.explanation = sourceWarning; }
         else if (!currentSave && save?.initialized) narration.explanation = '保存快照不属于当前聊天或所选剧情；实际发送会先载入或回放，当前不展示旧片段。';
@@ -1499,7 +1504,7 @@ export class Controller {
     }
     #recordPlan(plan, mode) {
         const record = { requestId: plan.requestId, at: new Date().toISOString(), mode,
-            selectedIds: clone(plan.selectedIds), summary: plan.summary, inventory: plan.inventory, details: plan.details,
+            selectedIds: clone(plan.selectedIds), mandatoryIds: clone(plan.mandatoryIds ?? []), triggeredIds: clone(plan.triggeredIds ?? []), gatedIds: clone(plan.gatedIds ?? []), summary: plan.summary, inventory: plan.inventory, details: plan.details,
             entries: plan.entries.filter(e => plan.selectedIds.includes(e.id)).map(e => ({ id: e.id, title: e.title, kind: e.kind,
                 constant: e.constant, important: e.important, version: e.version, contentChars: entryText(e).length })),
             mvu: clone(plan.mvu),
@@ -1517,15 +1522,20 @@ export class Controller {
         invariant(this.store?.state.initialized, '请先完成初始化');
         this.#assertActivity(activity);
         invariant(!this.sourceChanges.changed, '原书已变化：请先在“资料”页同步变化的条目，或选择本轮按原世界书发送。');
-        const snapshot = readSnapshot(), save = nativeSwitchOverlay(project ? this.store.project(snapshot.messages.map(m => m.key)) : this.store.snapshot(), this.#nativeRaw);
+        const snapshot = readSnapshot(), stored = nativeSwitchOverlay(project ? this.store.project(snapshot.messages.map(m => m.key)) : this.store.snapshot(), this.#nativeRaw);
+        const rules = entry => evaluateRules(this.compiledRules, entry), readable = snapshot.messages.filter(isReadableMessage);
+        // Gated entries never reach the catalog, so selection spends no slot on
+        // them, and an author `always` does not send them either.
+        const { gated, save } = applyGate(stored, readable, snapshot.userInput, { rules });
         const scopes = readableScopes(save.data.scopeContext);
         const eligible = entry => scopes.has(entryScope(entry)) && (this.host.eligible ? this.host.eligible(entry, snapshot) : entry.enabled);
         const recent = selectionMessages(snapshot, save, this.settings.recentTurns);
         const projection = this.settings.mvuEnabled ? await untilAborted(this.refreshMvu(), activity.signal) : null;
         this.#assertActivity(activity);
         const observedState = this.#observedState(projection, snapshot, recent);
-        const forced = triggeredIds(save, snapshot.messages.filter(isReadableMessage), snapshot.userInput, { eligible, rules: entry => evaluateRules(this.compiledRules, entry) });
-        const picked = await select(this.client, this.#taskView(save), recent, { eligible, selectionLimit: this.settings.selectionLimit,
+        const forced = triggeredIds(save, readable, snapshot.userInput, { eligible, rules });
+        const selectable = entry => eligible(entry) && !gated.has(entry.id);
+        const picked = await select(this.client, this.#taskView(save), recent, { eligible: selectable, selectionLimit: this.settings.selectionLimit,
             selectionChars: this.settings.selectionChars, observedState, forced, authorGuidance: this.rules.naturalLanguage, messageCount: snapshot.messages.length, signal: activity.signal });
         const ids = [...new Set([...forced, ...picked])];
         this.#assertActivity(activity);
@@ -1533,8 +1543,8 @@ export class Controller {
         invariant(save.revision === this.store.state.revision, '选材期间资料更新，请重试本轮');
         // The plan itself carries the live switches too, so injection agrees with selection.
         invariant(JSON.stringify(snapshot.messages.map(m => m.key)) === JSON.stringify(readSnapshot().messages.map(m => m.key)), '选材期间剧情候选已变化，请重试本轮');
-        return { requestId: uid('request'), chatId: snapshot.chatId, mvu: observedState,
-            ...assemblePromptPlan(this.#taskView(save), ids, { eligible, compiledRules: this.compiledRules, configEntryUids: this.rules.configEntryUids }) };
+        return { requestId: uid('request'), chatId: snapshot.chatId, mvu: observedState, triggeredIds: forced, gatedIds: [...gated],
+            ...assemblePromptPlan(this.#taskView(save), ids, { eligible: selectable, compiledRules: this.compiledRules, configEntryUids: this.rules.configEntryUids }) };
     }
 
     async generationBefore({ type, dryRun, isCurrent = () => true, signal } = {}) {
@@ -1687,18 +1697,22 @@ export class Controller {
             const { settled, pending } = prescan(classify);
             const classified = [...settled.values()];
             const groups = batches(pending, this.settings.batchChars, entryText, INITIALIZATION_BATCH_ITEMS);
+            const budget = scanBudget();
             for (let i = 0; i < groups.length; i++) {
                 this.#updateActivity(activity, { label: `扫描变化条目 ${i + 1}/${groups.length}` });
-                const result = await classifyEntries(this.client, groups[i], this.rules.naturalLanguage, signal);
+                const result = await classifyOrDefer(this.client, groups[i], this.rules.naturalLanguage, signal, budget);
                 this.#assertActivity(activity);
                 classified.push(...result.entries);
             }
             const ruled = applyRules(classified, this.compiledRules).entries;
             // Same baseline as initialization, so "恢复原书" restores this classification.
             for (const entry of ruled) if (entry.source && entryText(entry) === entry.source.original) entry.source.baselineSegments = clone(entry.segments);
-            const merges = [];
+            const merges = [], held = [];
             for (const next of ruled) {
                 const change = textChanged.get(next.id);
+                // A refused rescan of a scanned entry is not a sync: its memory and
+                // baseline stay, and the source change stays pending.
+                if (next.scanBlocked && change?.used && change.used.status !== DEFERRED) { held.push(next.id); continue; }
                 base[next.id] = next;
                 const writable = entry => (entry?.segments ?? []).filter(segment => segment.writable).map(segment => segment.text).join('');
                 const touched = change?.used && entryText(change.used) !== change.used.source.original;
@@ -1720,7 +1734,10 @@ export class Controller {
             await this.#saveActivity(activity, () => store.syncSource({ base, data, removed }, { expectedRevision: state.revision }));
             this.#assertActivity(activity);
             this.sourceChanges = sourceBookChanges(store.state, raw, this.rules.configEntryUids);
-            const summary = `原书已同步：新增 ${classify.length - textChanged.size} 条，更新 ${Object.keys(data).length - (classify.length - textChanged.size)} 条（其中 ${merges.length} 条与剧情合并），删除 ${removed.length} 条`;
+            const deferred = ruled.filter(entry => entry.scanBlocked).length - held.length;
+            const summary = `原书${held.length ? '部分' : '已'}同步：新增 ${classify.length - textChanged.size} 条，更新 ${Object.keys(data).length - (classify.length - textChanged.size)} 条（其中 ${merges.length} 条与剧情合并），删除 ${removed.length} 条`
+                + (held.length ? `；${held.length} 条的新版被辅助接口的内容审核拒收，没有同步，原资料保留` : '')
+                + (deferred ? `；${deferred} 条被内容审核拒收，暂按原世界书发送` : '');
             this.#state(summary);
             return { executed: true, message: summary };
         } catch (error) {
@@ -1760,26 +1777,32 @@ export class Controller {
             && new Set(ids).size === ids.length, '请选择 1–1000 个不同条目和有效档位');
         const store = this.store, entries = ids.map(id => store.state.data.entries[id]);
         invariant(entries.every(Boolean), '部分条目已不存在，请重新选择');
-        const items = entries.map(e => ({ id: e.id, expectedVersion: e.version }));
+        let items = entries.map(e => ({ id: e.id, expectedVersion: e.version }));
         const pending = tier === 'off' ? [] : entries.filter(e => e.status === DEFERRED);
         const activity = this.#beginActivity('classify', pending.length ? '正在扫描待启用条目' : '正在批量调整档位');
+        const refused = new Set();
         try {
             if (pending.length) {
                 await this.#loadRules(activity.epoch, activity.chatId, activity.signal);
                 invariant(!this.sourceChanges.changed, '原世界书已变化，请先同步变化的条目再批量启用');
+                const budget = scanBudget();
                 for (const group of batches(pending, this.settings.batchChars, entryText, INITIALIZATION_BATCH_ITEMS)) {
-                    const result = await classifyEntries(this.client, group, this.rules.naturalLanguage, activity.signal);
+                    const result = await classifyOrDefer(this.client, group, this.rules.naturalLanguage, activity.signal, budget);
                     this.#assertActivity(activity);
-                    for (const entry of applyRules(result.entries, this.compiledRules).entries) {
+                    for (const id of result.blocked) refused.add(id);
+                    for (const entry of applyRules(result.entries.filter(entry => !refused.has(entry.id)), this.compiledRules).entries) {
                         const item = items.find(item => item.id === entry.id);
                         invariant(item, '扫描结果包含未知条目'); item.classified = { ...entry, status: 'confirmed' };
                     }
                 }
             }
             this.#assertActivity(activity);
+            // Entries the provider refused to scan keep their tier and stay native.
+            items = items.filter(item => !refused.has(item.id));
+            if (!items.length) throw blockedResponse();
             await this.#saveActivity(activity, () => store.manual({ type: 'tiers', tier, items }, this.host.snapshot().messages.map(m => m.key)));
             this.#assertActivity(activity); this.host.clearPlan();
-            this.#state(`已一次保存 ${items.length} 条的档位`);
+            this.#state(`已一次保存 ${items.length} 条的档位${refused.size ? `；${refused.size} 条被辅助接口的内容审核拒收，档位未变` : ''}`);
             return { executed: true, message: this.status };
         } finally { this.#endActivity(activity); }
     }
