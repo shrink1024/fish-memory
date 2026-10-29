@@ -1050,12 +1050,20 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         if (creating || choice === 'current') form.append(field('配置名称', profileNameDraft, value => { profileNameDraft = value; }, { placeholder: '例如：DS 便宜档', key: 'profile-name', hint: creating ? '起个名字，以后可以一键切换回来。' : '起个名字保存下来，以后可以一键切换。留空就只用这一次。' }).wrap);
         form.append(field('接口地址', connectionDraft.endpoint, value => { connectionDraft.endpoint = value; }, { placeholder: 'https://…/v1', hint: '鱼忆会在后面加上 /chat/completions。' }).wrap,
             field('密钥', connectionDraft.apiKey, value => { connectionDraft.apiKey = value; }, { type: 'password', hint: !creating && view.connection?.hasApiKey ? '已保存密钥；地址不变时留空就继续用。换地址要重新填。' : '只存在这个浏览器。' }).wrap);
-        const model = field('模型', connectionDraft.model, value => { connectionDraft.model = value; }, { key: 'model-name' });
-        const fetchButton = button('获取模型列表', () => call(() => controller.fetchModels({ endpoint: connectionDraft.endpoint, apiKey: connectionDraft.apiKey }), '已获取模型列表'), { ghost: true });
-        model.wrap.append(fetchButton); form.append(model.wrap);
         const listed = view.modelList?.endpoint === connectionDraft.endpoint.trim().replace(/\/$/, '') ? view.modelList.models : [];
-        if (listed.length) form.append(selectField('从列表选择', listed.includes(connectionDraft.model) ? connectionDraft.model : '',
-            [['', `共 ${listed.length} 个模型，选一个填入`], ...listed.map(id => [id, id])], value => { if (value) { connectionDraft.model = value; render(); } }, 'model-list').wrap);
+        form.append(row(button('连接并获取模型', () => call(() => controller.fetchModels({ endpoint: connectionDraft.endpoint, apiKey: connectionDraft.apiKey })),
+            { ghost: true, key: 'fetch-models', disabled: running }),
+            h('span', 'dwm-muted dwm-hint', '先填地址和密钥，再连接；只获取模型列表，不生成内容。')));
+        const modelPicker = selectField('选择模型', listed.includes(connectionDraft.model) ? connectionDraft.model : '',
+            [['', listed.length ? `已获取 ${listed.length} 个模型，请选择` : '连接后在这里选择模型'], ...listed.map(id => [id, id])],
+            value => { if (value) { connectionDraft.model = value; render(); } }, 'model-list');
+        modelPicker.input.disabled = !listed.length || busy || running;
+        form.append(modelPicker.wrap);
+        const model = field('模型 ID（也可手动填写）', connectionDraft.model, value => { connectionDraft.model = value; },
+            { key: 'model-name', hint: '下拉选择后自动填入；接口不提供列表或模型未列出时，可直接手动填写。选好后保存才生效。' });
+        // Keep the dropdown in sync when a model ID is entered manually.
+        model.input.addEventListener('input', () => { modelPicker.input.value = listed.includes(connectionDraft.model) ? connectionDraft.model : ''; });
+        form.append(model.wrap);
         form.append(field('输出上限（可留空）', connectionDraft.maxOutputTokens, value => { connectionDraft.maxOutputTokens = value; }, { type: 'number', placeholder: '留空 = 服务商默认', hint: '思考型模型被截断时可以调大，比如 32768。更大的额度可能更贵。' }).wrap);
         const actions = h('div', 'dwm-row dwm-form-actions');
         if (editingName) actions.append(button('删除这套', () => {

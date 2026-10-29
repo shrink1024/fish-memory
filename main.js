@@ -10,7 +10,7 @@ import { createProblemExporter } from './src/diagnostics/problem-export.js';
 import { createFloatingManager } from './src/ui/floating-manager.js';
 
 // Loaded by index.js. Keep in step with manifest.json; test/version.test.js checks it.
-const PLUGIN_VERSION = '0.4.0';
+const PLUGIN_VERSION = '0.4.1';
 
 async function boot() {
     if (!globalThis.SillyTavern?.getContext || document.getElementById('dynamic-world-memory')) return;

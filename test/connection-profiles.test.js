@@ -133,7 +133,7 @@ test('FM-025: the connection picker switches profiles and saves a new one by nam
     assert.equal(input('接口地址').value, 'https://b.example/v1', 'the form shows the switched connection, not the old draft');
     picker().value = 'new'; picker().dispatch('change');
     assert.equal(input('接口地址').value, '', 'a new connection starts empty');
-    for (const [label, value] of [['配置名称', '新档'], ['接口地址', 'https://c.example/v1'], ['模型', 'm']]) { const field = input(label); field.value = value; field.dispatch('input'); }
+    for (const [label, value] of [['配置名称', '新档'], ['接口地址', 'https://c.example/v1'], ['模型 ID', 'm']]) { const field = input(label); field.value = value; field.dispatch('input'); }
     button('保存并使用').click(); await tick();
     assert.equal(applied[0].endpoint, 'https://c.example/v1');
     assert.deepEqual(saved, ['新档']);

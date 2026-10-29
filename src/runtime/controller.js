@@ -859,7 +859,7 @@ export class Controller {
         const models = await listModels({ endpoint: normalized, apiKey: key });
         this.#modelList = { endpoint: normalized, models };
         this.#notify();
-        return { executed: true, message: `已获取 ${models.length} 个模型，可在“从列表选择”里挑选` };
+        return { executed: true, message: `已获取 ${models.length} 个模型，可在“选择模型”下拉框里挑选` };
     }
     async updateConnection({ mode = 'raw', endpoint, model, apiKey, maxOutputTokens }) {
         invariant(!this.view().activity, '请先停止或等待当前任务完成，再应用连接；当前任务继续运行。');
