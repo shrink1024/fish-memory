@@ -1,10 +1,11 @@
 import { clone } from '../core/util.js';
-import { entryText, scopeSummary, readableScopes, GLOBAL_SCOPE } from '../core/state.js';
+import { encodeSelectionInput } from './selection-codec.js';
+import { entryText, scopeSummary, readableScopes, canCompactEntry, GLOBAL_SCOPE } from '../core/state.js';
 import { frontCatalog, maintenanceView, hasProtectedReferences } from '../core/views.js';
 import { INITIALIZE, ALIGN_STRATEGY, MAINTAIN, MAINTAIN_REWRITE, SELECT, COMPACT } from './prompts.js';
 
 export const INITIALIZATION_BATCH_ITEMS = 24;
-export const isReadableMessage = message => !message.hidden || message.hiddenBy === 'dynamic-world-memory';
+export const isReadableMessage = message => !message.regexSkipped && (!message.hidden || message.hiddenBy === 'dynamic-world-memory');
 
 /** Story text entering an auxiliary task is archival material, not a live
  * turn addressed to the model. Marking the speaker keeps the projection's
@@ -55,18 +56,17 @@ export function selectRequest(save, messages, { eligible = () => true, selection
     messages = messages.filter(isReadableMessage);
     // Entries the program already sends this turn (author triggers) count as constant.
     const catalog = frontCatalog(save, eligible, save.data.scopeContext, messages.map(m => m.key)).map(e => forced.includes(e.id) ? { ...e, constant: true } : e);
-    return clone({ purpose: 'select', system: SELECT,
-        input: { strategy: save.data.strategy, summary: [...readableScopes(save.data.scopeContext)].map(scopeId => { const text = scopeSummary(save.data, scopeId); return text ? (scopeId === GLOBAL_SCOPE ? text : `【范围 ${scopeId}】\n${text}`) : ''; }).filter(Boolean).join('\n\n'),
+    return { purpose: 'select', system: SELECT,
+        input: encodeSelectionInput({ strategy: save.data.strategy, summary: [...readableScopes(save.data.scopeContext)].map(scopeId => { const text = scopeSummary(save.data, scopeId); return text ? (scopeId === GLOBAL_SCOPE ? text : `【范围 ${scopeId}】\n${text}`) : ''; }).filter(Boolean).join('\n\n'),
             scopeContext: { activeScopeId: save.data.scopeContext?.activeScopeId ?? GLOBAL_SCOPE, requestedScopeIds: save.data.scopeContext?.requestedScopeIds ?? [] }, selectionLimit, selectionChars, catalog,
             ...(observedState ? { observedState } : {}), ...(authorGuidance ? { authorGuidance } : {}),
             ...(Number.isInteger(messageCount) ? { progress: { messageCount } } : {}),
-            messages: messages.map(({ key, role, content }) => ({ key, role: sourceRole(role), content, source: '存档正文' })) } });
+            messages: messages.map(({ key, role, content }) => ({ key, role: sourceRole(role), content, source: '存档正文' })) }, Object.keys(save.data.entries)) };
 }
 export function compactRequest(save, scopeId = GLOBAL_SCOPE, { summaryOnly = false } = {}) {
     const memory = maintenanceView(save, scopeId);
     delete memory.catalog;
-    memory.entries = memory.entries.filter(e => !summaryOnly && e.kind === 'event').map(e => ({ ...e,
-        mergeable: !save.data.entries[e.id].source && save.data.entries[e.id].segments.every(s => s.writable) }));
+    memory.entries = memory.entries.filter(e => !summaryOnly && canCompactEntry(save.data.entries[e.id])).map(e => ({ ...e, mergeable: true }));
     return { purpose: 'compact', system: COMPACT, input: { memory, ...referenceInstructions(memory) } };
 }
 export function requestBatches(items, maxChars, text = item => item.content, maxItems = Infinity) {

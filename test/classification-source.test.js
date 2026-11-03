@@ -105,6 +105,7 @@ test('task validation runs inside the instrumented client acceptance boundary', 
     await assert.rejects(classifyEntries(client, [source()]));
     await assert.rejects(select(client, createSave('chat', 'book'), []));
     await assert.rejects(alignStrategy(client, ['a', 'b'], [], ''));
-    await assert.rejects(compact(client, createSave('chat', 'book')));
+    const compactSave=createSave('chat','book');compactSave.data.summary='合成脉络';
+    await assert.rejects(compact(client, compactSave));
     assert.equal(caught, 4);
 });

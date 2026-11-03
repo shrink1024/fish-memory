@@ -1,3 +1,4 @@
+import { readStreamResponse } from '../agents/stream-response.js';
 import { throwIfAborted } from '../platform/abort.js';
 import { auxiliaryResponseLength, assertCompleteModelResponse, boundedResponseLength, modelApiError, requestMessages } from '../agents/client.js';
 
@@ -16,7 +17,7 @@ export async function generateAuxiliary({ params, context, script, openai, textg
         const model = openai.getChatCompletionModel(settings);
         const metadata = openai.model_list?.find(item => item.id === model);
         const responseLength = boundedResponseLength(requestedLength, settings.openai_max_tokens, metadata);
-        Object.assign(settings, { openai_max_tokens: responseLength, stream_openai: false, n: 1,
+        Object.assign(settings, { openai_max_tokens: responseLength, stream_openai: Boolean(params.stream), n: 1,
             function_calling: false, enable_web_search: false, request_images: false });
         // The story's thinking effort is not inherited unless the player asks.
         if (params.reasoningEffort && params.reasoningEffort !== 'inherit') settings.reasoning_effort = params.reasoningEffort;
@@ -49,7 +50,7 @@ export async function generateAuxiliary({ params, context, script, openai, textg
     // actual message terminators so text-completion models can end a reply.
     for (const key of ['stop', 'stopping_strings', 'grammar', 'grammar_string', 'guided_grammar', 'json_schema', 'guided_json',
         'tools', 'tool_choice', 'logprobs', 'top_logprobs']) delete data[key];
-    data.stream = false;
+    data.stream = Boolean(params.stream);
     if (typeof data.n === 'number') data.n = 1;
     else delete data.n;
     if (templateStops.length) { data.stop = templateStops; data.stopping_strings = templateStops; }
@@ -58,15 +59,32 @@ export async function generateAuxiliary({ params, context, script, openai, textg
         body: JSON.stringify(data), signal });
     throwIfAborted(signal);
     if ([401, 403].includes(response.status)) throw modelApiError(null, response.status);
-    let payload;
-    try { payload = await response.json(); }
-    catch {
+    let payload, plainJson = false;
+    const contentType = response.headers?.get('content-type') ?? '';
+    // ST's forwardFetchResponse pipes successful SSE without forwarding its
+    // Content-Type. A requested native stream is therefore also authoritative
+    // for a readable, non-JSON success response. HTTP errors still use JSON.
+    const streamed = params.stream && (contentType.includes('text/event-stream')
+        || response.ok && response.body?.getReader && !/application\/(?:[\w.-]+\+)?json\b/i.test(contentType));
+    try { payload = streamed
+        ? await readStreamResponse(response, { signal, onProgress: params.onProgress,
+            allowJson: !contentType.includes('text/event-stream'), onJson: () => { plainJson = true; },
+            // TT forwards some upstream failures as a synthetic assistant SSE
+            // message instead of an error event. This exact native envelope is
+            // not interpreted on ST or on a direct compatible connection.
+            mapContentError: globalThis.__TAURITAVERN__ ? content => {
+                const match=/^\[API 错误\]\s*\n(Custom OpenAI endpoint failed with status [45]\d\d:[\s\S]*)$/.exec(content);
+                return match ? modelApiError({error:{message:match[1]}},response.status,{nativeTauri:true}) : null;
+            } : undefined,
+            mapError: value => modelApiError(value, response.ok ? undefined : response.status) }) : await response.json(); }
+    catch (error) {
         throwIfAborted(signal);
+        if (error?.dwmStreamFault) throw error;
         if (!response.ok) throw modelApiError(null, response.status);
         throw new Error('酒馆辅助接口未返回有效的 JSON 响应，本次未采用。请检查收发记录与连接后重试。');
     }
     throwIfAborted(signal);
     if (!response.ok || payload?.error) throw modelApiError(payload, response.ok ? undefined : response.status);
     assertCompleteModelResponse(payload);
-    return script.extractMessageFromData(payload, api);
+    return streamed && !plainJson ? payload.choices[0].message.content : script.extractMessageFromData(payload, api);
 }

@@ -1,3 +1,4 @@
+import { createPromptRegex } from './prompt-regex.js';
 /** SillyTavern boundary. All persistent state belongs to the current chat. */
 import { tauriPersistence } from './tauritavern.js';
 import { lukerPersistence } from './luker.js';
@@ -117,6 +118,14 @@ export async function createSillyTavernHost(deps = {}) {
         if (!value) throw new Error('SillyTavern context unavailable');
         return value;
     };
+    let regexEngine = deps.regex;
+    if (!regexEngine && !deps.script) {
+        try { regexEngine = await import('/scripts/extensions/regex/engine.js'); } catch { /* Snapshot records the unavailable host capability. */ }
+    }
+    const promptRegex = createPromptRegex({ engine: regexEngine,
+        macroContext: () => ({char:ctx().name2 ?? '',user:ctx().name1 ?? '',characterId:ctx().characterId ?? ctx().this_chid ?? null}),
+        disabled: () => Boolean((ctx().extensionSettings ?? extensions.extension_settings)?.disabledExtensions?.includes('regex')),
+        warn: (code, message) => { if (!deps.script || deps.regex) warn(code, message); } });
     const persistence = await tauriPersistence(deps, script) ?? lukerPersistence(deps, script);
     const enqueueSave = task => persistence ? persistence.enqueue(task) : task();
     /** Prompt Template readiness. A zip install keeps names like
@@ -251,15 +260,17 @@ export async function createSillyTavernHost(deps = {}) {
         messageTimers.clear();
     }
 
-    function snapshot(readOnly = false) {
+    function snapshot(readOnly = false, promptOptions = {}) {
         const live = ctx();
         const character = live.characters?.[live.characterId ?? live.this_chid];
         const bookName = primaryBookName(character);
         const chatId = currentIdentity(live);
+        const projected = promptOptions.project === false ? (live.chat ?? []).map(m=>({content:String(m.mes??''),regexSkipped:false})) : promptRegex.project(live.chat ?? [], promptOptions);
         const messages = (live.chat ?? []).map((message, index) => ({
             key: messageKey(message, index, readOnly),
             role: message.is_user ? 'user' : message.extra?.dwmHidden?.owner === OWNER ? 'assistant' : message.is_system ? 'system' : 'assistant',
-            content: String(message.mes ?? ''),
+            content: projected[index].content,
+            ...(projected[index].regexSkipped ? { regexSkipped: true } : {}),
             index,
             hidden: Boolean(message.is_system || (windowChatId === chatId && windowKeys.has(messageKey(message, index, readOnly)))),
             hiddenBy: message.extra?.dwmHidden?.owner === OWNER || (!message.is_system && windowChatId === chatId && windowKeys.has(messageKey(message, index, readOnly))) ? OWNER : null,
@@ -277,14 +288,14 @@ export async function createSillyTavernHost(deps = {}) {
     }
 
     function captureReplacement(type) {
-        const at = snapshot(), tail = at.messages.at(-1);
+        const at = snapshot(false,{project:false}), tail = at.messages.at(-1);
         if (!['regenerate', 'swipe'].includes(type) || tail?.role !== 'assistant') return null;
         return { type, chatId: at.chatId, sourceKeys: at.messages.map(m => m.key),
             prefixKeys: at.messages.slice(0, -1).map(m => m.key), deleted: false, received: false };
     }
 
     function pendingReplacement() {
-        const at = snapshot(), keys = at.messages.map(m => m.key);
+        const at = snapshot(false,{project:false}), keys = at.messages.map(m => m.key);
         const same = path => JSON.stringify(path) === JSON.stringify(keys);
         if (replacement?.chatId === at.chatId) {
             if (replacement.received) return null;
@@ -301,8 +312,9 @@ export async function createSillyTavernHost(deps = {}) {
         return null;
     }
 
-    function generationSnapshot() {
-        const at = snapshot(), pending = pendingReplacement();
+    function generationSnapshot({ type = 'normal' } = {}) {
+        const pending = pendingReplacement();
+        const at = snapshot(false, { type, ...(pending ? { end: pending.prefixKeys.length } : {}) });
         return pending ? { ...at, messages: at.messages.slice(0, pending.prefixKeys.length), userInput: '' } : at;
     }
 
@@ -427,8 +439,14 @@ export async function createSillyTavernHost(deps = {}) {
         }
     }
 
+    function listWorldbooks() {
+        const names = Array.isArray(worldInfo.world_names) ? worldInfo.world_names : [];
+        const current = worldbookContext(), attached = new Set([current.primaryName, ...supplementaryBooks()]);
+        return [...new Set(names)].map(name => { const cached=worldInfo.worldInfoCache?.get?.(name); return { name, bound: attached.has(name), primary: name === current.primaryName, ...(cached?.entries ? {entryCount:Object.keys(cached.entries).length} : {}) }; });
+    }
     async function loadWorldbook(bookName = worldbookContext().primaryName) {
         if (!bookName) return [];
+        if (bookName !== worldbookContext().primaryName && Array.isArray(worldInfo.world_names) && !worldInfo.world_names.includes(bookName)) throw new Error('来源世界书不可用，现有资料保留。');
         const target = worldbookContext(), serial = worldbookCheckSerial;
         const primary = target.state === 'bound' && target.primaryName === bookName;
         let entries;
@@ -520,12 +538,12 @@ export async function createSillyTavernHost(deps = {}) {
         // ST counts the messages it will scan, excluding ordinary is_system
         // messages and removing the previous reply for swipe. We use the
         // visible-chat lower bound; interceptors may further reduce it.
-        const managed = Boolean(entry?.source?.book) && entry.source.book === snapshot().bookName;
+        const managed = Boolean(entry?.source?.book) && (entry.source.book === primaryBookName(character) || entry.source.external === true);
         if (!managed && (native.delay || native.cooldown || native.sticky)) {
             if (!Array.isArray(live.chat)) return uncertain('无法读取原生时间条件');
             const visibleCount = Math.max(0, live.chat.filter(message => !message.is_system).length - (type === 'swipe' ? 1 : 0));
             if (native.delay && visibleCount < Number(native.delay)) return false;
-            const book = entry?.source?.book ?? snapshot().bookName;
+            const book = entry?.source?.book ?? primaryBookName(character);
             const uid = entry?.source?.uid ?? native.uid;
             if (book && uid !== undefined && uid !== null) {
                 const effects = live.chatMetadata?.timedWorldInfo;
@@ -912,12 +930,24 @@ export async function createSillyTavernHost(deps = {}) {
             // possibly in-flight prompt and never alter native button state.
             guardReleasedInput(run);
             releaseInput(run);
+            // A failed native ping may end before the draft is consumed. This
+            // is enough to release an initialization wait, but not enough to
+            // discard a prepared memory plan or take over native button state.
+            if (normalInput(run) && !run.inputConsumed && run.input?.trim()
+                && run.chatId === currentIdentity(ctx()) && ctx().chat?.length === run.sentIndex
+                && snapshot().userInput === run.input && script.isGenerating?.() === false) {
+                run.scanReleasedBeforeInput = true;
+                controller.generationPreSendIdle?.();
+            }
         };
         const consumeInput = index => {
             const run = currentRun, message = ctx().chat?.[index];
             if (!run || run.phase !== 'native' || run.cancelled || run.chatId !== currentIdentity(ctx())
                 || index !== run.sentIndex || !message?.is_user) return;
             run.inputConsumed = true; run.replyIndex = index + 1;
+            // A global END can be foreign. If this send subsequently resumes,
+            // hold the scan again until its actual selected reply is finalized.
+            if (run.scanReleasedBeforeInput) controller.generationInputConsumed?.();
             removeInputGuard(run);
             releaseInput(run);
         };
@@ -987,6 +1017,10 @@ export async function createSillyTavernHost(deps = {}) {
                 } catch (error) {
                     run.cancelled = true; run.abort.abort();
                     releaseLock(run, true);
+                    // This preflight is definitely cancelled; unlike a global
+                    // ENDED event it cannot still produce a native reply. Only
+                    // its owner may release a scan waiting for that reply.
+                    if (active && run === currentRun) Promise.resolve(controller.generationEnded?.()).catch(console.error);
                     throw error;
                 }
             };
@@ -1143,7 +1177,7 @@ export async function createSillyTavernHost(deps = {}) {
         return result;
     }
 
-    return { supplementaryBooks, readSupplementaryBook, snapshot, generationSnapshot, pendingReplacement, previewSnapshot: () => snapshot(true), previewEligible: entry => eligible(entry, { silent: true, type: 'normal' }), loadWorldbook, worldbookStatus, checkWorldbook, eligible, storage, setPlan, clearPlan, applyWorldInfoEntries, applyWindow, restoreLegacyWindow, filterOutgoingHistory, bindController, rawGenerate, stopGeneration, auxiliaryReadiness,
+    return { statusSnapshot: () => snapshot(true,{project:false}), listWorldbooks, promptRegexSignature: promptRegex.signature, supplementaryBooks, readSupplementaryBook, snapshot, generationSnapshot, pendingReplacement, previewSnapshot: () => snapshot(true), previewEligible: entry => eligible(entry, { silent: true, type: 'normal' }), loadWorldbook, worldbookStatus, checkWorldbook, eligible, storage, setPlan, clearPlan, applyWorldInfoEntries, applyWindow, restoreLegacyWindow, filterOutgoingHistory, bindController, rawGenerate, stopGeneration, auxiliaryReadiness,
         readMvu: settings => readMvuProjection({ context: ctx, settings, globals: deps.globals ?? globalThis }),
         getWarnings: () => copy(warnings), windowStatus: () => copy(outgoingWindow) };
 }

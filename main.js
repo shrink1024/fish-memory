@@ -1,16 +1,17 @@
-import { mountToolbarEntry } from './src/ui/toolbar-entry.js';
+import { watchToolbarEntry } from './src/ui/toolbar-entry.js';
 import { orderedPresetEntries } from './src/agents/preset-application.js';
 import { createSillyTavernHost } from './src/adapters/sillytavern.js';
-import { createSettingsPersistence } from './src/adapters/settings.js';
+import { createSettingsPersistence, initialSettings } from './src/adapters/settings.js';
 import { Controller } from './src/runtime/controller.js';
 import { mountPanel } from './src/ui/panel.js';
 import { createTraceStore } from './src/diagnostics/trace-store.js';
 import { installCapture } from './src/diagnostics/capture.js';
 import { createProblemExporter } from './src/diagnostics/problem-export.js';
 import { createFloatingManager } from './src/ui/floating-manager.js';
+import { lazyShortStatus } from './src/ui/lazy-copy.js';
 
 // Loaded by index.js. Keep in step with manifest.json; test/version.test.js checks it.
-const PLUGIN_VERSION = '0.4.1';
+const PLUGIN_VERSION = '1.1.0';
 
 async function boot() {
     if (!globalThis.SillyTavern?.getContext || document.getElementById('dynamic-world-memory')) return;
@@ -46,7 +47,9 @@ async function boot() {
             entries: orderedPresetEntries(openai.oai_settings?.prompts ?? [], order) };
     };
     const extensionSettings = context.extensionSettings ?? (await import('/scripts/extensions.js')).extension_settings;
-    const settings = extensionSettings.dwm ?? {};
+    const freshInstall = extensionSettings.dwm == null;
+    const settings = initialSettings(extensionSettings);
+    extensionSettings.dwm = settings;
     const connectionStore = {
         key: 'dwm:auxiliary-connection',
         load() { return JSON.parse(globalThis.localStorage?.getItem(this.key) ?? 'null'); },
@@ -90,24 +93,33 @@ async function boot() {
     const mount = document.createElement('div'); mount.id = 'dynamic-world-memory';
     const drawer = document.createElement('details');
     const title = document.createElement('summary'); title.textContent = '鱼忆｜动态世界书与记忆';
+    // 超级懒人模式在这里也给出状态和小点：顶栏按钮点不动时，玩家仍能从扩展设置看到并打开。
+    const extDot = document.createElement('span'); extDot.className = 'dwm-ext-dot'; extDot.hidden = true; extDot.setAttribute('aria-hidden', 'true'); title.append(extDot);
+    const extStatus = document.createElement('p'); extStatus.className = 'dwm-ext-status'; extStatus.hidden = true; extStatus.setAttribute('role', 'status');
     const openManager = document.createElement('button'); openManager.type = 'button'; openManager.textContent = '打开管理窗口';
-    const manager = createFloatingManager(document);
+    const manager = createFloatingManager(document, { bubbleVisible: !freshInstall });
     manager.body.append(mount);
     const showManager = event => manager.open(event);
     const bindManagerEntry = button => manager.bindEntry(button);
-    let toolbarButton = null;
     bindManagerEntry(openManager);
-    drawer.append(title, openManager);
+    drawer.append(title, extStatus, openManager);
     (document.querySelector('#extensions_settings2') ?? document.querySelector('#extensions_settings') ?? document.body).append(drawer);
-    toolbarButton = mountToolbarEntry(document, bindManagerEntry);
+    const toolbarWatch = watchToolbarEntry(document, bindManagerEntry);
     const problems = createProblemExporter({ controller, context: () => {
         const live = SillyTavern.getContext();
         return { chatId: live.getCurrentChatId?.() ?? live.chatId ?? '', character: live.name2 ?? '', memoryChatId: host.snapshot().chatId,
             pluginVersion: PLUGIN_VERSION, mainApi: live.mainApi, browser: navigator.userAgent };
     } });
     const panel = mountPanel(mount, controller, { exportProblem: () => problems.export(),
-        statusSlot: manager.statusSlot, titleSlot: manager.titleSlot, appearance: { dock: () => manager.dock(), setDock: patch => manager.setDock(patch) } });
-    const renderManagerStatus = () => manager.render(controller.uiStatus());
+        statusSlot: manager.statusSlot, titleSlot: manager.titleSlot,
+        appearance: { dock: () => manager.dock(), setDock: patch => manager.setDock(patch), setVariant: variant => manager.setVariant(variant) } });
+    const renderManagerStatus = () => {
+        const status = controller.uiStatus(), lazy = Boolean(status.lazy?.enabled), attention = lazy && status.enabled !== false && Boolean(status.lazy.attention);
+        manager.render(status);
+        extDot.hidden = !attention; extStatus.hidden = !lazy; extStatus.classList.toggle('dwm-ext-attention', attention);
+        const state = document.createElement('b'); state.textContent = lazyShortStatus(status);
+        extStatus.replaceChildren('超级懒人模式 · ', state);
+    };
     const unsubscribeManager = controller.subscribe(renderManagerStatus);
     renderManagerStatus();
     globalThis.dwmFilterOutgoingHistory = (...args) => host.filterOutgoingHistory(...args);
@@ -130,6 +142,7 @@ async function boot() {
     globalThis.addEventListener('pagehide', event => {
         if (event.persisted) return;
         controller.cancel('页面已关闭，辅助等待已结束');
+        toolbarWatch.destroy();
         unsubscribeManager();
         panel.destroy();
         manager.destroy();

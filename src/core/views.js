@@ -12,6 +12,11 @@ const legacyMarkerOperations = new WeakMap();
 const REFERENCE_PREFIX = '⟦鱼忆引用:';
 const referencePattern = () => /⟦鱼忆引用:[^⟧]*(?:⟧|$)/gu;
 
+export function projectProtectedReferences(original, projected) {
+    const source=protectedReferences.get(original);
+    if(source)protectedReferences.set(projected,new Map([...source].filter(([token,ref])=>referenceSource(projected,ref.source)?.includes(token))));
+    return projected;
+}
 export function hasProtectedReferences(memory) { return Boolean(protectedReferences.get(memory)?.size); }
 
 function referenceSource(memory, source) {
@@ -29,7 +34,7 @@ function referenceAllowed(source, operation, path) {
         return path.length === 3 && path[0] === 'segments' && path[2] === 'text' && source[2] === 'segment'
             && operation.segments[path[1]]?.id === source[3];
     }
-    if (operation.type === 'mergeEvents' && source[0] === 'entry' && operation.sources?.some(entry => entry.id === source[1])) {
+    if (['mergeEvents', 'mergeEntries'].includes(operation.type) && source[0] === 'entry' && operation.sources?.some(entry => entry.id === source[1])) {
         return path.length === 1 && (path[0] === 'text' ? source[2] === 'segment'
             : ['title', 'intro', 'retrieveWhen'].includes(path[0]) && path[0] === source[2]);
     }
@@ -88,7 +93,7 @@ function legacyMarkersAllowed(memory, operation, used) {
             return output.every((count, index) => count <= (input[index] ?? 0));
         }) && fields.every(({ path }) => path.length === 3 && path[0] === 'items' && ['name', 'description'].includes(path[2]));
     }
-    if (operation.type === 'mergeEvents') {
+    if (['mergeEvents', 'mergeEntries'].includes(operation.type)) {
         const sources = (operation.sources ?? []).map(item => entry(item?.id)).filter(Boolean);
         if (!sources.length || !fields.every(({ path, count }) => path.length === 1 && count <= sameKind(sources, path))) return false;
         // Merged sources are removed; the same source must not also be carried
@@ -168,7 +173,7 @@ export function maintenanceView(save, scopeId = GLOBAL_SCOPE, { includeProvenanc
     const writable = Object.values(save.data.entries).filter(e => e.enabled && entryScope(e) === scopeId && e.segments.some(s => s.writable));
     const catalog = focus ? writable.filter(e => !focus.has(e.id)) : [];
     const view = {
-        scopeId, strategy: save.data.strategy, summary: scopeSummary(save.data, scopeId),
+        scopeId, strategy: save.data.strategy,
         entries: writable.filter(e => !focus || focus.has(e.id))
             .map(e => ({ id: e.id, scopeId: entryScope(e), title: e.title, kind: e.kind,
                 // A mixed entry's introduction may quote a protected segment.
@@ -179,6 +184,7 @@ export function maintenanceView(save, scopeId = GLOBAL_SCOPE, { includeProvenanc
                 ...(includeProvenance ? { evidence: clone(e.evidence), lastEvidence: clone(e.lastEvidence ?? e.evidence),
                     evidenceTrimmed: Boolean(e.evidenceTrimmed), lineage: clone(e.lineage ?? []) } : {}) })),
         ...(catalog.length ? { catalog: catalog.map(e => ({ id: e.id, title: e.title, kind: e.kind, intro: e.intro.length > 80 ? `${e.intro.slice(0, 80)}…` : e.intro })) } : {}),
+        summary: scopeSummary(save.data, scopeId),
         ...(save.data.inventoryEnabled ? { inventory: clone(scopeInventory(save.data, scopeId)) } : {}),
     };
     // Keep references reversible only for text already present in this writable
@@ -231,10 +237,27 @@ export function memoryMetrics(save) {
         eventChars: entries.filter(e => e.enabled && e.kind === 'event').reduce((sum, e) => sum + entryText(e).length, 0),
         summaryChars: save.data.summary.length + Object.values(save.data.scopeSummaries ?? {}).reduce((sum, text) => sum + text.length, 0) };
 }
+const restoreCache = new WeakMap();
+function restoreChanges(save) {
+    const cached=restoreCache.get(save);
+    if(cached?.revision===save.revision)return cached.value;
+    const value=Object.fromEntries(Object.values(save.data.entries).filter(e=>e.source).map(e=>{
+            const baseline=save.base.entries[e.id];
+            const segments=e.source.baselineSegments??baseline?.segments??[{id:'body',text:e.source.original,writable:false}];
+            const changed=e.title!==(baseline?.title??e.title)||e.kind!==(baseline?.kind??e.kind)||e.needsReview!==Boolean(baseline?.needsReview)||JSON.stringify(e.segments)!==JSON.stringify(segments)||e.intro!==(baseline?.intro??'')||e.retrieveWhen!==(baseline?.retrieveWhen??'')
+                || scannedTier({...e,tier:undefined})!==scannedTier(baseline??e) || e.tier && e.tier!==scannedTier(baseline??e)
+                || save.audit.some(r=>r.entryId===e.id&&!['tier','tiers','tier-reset','extra-book'].includes(r.reason));
+            return [e.id,Boolean(changed)];
+        }));
+    restoreCache.set(save,{revision:save.revision,value});return value;
+}
 export function playerView(save) {
     return clone({ id: save.id, revision: save.revision, initialized: save.initialized,
         bookName: save.bookName, preferences: save.preferences ?? {}, data: save.data, processedCount: save.processed.length,
         inventoryNeedsCatchUp: save.inventoryDisabledAt !== null, audit: save.audit,
+        restoreChanges: restoreChanges(save),
+        // Read-only, so the player can compare before choosing how to settle it.
+        sourceHeld: Object.fromEntries(Object.entries(save.sourceHeld ?? {}).map(([id, item]) => [id, { title: item.next?.title ?? '', text: item.next ? entryText(item.next) : '' }])),
         scannedTiers: Object.fromEntries(Object.values(save.base?.entries ?? {}).map(e => [e.id, scannedTier(e)])) });
 }
 

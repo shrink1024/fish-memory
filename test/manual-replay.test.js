@@ -64,5 +64,5 @@ test('tier changes, single and batch, survive a reroll of the reply they were ma
     assert.equal(entryTier(store.state.data.entries.gate), 'constant');
     assert.equal(entryTier(store.state.data.entries.world), 'off');
     assert.equal(store.state.data.entries.world.enabled, false);
-    assert.ok(store.state.audit.some(item => item.entryId === 'gate' && item.reason === 'tier'), 'their audit records are kept');
+    assert.ok(!store.state.audit.some(item => ['tier','tiers','tier-reset'].includes(item.reason)), 'tier replay does not add audit noise');
 });

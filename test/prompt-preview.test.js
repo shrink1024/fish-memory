@@ -1,3 +1,4 @@
+import {compactPlans} from '../src/agents/compact-plan.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createSave, createEntry, makeSourceEntry, DEFAULT_SETTINGS } from '../src/core/state.js';
@@ -61,10 +62,10 @@ test('executing all five tasks uses the same projections as the request factorie
     await maintain(client, save, snapshot.messages);
     await compact(client, save);
     assert.deepEqual(calls, [initializeRequest(entries, '作者规则'), strategyRequest(['甲', '乙'], entries, '作者规则'),
-        selectRequest(save, snapshot.messages, { selectionLimit: 7, selectionChars: 8000 }), maintainRequest(save, snapshot.messages), compactRequest(save)]);
+        selectRequest(save, snapshot.messages, { selectionLimit: 7, selectionChars: 8000 }), maintainRequest(save, snapshot.messages), ...compactPlans(compactRequest(save)).map(p=>p.request)]);
     assert.equal(await alignStrategy(client, ['', '甲', '甲'], entries, ''), '甲');
     assert.equal(strategyRequest(['甲', '甲'], entries, ''), null);
-    assert.equal(calls.length, 5);
+    assert.equal(calls.length, 4+compactPlans(compactRequest(save)).length);
 });
 
 test('current preview matches real task inputs while preserving backlog and unsent draft boundaries', async () => {
@@ -188,8 +189,9 @@ test('compact preview includes only active-scope events and accurately marks mer
     }
     const compactStage = get(buildPromptPreview(f), 'compact');
     assert.equal(compactStage.status, 'conditional');
-    assert.equal(compactStage.input.memory.summary, '第二世界的脉络');
-    assert.deepEqual(compactStage.input.memory.entries.map(entry => [entry.id, entry.mergeable]), [['local', true], ['original', false]]);
-    assert.deepEqual(inputAndSystem(compactStage), inputAndSystem(compactRequest(f.save, 'world:2')));
+    assert.equal(compactStage.input.memory.summary, '', '事件批次不重复携带脉络');
+    assert.equal(compactPlans(compactRequest(f.save,'world:2')).find(p=>p.summaryIndex===0).request.input.memory.summary,'第二世界的脉络');
+    assert.deepEqual(compactStage.input.memory.entries.map(entry => [entry.id, entry.mergeable]), [['local', true]]);
+    assert.deepEqual(inputAndSystem(compactStage), inputAndSystem(compactPlans(compactRequest(f.save, 'world:2'))[0].request));
     assert.match(compactStage.uncertainties.join(''), /48000/);
 });

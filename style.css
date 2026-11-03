@@ -37,9 +37,9 @@
 .dwm-management-chrome { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; min-width: 0; height: 46px; padding: 0 6px 0 14px; border-bottom: 1px solid var(--dwm-float-line); cursor: grab; user-select: none; -webkit-user-select: none; touch-action: none; }
 #dwm-management-dialog:not([data-layout='window']) .dwm-management-chrome { cursor: default; touch-action: auto; }
 .dwm-management-chrome:active { cursor: grabbing; }
-.dwm-management-heading { display: flex; align-items: center; gap: 8px; flex: 0 1 auto; min-width: 0; }
+.dwm-management-heading { display: flex; align-items: center; gap: 8px; flex: 0 1 auto; min-width: min-content; }
 .dwm-management-logo { flex: 0 0 22px; width: 22px; height: 22px; fill: none; stroke: var(--dwm-float-accent); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.dwm-management-heading strong { font-size: 14px; font-weight: 650; color: inherit; flex: 0 0 auto; }
+.dwm-management-heading strong { font-size: 14px; font-weight: 650; color: inherit; flex: 0 0 auto; white-space: nowrap; }
 .dwm-management-subtitle { min-width: 0; font-size: 12px; color: var(--dwm-float-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dwm-management-status { display: flex; justify-content: flex-end; flex: 1 1 auto; min-width: 0; cursor: auto; }
 .dwm-floating-root .dwm-management-icon { appearance: none; display: grid; place-items: center; flex: 0 0 auto; width: 32px; height: 32px; padding: 0; margin: 0; border: 0; border-radius: 7px; color: var(--dwm-float-muted); background: transparent; cursor: pointer; touch-action: manipulation; }
@@ -89,3 +89,17 @@
 #dwm-toolbar-entry { display: flex; align-items: center; justify-content: center; min-width: 32px; }
 #dwm-toolbar-button { appearance: none; width: 100%; max-width: 44px; min-height: min(44px, var(--topBarBlockSize, 44px)); margin: 0; border: 0; border-radius: 4px; background: transparent; color: inherit; line-height: 1; }
 #dwm-toolbar-button:focus-visible { opacity: 1; outline: 2px solid currentColor; outline-offset: 2px; }
+
+/* 超级懒人模式: a narrow window that grows with its content, and a yellow dot on every entry when the player must look. */
+#dwm-management-dialog[data-variant='lazy'][data-layout='window'] { height: auto; }
+#dwm-management-dialog[data-variant='lazy'] .dwm-resize { display: none; }
+.dwm-floating-root { --dwm-float-warn: #b88a2e; }
+.dwm-floating-root .dwm-floating-bubble[data-attention='true'] { border-color: var(--dwm-float-warn); }
+.dwm-floating-root[data-bubble-size='compact'] .dwm-floating-bubble[data-state='attention'][data-attention='true']::after { background: var(--dwm-float-warn); }
+#dwm-toolbar-button { position: relative; }
+#dwm-toolbar-button[data-dwm-attention='true']::after { content: ''; position: absolute; top: 18%; right: 14%; width: 8px; height: 8px; border-radius: 50%; background: #b88a2e; box-shadow: 0 0 0 2px var(--SmartThemeBlurTintColor, #222); }
+.dwm-ext-dot { display: inline-block; width: 8px; height: 8px; margin-left: 8px; border-radius: 50%; background: #b88a2e; vertical-align: middle; }
+:is(.dwm-ext-dot, .dwm-ext-status)[hidden] { display: none; }
+.dwm-ext-status { margin: 6px 0; font-size: 12.5px; line-height: 1.55; opacity: .85; }
+.dwm-ext-status b { font-weight: 600; }
+.dwm-ext-status.dwm-ext-attention b { color: #b88a2e; }

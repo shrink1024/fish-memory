@@ -49,7 +49,7 @@ function fixture(extra = {}) {
 test('building memory skips the optional preset scan even when it is available and would fail', async t => {
     const f = fixture(); t.after(() => f.panel.destroy());
     assert.match(f.root.textContent, /预设可在“设置 → 预设应用”中选择或扫描推荐，不影响建立记忆/);
-    f.button('建立此存档记忆').click(); await tick();
+    f.button('开始初始化').click(); await tick();
     assert.deepEqual(f.calls, { initialize: 1, preset: 0 });
     assert.match(f.root.textContent, /合成建档完成/);
     f.button('设置').click(); f.button('预设应用').click();
@@ -83,7 +83,7 @@ test('worldbook diagnosis and a separate check action are available before initi
         worldbook: { state: 'unbound', primaryName: null, message: '角色尚未绑定主世界书；只检测到附加书。' } });
     t.after(() => f.panel.destroy());
     assert.match(f.root.textContent, /只检测到附加书/);
-    assert.equal(f.button('建立此存档记忆').disabled, true);
+    assert.equal(f.button('开始初始化').disabled, true);
     assert.equal(f.button('重新检查世界书').disabled, false);
     f.button('重新检查世界书').click(); await tick();
     assert.equal(f.calls.initialize, 0);

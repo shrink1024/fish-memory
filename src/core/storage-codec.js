@@ -37,7 +37,8 @@ function denseArray(value) {
     return value;
 }
 function bounded(metric) {
-    invariant(metric.chars <= MAX_EXPANDED_CHARS && metric.count <= MAX_EXPANDED_NODES, '存档展开后过大，超过安全上限');
+    if (metric.chars > MAX_EXPANDED_CHARS) throw Object.assign(new Error('存档容量不足：本次改动没有保存，原资料保留。请先导出备份，再删减部分资料。'), {kind:'capacity',dwmCapacity:{required:metric.chars,limit:MAX_EXPANDED_CHARS}});
+    invariant(metric.count <= MAX_EXPANDED_NODES, '存档展开后过大，超过安全上限');
     invariant(metric.depth <= MAX_DEPTH, '存档嵌套深度超过上限');
     return metric;
 }
@@ -120,13 +121,23 @@ function poolTree(value) {
         return index;
     };
     const root = visit(value);
-    return { pool, root };
+    return { pool, root, chars: metrics[root].chars };
 }
 
+const encodedSizes = new WeakMap();
+/** Transfer a size only after successful persistence of this immutable snapshot. */
+export function rememberEncodedSize(target, source) {
+    if (encodedSizes.has(source)) encodedSizes.set(target, encodedSizes.get(source));
+}
+export function savedCapacityPercent(save) {
+    const chars = encodedSizes.get(save) ?? expandedChars(save);
+    return Math.min(100, Math.round(chars / MAX_EXPANDED_CHARS * 1000) / 10);
+}
 export function encodeSave(save) {
     const identity = header(save);
     invariant(dataProperty(save, 'schema') === 2, '不支持的内存存档格式，请勿覆盖现有数据');
-    const { pool, root } = poolTree(save);
+    const { pool, root, chars } = poolTree(save);
+    encodedSizes.set(save, chars);
     return { schema: STORAGE_SCHEMA, encoding: STORAGE_ENCODING, ...identity, pool, root };
 }
 
@@ -158,5 +169,9 @@ export function decodeSave(stored) {
     };
     const decoded = expand(root);
     invariant(decoded?.schema === 2 && HEADER_KEYS.every(key => decoded[key] === identity[key]), '存档池内容与外层身份不一致');
+    encodedSizes.set(decoded, metrics[root].chars);
     return decoded;
 }
+
+/** Same expanded-size accounting as the decoder, without expanding the pool. */
+export function expandedChars(value) { return poolTree(value).chars; }

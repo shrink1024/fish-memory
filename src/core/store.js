@@ -1,5 +1,6 @@
+import { rememberEncodedSize } from './storage-codec.js';
 import { clone, invariant, SerialQueue, commonPrefix, isPrefix, uid, plainText } from './util.js';
-import { createSave, validateSave, createEntry, normalizeScopeId, GLOBAL_SCOPE, TIERS } from './state.js';
+import { createSave, validateSave, createEntry, normalizeScopeId, GLOBAL_SCOPE, TIERS, splitSourceText } from './state.js';
 import { applyMaintenance, applyDataPatch, diffData, auditChanges } from './operations.js';
 
 function anchor(sourceKeys) {
@@ -104,6 +105,17 @@ function replayOnPath(state, sourceKeys) {
                 if (!current || !previous || !value) continue;
                 corrected.entries[id] = reapplyManualEntry(previous, value, current);
             }
+            if (commit.restoreEntry) {
+                const {id,withTier}=commit.restoreEntry, target=commit.patch.entries[id], current=corrected.entries[id];
+                if(current && target?.source) corrected.entries[id]=createEntry({...current,title:target.title,kind:target.kind,
+                    intro:target.intro,retrieveWhen:target.retrieveWhen,segments:clone(target.segments),source:clone(target.source),needsReview:target.needsReview,
+                    evidence:[],lastEvidence:[],evidenceTrimmed:false,version:current.version+1,
+                    ...(withTier?{tier:target.tier,enabled:target.enabled,constant:target.constant,important:target.important}:{})});
+            }
+            if (commit.sourceResolution) {
+                const id = commit.sourceResolution.id, target = commit.patch.entries[id];
+                if (corrected.entries[id] && target?.source) corrected.entries[id] = createEntry({ ...clone(target), version: corrected.entries[id].version + 1 });
+            }
             if (Object.hasOwn(commit.patch, 'inventoryEnabled')) corrected.inventoryEnabled = commit.patch.inventoryEnabled;
             const patch = diffData(data, corrected);
             if (Object.keys(patch.entries).length || Object.hasOwn(patch, 'inventoryEnabled')) {
@@ -134,7 +146,7 @@ function replayOnPath(state, sourceKeys) {
     for (const commit of journal) retainedLength = Math.max(retainedLength, commit.anchorLength);
     next.storyKeys = sourceKeys.slice(0, retainedLength);
     next.inventoryDisabledAt = inventoryDisabledAt;
-    const manualReasons = new Set(['edit', 'reset', 'classify', 'promote', 'promote-from-pool', 'tier', 'tier-reset', 'tiers', 'import-memory']);
+    const manualReasons = new Set(['edit', 'reset', 'classify', 'promote', 'promote-from-pool', 'import-memory', 'extra-book', 'source-held-resolve']);
     next.audit = state.audit.filter(item => manualReasons.has(item.reason) && data.entries[item.entryId]);
     return next;
 }
@@ -161,6 +173,7 @@ export class MemoryStore {
                 next.data.scopeContext = null;
                 delete next.initializationCheckpoint;
             }
+            if (stored?.chatId === next.chatId) rememberEncodedSize(next, stored);
             this.state = next;
             return this.snapshot();
         });
@@ -177,7 +190,12 @@ export class MemoryStore {
             next.initializationCheckpoint = clone(previous.initializationCheckpoint);
             next.initializationCheckpoint.identity.revision = next.revision;
         }
-        await this.storage.write(next.chatId, clone(next), previous.revision);
+        // Production storage encodes once and enforces its actual hard limit.
+        // Rebuild reserves are admission checks, not a second traversal here;
+        // legacy saves above the reserve threshold can still be reduced.
+        const submitted = clone(next);
+        await this.#write(next.chatId, submitted, previous.revision);
+        rememberEncodedSize(next, submitted);
         this.state = next;
         return this.snapshot();
     }
@@ -185,6 +203,14 @@ export class MemoryStore {
         if (!this.state?.initializationCheckpoint) return null;
         try { return clone(validateInitializationCheckpoint(this.state.initializationCheckpoint, this.state)); }
         catch { return null; }
+    }
+    async #write(chatId, submitted, revision) {
+        try { await this.storage.write(chatId, submitted, revision); }
+        catch (error) {
+            // The same HTTP/TypeError shapes can come from model calls or
+            // chat persistence. Tag at the actual write boundary, not by text.
+            throw Object.assign(new Error(error?.message ?? String(error), {cause:error}), error, {dwmStorage:true});
+        }
     }
     async saveInitializationCheckpoint(checkpoint, { expectedRevision, isCurrent = () => {} } = {}) {
         return this.#queue.run(async () => {
@@ -195,12 +221,14 @@ export class MemoryStore {
             next.initializationCheckpoint = clone(checkpoint);
             // Checkpoint writes are serialized with regular writes, but they do
             // not certify narrative or advance the formal data revision.
-            await this.storage.write(next.chatId, clone(next), this.state.revision);
+            const submitted = clone(next);
+            await this.#write(next.chatId, submitted, this.state.revision);
+            rememberEncodedSize(next, submitted);
             this.state = next;
             return clone(next.initializationCheckpoint);
         });
     }
-    async initialize(entries, strategy, { expectedRevision } = {}) {
+    async initialize(entries, strategy, { expectedRevision, baseEntries = {} } = {}) {
         return this.#queue.run(async () => {
             if (expectedRevision !== undefined) invariant(this.state.revision === expectedRevision, '初始化期间存档已经变化');
             const next = this.snapshot();
@@ -213,7 +241,9 @@ export class MemoryStore {
                 return [entry.id, entry];
             })), strategy: plainText(strategy, '记忆策略', 10000), summary: '', inventory: [], inventoryEnabled: next.data.inventoryEnabled,
                 scopeSummaries: {}, scopeInventories: {}, scopeContext: clone(next.data.scopeContext ?? null), messageScopes: clone(next.data.messageScopes ?? {}) };
-            next.base = clone(next.data); next.processed = []; next.rememberedKeys = []; next.storyKeys = []; next.journal = []; next.audit = []; next.inventoryDisabledAt = null; next.initialized = true;
+            next.base = clone(next.data); delete next.sourceHeld;
+            for (const [id, entry] of Object.entries(baseEntries)) { invariant(next.data.entries[id], '复原基线缺少对应资料'); next.base.entries[id] = createEntry(entry); }
+            next.processed = []; next.rememberedKeys = []; next.storyKeys = []; next.journal = []; next.audit = []; next.inventoryDisabledAt = null; next.initialized = true;
             return this.#persist(next);
         });
     }
@@ -263,11 +293,16 @@ export class MemoryStore {
     /** Incremental source sync: replace changed baseline entries and record the
      * live result as a commit at the current progress, so branches and
      * rollbacks replay it like any other memory change. */
-    async syncSource({ base = {}, data = {}, removed = [] }, { expectedRevision }) {
+    async syncSource({ base = {}, data = {}, removed = [], held = {} }, { expectedRevision }) {
         return this.#queue.run(async () => {
             invariant(this.state?.initialized, '请先完成初始化');
             invariant(this.state.revision === expectedRevision, '资料在同步期间已变化，请重新同步');
             const next = this.snapshot(), at = new Date().toISOString();
+            next.sourceHeld = { ...(next.sourceHeld ?? {}) };
+            for (const id of [...removed, ...Object.keys(base), ...Object.keys(data)]) delete next.sourceHeld[id];
+            for (const [id, pending] of Object.entries(held)) {
+                if (pending === null) delete next.sourceHeld[id]; else next.sourceHeld[id] = clone(pending);
+            }
             const nextData = clone(next.data);
             for (const id of removed) { delete nextData.entries[id]; delete next.base.entries[id]; }
             for (const [id, entry] of Object.entries(base)) next.base.entries[id] = createEntry(entry);
@@ -295,7 +330,36 @@ export class MemoryStore {
             const baseline = isPrefix(this.state.storyKeys, sourceKeys) ? this.snapshot() : replayOnPath(this.state, sourceKeys);
             const data = clone(baseline.data);
             const entry = data.entries[action.id];
-            if (action.type === 'import-memory') {
+            if (action.type === 'audit-clear') {
+                invariant(entry && !entry.source, '仅鱼忆新增条目可单独清除记录');
+                invariant(action.confirmed === true, '清除记录需要确认');
+                baseline.audit = baseline.audit.filter(item => item.entryId !== action.id);
+                return this.#persist(baseline);
+            }
+            if (action.type === 'source-held-resolve') {
+                invariant(action.confirmed === true, '处理待决定的原书变化需要确认');
+                invariant(['adopt-source', 'keep-current'].includes(action.choice), '请选择采用新原文或保留当前版本');
+                invariant(action.expectedRevision === undefined || action.expectedRevision === this.state.revision, '资料已变化，请重新核对');
+                const pending = baseline.sourceHeld?.[action.id], nextSource = pending?.next;
+                invariant(entry?.source && nextSource?.id === entry.id && nextSource.source?.book === entry.source.book
+                    && String(nextSource.source.uid) === String(entry.source.uid), '该条目已没有待决定的原书变化');
+                invariant(action.expectedResolutionId === undefined || action.expectedResolutionId === pending.resolutionId, '待决定的原书版本已变化，请重新核对');
+                invariant(action.expectedVersion === undefined || action.expectedVersion === entry.version, '条目已更新，请重新核对后确认');
+                baseline.base.entries[entry.id] = createEntry(nextSource);
+                data.entries[entry.id] = createEntry(action.choice === 'keep-current'
+                    ? { ...entry, source: clone(nextSource.source), version: entry.version + 1 }
+                    : { ...nextSource, ...(entry.tier ? { tier: entry.tier, enabled: entry.tier !== 'off' } : {}), version: entry.version + 1 });
+                delete baseline.sourceHeld[entry.id];
+            } else if (action.type === 'extra-book') {
+                invariant(Array.isArray(action.entries) && action.entries.length > 0 && action.entries.length <= 1000, '加入条目数量无效');
+                for (const input of action.entries) {
+                    const added = createEntry(input);
+                    invariant(added.source?.book && added.source.book !== baseline.bookName && !data.entries[added.id] && !baseline.base.entries[added.id], '来源条目已存在或无效');
+                    data.entries[added.id] = added;
+                    // Explicit additions belong to the save, not to a discarded reply.
+                    baseline.base.entries[added.id] = clone(added);
+                }
+            } else if (action.type === 'import-memory') {
                 invariant(Array.isArray(action.entries) && action.entries.length > 0 && action.entries.length <= 1000, '补充记忆数量无效');
                 for (const row of action.entries) {
                     const title = plainText(row.title, '条目名称', 500), text = plainText(row.content, '补充正文', 100000);
@@ -332,14 +396,23 @@ export class MemoryStore {
             } else {
                 invariant(entry, '条目不存在');
                 if (action.expectedVersion !== undefined) invariant(action.expectedVersion === entry.version, '条目已更新，请先检查新版再保存草稿');
-                if (action.type === 'reset') {
+                if (['reset', 'restore-entry'].includes(action.type)) {
                     invariant(action.confirmed === true && entry.source, '恢复原书需要确认且必须有原书来源');
+                    const initial = baseline.base.entries[entry.id];
+                    entry.title = initial?.title ?? entry.source.metadata?.comment ?? entry.title;
+                    entry.kind = initial?.kind ?? entry.kind;
+                    entry.needsReview = Boolean(initial?.needsReview);
                     entry.segments = clone(entry.source.baselineSegments ?? [{ id: 'body', text: entry.source.original, writable: false }]);
                     entry.intro = baseline.base.entries[entry.id]?.intro ?? '';
                     entry.retrieveWhen = baseline.base.entries[entry.id]?.retrieveWhen ?? '';
                     entry.evidence = []; entry.lastEvidence = []; entry.evidenceTrimmed = false;
+                    if (action.type === 'restore-entry' && action.withTier) {
+                        const scanned = baseline.base.entries[entry.id];
+                        delete entry.tier; entry.enabled = scanned?.enabled ?? true;
+                        entry.constant = scanned?.constant ?? false; entry.important = scanned?.important ?? false;
+                    }
                 } else if (action.type === 'edit') {
-                    const replacement = createEntry({ ...entry, segments: action.segments ?? entry.segments, title: action.title ?? entry.title,
+                    const replacement = createEntry({ ...entry, segments: (action.segments ?? entry.segments).flatMap(segment => typeof segment.text === 'string' && segment.text.length > 100000 ? splitSourceText(segment.text).map((part,index)=>({...segment,text:part.text,id:index?uid('segment'):segment.id})) : [segment]), title: action.title ?? entry.title,
                         intro: action.intro ?? entry.intro, retrieveWhen: action.retrieveWhen ?? entry.retrieveWhen });
                     data.entries[entry.id] = replacement;
                 } else if (action.type === 'tier') {
@@ -381,10 +454,13 @@ export class MemoryStore {
             const next = baseline;
             const at = new Date().toISOString();
             if (sourceKeys.length > next.storyKeys.length) next.storyKeys = clone(sourceKeys);
-            next.audit.push(...auditChanges(next.data, data, action.type, at));
+            if (action.type === 'restore-entry') next.audit = next.audit.filter(item => item.entryId !== action.id);
+            else if (!['tier', 'tiers', 'tier-reset'].includes(action.type)) next.audit.push(...auditChanges(next.data, data, action.type, at));
             next.audit = next.audit.slice(-this.auditLimit);
             if (action.type === 'inventory-toggle' && !action.enabled && next.data.inventoryEnabled) next.inventoryDisabledAt = progress.length;
-            next.journal.push({ id: uid('commit'), ...anchor(sourceKeys), patch: diffData(next.data, data), reason: 'manual', inventoryDisabledAt: next.inventoryDisabledAt });
+            next.journal.push({ id: uid('commit'), ...anchor(sourceKeys), patch: diffData(next.data, data), reason: 'manual', inventoryDisabledAt: next.inventoryDisabledAt,
+                ...(action.type==='restore-entry'?{restoreEntry:{id:action.id,withTier:Boolean(action.withTier)}}:{}),
+                ...(action.type==='source-held-resolve'?{sourceResolution:{id:action.id,choice:action.choice}}:{}) });
             next.data = data;
             return this.#persist(next, { preserveClassification: action.type === 'scope-context' });
         });
@@ -412,7 +488,7 @@ export class MemoryStore {
         return this.#queue.run(async () => {
             const next = this.snapshot();
             next.preferences = { ...(next.preferences ?? {}), ...clone(patch) };
-            return this.#persist(next);
+            return this.#persist(next, {preserveClassification:Object.keys(patch).every(key=>key==='lazy')});
         });
     }
     idle() { return this.#queue.idle(); }

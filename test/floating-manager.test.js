@@ -55,7 +55,7 @@ test('manager uses a nonmodal persistent surface and restores focus after collap
     entry.fire('click'); assert.equal(f.ui.panel.hidden, false); assert.equal(entry.getAttribute('aria-expanded'), 'true');
     assert.equal(f.ui.panel.getAttribute('aria-modal'), 'false');
     f.doc.fire('keydown', { key: 'Escape' });
-    assert.equal(f.ui.panel.hidden, true); assert.equal(f.ui.bubble.hidden, false); assert.equal(f.doc.activeElement, entry);
+    assert.equal(f.ui.panel.hidden, true); assert.equal(f.ui.bubble.hidden, false); assert.equal(f.doc.activeElement, f.ui.bubble);
     f.ui.bubble.fire('click'); assert.equal(f.ui.body.children[0], draft); assert.equal(draft.value, '尚未保存的草稿');
     f.get('dwm-management-close').fire('click'); assert.equal(f.doc.activeElement, f.ui.bubble);
     assert.equal(entry.getAttribute('aria-expanded'), 'false'); f.ui.destroy();
@@ -225,4 +225,15 @@ test('a saved frame is clamped into a smaller viewport, and phones use the full 
     Object.assign(g.win.visualViewport, { width: 375, height: 812 }); g.win.fire('resize');
     assert.equal(ui.panel.dataset.layout, 'compact'); assert.equal(ui.panel.style.width, '');
     ui.destroy();
+});
+
+
+test('hidden bubble remains hidden across collapse/render/reload and drag preserves its size', () => {
+    const f=fixture();const entry=f.doc.createElement('button');f.doc.body.append(entry);f.ui.bindEntry(entry);
+    f.ui.setDock({visible:false});entry.fire('click');f.ui.close();f.ui.render({initialized:true});
+    assert.equal(f.ui.bubble.hidden,true);assert.equal(f.doc.activeElement,entry);
+    const saved=JSON.stringify(f.writes.at(-1).value),restored=fixture({saved});assert.equal(restored.ui.bubble.hidden,true);restored.ui.destroy();
+    f.ui.setDock({visible:true,size:'compact'});
+    f.ui.bubble.fire('pointerdown',{button:0,pointerId:8,clientX:320,clientY:400});f.win.fire('pointermove',{pointerId:8,clientX:30,clientY:300});f.win.fire('pointerup',{pointerId:8});
+    assert.equal(f.ui.dock().size,'compact');assert.equal(f.writes.at(-1).value.size,'compact');assert.equal(f.ui.panel.hidden,true);f.ui.destroy();
 });

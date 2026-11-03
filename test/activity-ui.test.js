@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createActivityIndicator, elapsedLabel } from '../src/ui/activity.js';
 
 class Element {
-    constructor(tag) { this.tagName = tag; this.children = []; this.dataset = {}; this.events = {}; this.attributes = {}; this.textContent = ''; }
+    constructor(tag) { this.tagName = tag; this.children = []; this.dataset = {}; this.events = {}; this.attributes = {}; this.style = {}; this.textContent = ''; }
     append(...nodes) { this.children.push(...nodes); }
     setAttribute(key, value) { this.attributes[key] = value; }
     addEventListener(name, fn) { this.events[name] = fn; }
@@ -93,4 +93,16 @@ test('automatic initialization waiting and failed attempts are visible without f
     ui.render(view(null, { initialization: { state: 'retry', message: '初始化未完成，可手动重试', retry: true }, enabled: false }));
     assert.equal(ui.element.hidden, true);
     ui.destroy();
+});
+
+test('a scan shows whole-scan progress from real batch counts; other tasks show none', () => {
+    const f = fixture(), bar = f.get('dwm-activity-bar');
+    const scan = { stage: { index: 3, total: 3, label: 'history' }, batch: { done: 1, total: 4 } };
+    f.ui.render(view(activity({ kind: 'initialize', label: '扫描历史剧情 2/8' }), { lazy: { status: scan } }));
+    assert.equal(bar.hidden, false); assert.equal(bar.attributes.role, 'progressbar');
+    assert.equal(bar.attributes['aria-valuenow'], '75'); assert.equal(bar.children[0].style.width, '75%');
+    f.ui.render(view(activity({ id: 'task-2', kind: 'maintain' }), { lazy: { status: scan } }));
+    assert.equal(bar.hidden, true);
+    f.ui.render(view(activity({ id: 'task-3', kind: 'initialize' }), { lazy: { status: { stage: null, batch: null } } }));
+    assert.equal(bar.hidden, true);
 });

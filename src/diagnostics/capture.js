@@ -17,13 +17,14 @@ export function decodeResponse(raw, contentType = '') {
     if (!contentType.includes('text/event-stream') && !/^\s*(?:event:|data:)/.test(raw)) return safe(() => JSON.parse(raw), null);
     const messages = new Map(); const events = [];
     const get = index => { if (!messages.has(index)) messages.set(index, { role: 'assistant', index, content: '', reasoning: '', tool_calls: [] }); return messages.get(index); };
-    let malformedEvents = 0, done = false;
+    let malformedEvents = 0, done = false, usage;
     for (const frame of raw.replaceAll('\r\n', '\n').split(/\n\n/)) {
         const data = frame.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).replace(/^ /, '')).join('\n');
         if (!data) continue;
         if (data.trim() === '[DONE]') { done = true; continue; }
         const value = safe(() => JSON.parse(data));
         if (!value) { malformedEvents++; continue; }
+        if (value.usage && typeof value.usage === 'object') usage = value.usage;
         if (value.error) events.push(value.error);
         if (Array.isArray(value.choices)) for (const choice of value.choices) {
             const out = get(choice.index ?? 0), delta = choice.delta ?? choice.message ?? {};
@@ -50,7 +51,7 @@ export function decodeResponse(raw, contentType = '') {
             if (value.type === 'message_stop' || value.type === 'response.completed') done = true;
         }
     }
-    return { messages: [...messages.values()], stream: true, done, malformedEvents, ...(events.length ? { errors: events } : {}) };
+    return { messages: [...messages.values()], stream: true, done, malformedEvents, ...(events.length ? { errors: events } : {}), ...(usage ? { usage } : {}) };
 }
 
 /** Requests fish did not send itself, named by ST's generation type. */
@@ -66,8 +67,8 @@ export function installCapture({ target = globalThis, store, context = () => ({}
     const original = target.fetch; const intents = new Set(), readers = new Set();
     let disposed = false;
     const change = (method, ...args) => safe(() => store[method](...args));
-    const register = ({ purpose, label, source = '鱼忆', system, input }) => {
-        const intent = { label: label ?? TASKS[purpose] ?? purpose ?? '辅助调用', source, system: String(system ?? ''), input: typeof input === 'string' ? input : serializeAgentInput(input), recordIds: [] };
+    const register = ({ purpose, label, source = '鱼忆', system, input, automatic }) => {
+        const intent = { label: label ?? TASKS[purpose] ?? purpose ?? '辅助调用', source, system: String(system ?? ''), input: typeof input === 'string' ? input : serializeAgentInput(input), recordIds: [], automatic };
         intents.add(intent);
         return { end: error => { intents.delete(intent); if (error) for (const id of intent.recordIds) change('update', id, { processingError: String(error.message ?? error).slice(0, 1000), processingOutcome: error.dwmYielded ? 'yielded' : error.dwmCancelled || error.wxlCancelled ? 'stopped' : error.name === 'AbortError' ? 'cancelled' : 'error' }); } };
     };
@@ -120,7 +121,7 @@ export function installCapture({ target = globalThis, store, context = () => ({}
         if (route.transport === 'browser-api' && request && !request.messages && !request.input && !request.prompt) return original.apply(this, arguments);
         intent = safe(() => identify(request));
         id = change('start', { ...route, request, context: safe(context, {}), provenance: safe(() => matchedProvenance(request), []),
-            source: intent?.source ?? '来源未确认', label: intent?.label ?? externalLabel(request?.type), kind: request?.type ?? 'unknown',
+            ...(intent?.automatic?{automatic:intent.automatic}:{}), source: intent?.source ?? '来源未确认', label: intent?.label ?? externalLabel(request?.type), kind: request?.type ?? 'unknown',
             captureNote: route.transport === 'browser-st' ? '浏览器与酒馆之间的收发原文；酒馆服务端可能继续转换供应商协议。' : '浏览器直接发出的模型请求。' });
         if (intent && id) intent.recordIds.push(id);
         if (request === null && input?.clone) {
@@ -142,7 +143,7 @@ export function installCapture({ target = globalThis, store, context = () => ({}
                 const body = safe(() => JSON.parse(text), { captureError: '请求体不是有效 JSON，未记录未解析配置。' });
                 const match = safe(() => identify(body));
                 if (match && id) match.recordIds.push(id);
-                change('update', id, { request: body, provenance: safe(() => matchedProvenance(body), []), ...(match ? { label: match.label, source: match.source } : {}) });
+                change('update', id, { request: body, provenance: safe(() => matchedProvenance(body), []), ...(match ? { label: match.label, source: match.source, ...(match.automatic?{automatic:match.automatic}:{}) } : {}) });
             })().catch(() => change('update', id, { captureNote: '无法读取请求体；响应仍会记录。' })));
         }
         let operation;

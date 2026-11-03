@@ -1,3 +1,5 @@
+import { scanProgress } from './lazy-copy.js';
+
 /** Small, stable task feedback. No prompt text or timer-driven panel rerenders. */
 export function elapsedLabel(startedAt, now = Date.now()) {
     const value = typeof startedAt === 'number' ? startedAt : Date.parse(startedAt);
@@ -14,12 +16,14 @@ export function createActivityIndicator(doc, { onStop, onRecover, now = Date.now
     const label = make('strong', 'dwm-activity-label'); label.setAttribute('role', 'status'); label.setAttribute('aria-live', 'polite');
     const clock = make('span', 'dwm-activity-clock'); clock.setAttribute('aria-live', 'off');
     const hint = make('span', 'dwm-activity-hint');
+    const bar = make('div', 'dwm-activity-bar'), fill = make('i', '');
+    bar.setAttribute('role', 'progressbar'); bar.setAttribute('aria-label', '建立记忆进度'); bar.setAttribute('aria-valuemin', '0'); bar.setAttribute('aria-valuemax', '100'); bar.append(fill);
     const action = make('button', 'dwm-activity-stop'); action.type = 'button';
     const recover = make('button', 'dwm-activity-recover'); recover.type = 'button'; recover.hidden = true; recover.textContent = '重试补记';
     const dismiss = make('button', 'dwm-activity-dismiss'); dismiss.type = 'button'; dismiss.textContent = '收起';
     dismiss.setAttribute('aria-label', '收起鱼忆运行提示');
-    line.append(label, clock); copy.append(line, hint); element.append(mark, copy, action, recover, dismiss);
-    let activity = null, previous = null, context, notice = '', actionError = '', timer = null, stopping = null, destroyed = false, finishTimer = null, recovery = false, recoveryKind = 'maintain', dismissedInitialization = '';
+    line.append(label, clock); copy.append(line, hint, bar); element.append(mark, copy, action, recover, dismiss);
+    let activity = null, progress = null, previous = null, context, notice = '', actionError = '', timer = null, stopping = null, destroyed = false, finishTimer = null, recovery = false, recoveryKind = 'maintain', dismissedInitialization = '';
     const set = (node, text) => { if (node.textContent !== text) node.textContent = text; };
     const tick = () => set(clock, activity ? elapsedLabel(activity.startedAt, now()) : '');
     function paint() {
@@ -28,6 +32,8 @@ export function createActivityIndicator(doc, { onStop, onRecover, now = Date.now
         element.dataset.phase = activity ? activity.phase : 'finished';
         set(label, activity ? `鱼忆 · ${activity.label}` : `鱼忆 · ${notice}`);
         set(hint, actionError || activity?.hint || ''); hint.hidden = !actionError && !activity?.hint;
+        bar.hidden = progress === null;
+        if (progress !== null) { const percent = String(Math.round(progress * 100)); bar.setAttribute('aria-valuenow', percent); fill.style.width = `${percent}%`; }
         action.hidden = !activity;
         action.disabled = !activity?.cancellable || stopping === activity?.id || activity?.phase === 'cancelling';
         set(action, stopping === activity?.id || activity?.phase === 'cancelling' ? '正在停止…' : activity?.stopLabel || '停止任务');
@@ -58,6 +64,8 @@ export function createActivityIndicator(doc, { onStop, onRecover, now = Date.now
             if (context !== nextContext) { previous = null; notice = ''; dismissedInitialization = ''; context = nextContext; if (finishTimer !== null) timers.clearTimeout?.(finishTimer); finishTimer = null; }
             if (activity?.id !== view.activity?.id) actionError = '';
             activity = view.activity ?? null;
+            // Same whole-scan measure as 超级懒人模式, from the real batch counts.
+            progress = activity?.kind === 'initialize' ? scanProgress(view.lazy?.status) : null;
             if (activity) { previous = activity; notice = ''; if (finishTimer !== null) timers.clearTimeout?.(finishTimer); finishTimer = null; }
             else if (previous) {
                 notice = view.status || (view.error ? '本次处理未完成，已有资料保留' : '本次处理已结束');

@@ -1,10 +1,12 @@
+import { lazyShortStatus } from './lazy-copy.js';
+
 const POSITION_KEY = 'dwm.floating-position.v1';
 const WINDOW_KEY = 'dwm.floating-window.v1';
-const MIN_WIDTH = 560, MIN_HEIGHT = 420, COMPACT_WIDTH = 720;
+const MIN_WIDTH = 560, MIN_HEIGHT = 420, COMPACT_WIDTH = 720, LAZY_WIDTH = 440;
 const clamp = (value, min, max) => Math.min(Math.max(value, min), Math.max(min, max));
 
 /** A persistent, nonmodal workspace. It never reparents or remounts its contents. */
-export function createFloatingManager(doc, { window: win = doc.defaultView, storage, storageKey = POSITION_KEY, windowKey = WINDOW_KEY } = {}) {
+export function createFloatingManager(doc, { window: win = doc.defaultView, storage, storageKey = POSITION_KEY, windowKey = WINDOW_KEY, bubbleVisible = true } = {}) {
     const make = (tag, className, text) => {
         const node = doc.createElement(tag); node.className = className;
         if (text !== undefined) node.textContent = text;
@@ -51,22 +53,27 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
     element.append(panel, bubble); doc.body.append(element);
 
     let opened = false, destroyed = false, opener = null, drag = null, suppressClick = false, observedComposer = null;
-    let dock = { edge: 'right', fraction: 0.65, size: 'compact' };
-    let frame = null, maximized = false, moving = null;
+    // 超级懒人模式的新安装默认不显示气泡；玩家调过的设置优先。
+    let dock = { edge: 'right', fraction: 0.65, size: 'compact', visible: bubbleVisible !== false };
+    let frame = null, maximized = false, moving = null, lazyPos = null;
     try { storage ??= win?.localStorage; const saved = JSON.parse(storage?.getItem(storageKey) ?? 'null');
         if (['left', 'right'].includes(saved?.edge) && Number.isFinite(saved.fraction)) dock = { ...dock, edge: saved.edge, fraction: clamp(saved.fraction, 0, 1) };
         if (['compact', 'full'].includes(saved?.size)) dock.size = saved.size;
+        if (typeof saved?.visible === 'boolean') dock.visible = saved.visible;
+        // Keep a new install's hidden default after later loads stop counting as new.
+        else if (!dock.visible) storage?.setItem(storageKey, JSON.stringify(dock));
     } catch { /* Browser storage may be blocked; the manager remains usable. */ }
     try { const saved = JSON.parse(storage?.getItem(windowKey) ?? 'null');
         if (['x', 'y', 'width', 'height'].every(key => Number.isFinite(saved?.[key]))) frame = { x: saved.x, y: saved.y, width: saved.width, height: saved.height };
         maximized = saved?.maximized === true;
+        if (Number.isFinite(saved?.lazy?.x) && Number.isFinite(saved?.lazy?.y)) lazyPos = { x: saved.lazy.x, y: saved.lazy.y };
     } catch { /* A broken window size falls back to the default frame. */ }
     const listeners = [], entries = new Set();
     const listen = (target, type, fn, options) => {
         target?.addEventListener(type, fn, options); listeners.push(() => target?.removeEventListener(type, fn, options));
     };
     const save = () => { try { storage?.setItem(storageKey, JSON.stringify(dock)); } catch { /* Position memory is optional. */ } };
-    const saveFrame = () => { try { storage?.setItem(windowKey, JSON.stringify({ ...frame, maximized })); } catch { /* Size memory is optional. */ } };
+    const saveFrame = () => { try { storage?.setItem(windowKey, JSON.stringify({ ...frame, maximized, ...(lazyPos ? { lazy: lazyPos } : {}) })); } catch { /* Size memory is optional. */ } };
     const viewport = () => {
         if (ttSnapshot) {
             const { viewport: v, ime } = ttSnapshot;
@@ -93,13 +100,22 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
         return { ...v, minX, maxX, minY, maxY: Math.max(minY, bottom - height), bubbleWidth: width };
     };
     // The window frame, clamped into the reachable viewport. Narrow screens use the full surface.
+    // The 超级懒人模式 window is a narrow card: it keeps its own position and grows with its content.
     const placeWindow = () => {
-        const v = viewport(), compact = v.width <= COMPACT_WIDTH;
-        panel.dataset.layout = compact ? 'compact' : maximized ? 'maximized' : 'window';
-        maximizeButton.hidden = compact;
+        const v = viewport(), compact = v.width <= COMPACT_WIDTH, lazy = panel.dataset.variant === 'lazy';
+        panel.dataset.layout = compact ? 'compact' : maximized && !lazy ? 'maximized' : 'window';
+        maximizeButton.hidden = compact || lazy;
         maximizeButton.title = maximized ? '还原' : '最大化'; maximizeButton.setAttribute('aria-label', maximizeButton.title);
-        if (compact || maximized) { for (const key of ['left', 'top', 'width', 'height']) panel.style[key] = ''; return; }
+        panel.style.maxHeight = '';
+        if (compact || maximized && !lazy) { for (const key of ['left', 'top', 'width', 'height']) panel.style[key] = ''; return; }
         const margin = 12;
+        if (lazy) {
+            const width = Math.min(LAZY_WIDTH, v.width - margin * 2);
+            const x = clamp(lazyPos?.x ?? v.width - width - 24, margin, v.width - width - margin);
+            const y = clamp(lazyPos?.y ?? 58, margin, v.height - margin - 160);
+            Object.assign(panel.style, { left: `${x}px`, top: `${y}px`, width: `${width}px`, height: '', maxHeight: `${v.height - y - margin}px` });
+            return;
+        }
         const width = clamp(frame?.width ?? Math.min(1040, v.width - margin * 2), Math.min(MIN_WIDTH, v.width - margin * 2), v.width - margin * 2);
         const height = clamp(frame?.height ?? Math.min(780, v.height * 0.78), Math.min(MIN_HEIGHT, v.height - margin * 2), v.height - margin * 2);
         const x = clamp(frame?.x ?? v.width - width - margin, margin, v.width - width - margin);
@@ -133,7 +149,7 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
             entry.classList.toggle('openIcon', opened); entry.classList.toggle('closedIcon', !opened);
         }
         bubble.setAttribute('aria-expanded', String(opened));
-        panel.hidden = !opened; bubble.hidden = opened;
+        panel.hidden = !opened; bubble.hidden = opened || !dock.visible;
     };
     function open(source) {
         if (destroyed || opened) return;
@@ -142,13 +158,17 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
     function close({ restoreFocus = true } = {}) {
         if (destroyed || !opened) return;
         opened = false; setExpanded(); layout();
-        if (restoreFocus) (opener?.isConnected ? opener : bubble).focus({ preventScroll: true });
+        if (restoreFocus) {
+            const target = dock.visible ? bubble : opener?.isConnected && opener !== bubble ? opener : [...entries].find(entry => entry.isConnected);
+            target?.focus({ preventScroll: true });
+        }
         opener = null;
     }
     function bindEntry(entry) {
         if (entries.has(entry)) return;
+        for (const old of entries) if (!old.isConnected) { old.removeEventListener('click', open); entries.delete(old); }
         entries.add(entry); entry.setAttribute('aria-haspopup', 'dialog'); entry.setAttribute('aria-controls', panel.id); entry.setAttribute('aria-expanded', String(opened));
-        listen(entry, 'click', open);
+        entry.addEventListener('click', open);
     }
     bubble.setAttribute('aria-haspopup', 'dialog'); bubble.setAttribute('aria-controls', panel.id); bubble.setAttribute('aria-expanded', 'false');
     listen(bubble, 'click', event => {
@@ -157,6 +177,7 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
     });
     listen(closeButton, 'click', () => close());
     listen(doc, 'keydown', event => {
+        if (drag && event.key === 'Escape') { finishDrag({ type: 'pointercancel', pointerId: drag.id }); event.preventDefault(); return; }
         if (opened && event.key === 'Escape' && !event.defaultPrevented && !doc.querySelector('dialog[open]')) { event.preventDefault(); close(); }
     });
     listen(maximizeButton, 'click', () => { maximized = !maximized; saveFrame(); layout(); });
@@ -176,6 +197,10 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
         const v = viewport(), dx = event.clientX - moving.x, dy = event.clientY - moving.y, r = moving.rect, margin = 12;
         let { x, y, width, height } = r;
         if (!moving.edge) { x = clamp(r.x + dx, margin, v.width - r.width - margin); y = clamp(r.y + dy, margin, v.height - r.height - margin); }
+        if (panel.dataset.variant === 'lazy') {
+            if (!moving.edge) { lazyPos = { x, y }; Object.assign(panel.style, { left: `${x}px`, top: `${y}px`, maxHeight: `${v.height - y - margin}px` }); }
+            return;
+        }
         if (moving.edge.includes('e')) width = clamp(r.width + dx, MIN_WIDTH, v.width - r.x - margin);
         if (moving.edge.includes('s')) height = clamp(r.height + dy, MIN_HEIGHT, v.height - r.y - margin);
         if (moving.edge.includes('w')) { width = clamp(r.width - dx, MIN_WIDTH, r.x + r.width - margin); x = r.x + r.width - width; }
@@ -206,7 +231,7 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
     listen(win, 'pointermove', event => {
         if (!drag || event.pointerId !== drag.id) return;
         const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
-        if (!drag.moved && Math.hypot(dx, dy) < 8) return;
+        if (!drag.moved && Math.hypot(dx, dy) <= 6) return;
         drag.moved = true; bubble.dataset.dragging = 'true'; event.preventDefault();
         const bounds = measure();
         bubble.style.left = `${clamp(drag.left + dx, bounds.minX, bounds.maxX)}px`;
@@ -218,7 +243,7 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
             suppressClick = true;
             if (event.type !== 'pointercancel') {
                 const bounds = measure(), left = parseFloat(bubble.style.left), top = parseFloat(bubble.style.top);
-                dock = { edge: left + bounds.bubbleWidth / 2 < bounds.width / 2 ? 'left' : 'right',
+                dock = { ...dock, edge: left + bounds.bubbleWidth / 2 < bounds.width / 2 ? 'left' : 'right',
                     fraction: bounds.maxY > bounds.minY ? clamp((top - bounds.minY) / (bounds.maxY - bounds.minY), 0, 1) : 0.5 };
                 save();
             }
@@ -232,17 +257,26 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
     const render = (view = {}) => {
         if (destroyed) return;
         let text = '点开管理', state = 'idle';
-        if (view.enabled === false) { text = '已暂停'; state = 'paused'; }
+        // In 超级懒人模式 only a stop the player must look at marks the entries.
+        const lazy = Boolean(view.lazy?.enabled), attention = lazy && view.enabled !== false && Boolean(view.lazy.attention);
+        bubble.dataset.attention = String(attention);
+        for (const entry of entries) entry.dataset.dwmAttention = String(attention);
+        if (lazy && view.enabled !== false) {
+            const short = lazyShortStatus(view);
+            text = attention ? '需要处理' : view.activity ? (view.lazy.status?.state === 'building' ? '建立记忆中' : '整理中') : short === '记忆正常' ? '已就绪' : short;
+            state = attention ? 'attention' : view.activity ? 'busy' : 'idle';
+        } else if (view.enabled === false) { text = '已暂停'; state = 'paused'; }
         else if (view.activity) { text = view.activity.phase === 'cancelling' ? '正在停止' : '正在处理'; state = 'busy'; }
         else if (view.error) { text = '需要处理'; state = 'attention'; }
         else if (!view.initialized) { text = '建立记忆'; state = 'attention'; }
         else if (Number(view.pendingCount) > 0) { text = `${Math.min(999, Math.floor(view.pendingCount))}${view.pendingCount > 999 ? '+' : ''} 条待补记`; state = 'pending'; }
         status.textContent = text; bubble.dataset.state = state;
+        for (const entry of entries) entry.setAttribute('aria-label', attention ? `打开鱼忆管理窗口：${lazyShortStatus(view)}` : '打开鱼忆管理窗口');
         bubble.setAttribute('aria-label', `打开鱼忆管理窗口，${text}。可拖动气泡调整位置`);
         bubble.title = `鱼忆 · ${text}；点开管理，拖动可换位置`;
         layout();
     };
-    render({ initialized: true });
+    setExpanded(); render({ initialized: true });
     if (ttHost) {
         const report = error => win?.console?.warn?.('鱼忆：TT 布局订阅不可用，继续使用浏览器视口。', error);
         const release = fn => { try { Promise.resolve(fn?.()).catch(report); } catch (error) { report(error); } };
@@ -267,19 +301,25 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
         }).catch(report);
     }
     const setDock = patch => {
+        if (typeof patch?.visible === 'boolean') dock = { ...dock, visible: patch.visible };
         if (['left', 'right'].includes(patch?.edge)) dock = { ...dock, edge: patch.edge };
         if (Number.isFinite(patch?.fraction)) dock = { ...dock, fraction: clamp(patch.fraction, 0, 1) };
         if (['compact', 'full'].includes(patch?.size)) dock = { ...dock, size: patch.size };
-        save(); layout();
+        save(); setExpanded(); layout();
+    };
+    const setVariant = variant => {
+        const next = variant === 'lazy' ? 'lazy' : 'full';
+        if (panel.dataset.variant === next) return;
+        panel.dataset.variant = next; layout();
     };
     return { element, panel, body, bubble, titleSlot, statusSlot, bindEntry, open, close, toggle: () => opened ? close() : open(), render,
-        dock: () => ({ ...dock }), setDock,
+        dock: () => ({ ...dock }), setDock, setVariant,
         destroy() {
             if (destroyed) return;
             if (opened && element.contains(doc.activeElement)) close();
             destroyed = true; releaseTt?.(); releaseTt = null;
             for (const remove of listeners) remove(); observer?.disconnect();
-            for (const entry of entries) entry.setAttribute('aria-expanded', 'false');
+            for (const entry of entries) { entry.setAttribute('aria-expanded', 'false'); entry.removeEventListener('click', open); }
             entries.clear(); drag = null; element.remove();
         } };
 }

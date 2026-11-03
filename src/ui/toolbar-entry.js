@@ -11,3 +11,14 @@ export function mountToolbarEntry(doc, bindEntry) {
     if (worldInfoEntry) worldInfoEntry.after(entry); else toolbar.append(entry);
     return button;
 }
+
+/** Recover when a host/theme mounts or replaces its toolbar after extension boot. */
+export function watchToolbarEntry(doc, bindEntry, Observer = doc.defaultView?.MutationObserver) {
+    let button = mountToolbarEntry(doc, bindEntry), stopped = false;
+    const refresh = () => {
+        if (!stopped && !doc.getElementById('dwm-toolbar-entry')) button = mountToolbarEntry(doc, bindEntry);
+    };
+    const observer = Observer ? new Observer(refresh) : null;
+    if (doc.body) observer?.observe(doc.body, { childList: true, subtree: true });
+    return { refresh, destroy() { stopped = true; observer?.disconnect(); button?.parentNode?.remove(); } };
+}

@@ -64,6 +64,7 @@ for (const mode of ['select', 'maintain', 'compact']) test(`${mode} rejects a re
         entered.resolve(); await resume.promise;
         return request.purpose === 'select' ? { ids: [] } : { operations: [{ type: 'summary', text: 'A result based on the previous source.' }] };
     });
+    if (mode === 'compact') f.c.store.state.data.summary = '已有脉络';
     const before = structuredClone(f.c.store.state);
     const running = mode === 'select' ? f.c.generationBefore({ type: 'normal' }) : f.c[mode]();
     const checked = mode === 'select' ? running : assert.rejects(running, /原书已变化/);

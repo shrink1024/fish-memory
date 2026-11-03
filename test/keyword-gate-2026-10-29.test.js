@@ -4,6 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Controller } from '../src/runtime/controller.js';
+import { selectionCatalog } from '../src/agents/selection-codec.js';
 import { compileRules, evaluateRules, formToScript } from '../src/rules/index.js';
 import { gatedIds } from '../src/core/focus.js';
 import { gatedTier } from '../src/core/state.js';
@@ -111,7 +112,7 @@ test('review 10-29: once its keyword appears, a gated entry the scan judged impo
     const id = title => Object.values(c.store.state.data.entries).find(e => e.title.startsWith(title)).id;
     const [ferry, boatman] = [id('支线'), id('人物')];
     await c.generationBefore({ type: 'normal' });
-    const catalog = calls.findLast(x => x.purpose === 'select').input.catalog;
+    const catalog = selectionCatalog(calls.findLast(x => x.purpose === 'select').input);
     assert.equal(catalog.find(e => e.id === ferry).constant, false, 'offered as on demand, the tier the panel shows');
     assert.ok(!c.diagnostics.lastPlan.mandatoryIds.includes(ferry) && !c.diagnostics.lastPlan.selectedIds.includes(ferry), 'the model did not pick it, so it is not sent');
     assert.equal(catalog.find(e => e.id === boatman).constant, true, 'an important entry without a gate keeps its meaning');
@@ -120,7 +121,7 @@ test('review 10-29: once its keyword appears, a gated entry the scan judged impo
     // The preview reads the same gate: held back without the keyword, on demand with it.
     const stage = (result, id) => result.stages.find(s => s.id === id);
     let preview = await c.previewPrompts();
-    assert.equal(stage(preview, 'select').input.catalog.find(e => e.id === ferry).constant, false);
+    assert.equal(selectionCatalog(stage(preview, 'select').input).find(e => e.id === ferry).constant, false);
     assert.ok(!stage(preview, 'narration').input.worldbookCandidates.some(e => e.id === ferry));
     state.userInput = '走吧';
     preview = await c.previewPrompts();

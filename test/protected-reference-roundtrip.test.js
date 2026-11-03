@@ -65,11 +65,12 @@ test('unknown, stale and malformed references never reach persistence', async ()
 
 test('compaction restores only references in its actual event subset and merge sources', async () => {
     const save = fixture(); save.data.summary = '';
+    save.data.entries.npc.source = { book: 'book', uid: 'npc', original: entryText(save.data.entries.npc) };
     save.data.entries.e1 = createEntry({ id: 'e1', kind: 'event', title: '前事', text: `抵达${place}。`, evidence: ['m0'] });
     save.data.entries.e2 = createEntry({ id: 'e2', kind: 'event', title: '后事', text: `离开${place}。`, evidence: ['m1'] });
     const merged = await compact({ complete: async ({ input }) => ({ operations: [{ type: 'mergeEvents',
         sources: input.memory.entries.map(entry => ({ id: entry.id, expectedVersion: entry.version })), targetId: 'e1',
-        title: '旅程', intro: '两次事件', text: input.memory.entries.map(entry => entry.segments[0].text).join(''), evidence: ['m0', 'm1'] }] }) }, save);
+        title: '旅程', intro: '两次事件', text: input.memory.entries.map(entry => entry.segments[0].text).join(''), evidence: input.memory.entries.flatMap(e=>e.evidence) }] }) }, save);
     const next = apply(save, merged).next;
     assert.equal(entryText(next.entries.e1), `抵达${place}。离开${place}。`);
     await assert.rejects(compact({ complete: async ({ input }) => {
@@ -77,8 +78,8 @@ test('compaction restores only references in its actual event subset and merge s
         // The hidden NPC reference was allocated first by maintenanceView but
         // was removed from compact's request; guessing its index grants nothing.
         const hidden = reference(input.memory.entries[0].segments[0].text).replace(/:\d+⟧$/u, ':1⟧');
-        return { operations: [{ type: 'update', id: 'e1', expectedVersion: 1, evidence: ['m0'], segments: [{ id: 'body', text: hidden }] }] };
-    } }, save), /引用.*(?:来源|字段|提供)|(?:来源|字段|提供).*引用/);
+        return { operations: [{ type: 'update', id: 'e1', expectedVersion: 1, evidence: input.memory.entries[0].evidence, segments: [{ id: 'body', text: hidden }] }] };
+    } }, save), /引用.*(?:来源|字段|提供)|(?:来源|字段|提供).*引用|未知或过期的受保护引用/);
 });
 
 test('literal reference-like story text is escaped without colliding with internal references', async () => {

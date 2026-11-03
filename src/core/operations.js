@@ -1,6 +1,6 @@
 import { clone, invariant, plainText, uid, limitText } from './util.js';
 import { assertNoPendingProtectedReferences } from './views.js';
-import { createEntry, assertOriginalPreserved, entryText, entryScope, normalizeScopeId, scopeSummary, GLOBAL_SCOPE } from './state.js';
+import { createEntry, assertOriginalPreserved, entryText, entryScope, normalizeScopeId, scopeSummary, canCompactEntry, entryTier, GLOBAL_SCOPE } from './state.js';
 
 // Navigation sources, not a claim that every retained fact is supported by every
 // source. Keep both the early origin and recent changes without endless growth.
@@ -82,7 +82,7 @@ export function applyMaintenance(data, result, { allowedEvidence = [], maxChars 
             retainEvidence(e, evidence(op.evidence));
             e.version++;
             touched.add(e.id);
-        } else if (op.type === 'mergeEvents') {
+        } else if (['mergeEvents', 'mergeEntries'].includes(op.type)) {
             invariant(Array.isArray(op.sources) && op.sources.length >= 2 && op.sources.length <= 100,
                 '事件整合至少需要两个已有条目');
             const ids = op.sources.map(source => source?.id);
@@ -92,11 +92,11 @@ export function applyMaintenance(data, result, { allowedEvidence = [], maxChars 
             const sources = op.sources.map(source => {
                 const current = next.entries[source.id];
                 invariant(current && entryScope(current) === scopeId, '事件整合不能跨资料范围');
-                invariant(current?.kind === 'event' && !current.source && current.enabled
-                    && current.segments.every(segment => segment.writable), '只能整合可维护的自建事件');
+                invariant(canCompactEntry(current) && (op.type === 'mergeEntries' || current.kind === 'event'), '只能整合未受保护的鱼忆新增条目');
                 invariant(source.expectedVersion === current.version, '事件版本已变化，请重新整理');
                 return current;
             });
+            if (op.type === 'mergeEntries') invariant(sources.every(e => e.kind === sources[0].kind), '合并条目须属于同一类型');
             invariant(Array.isArray(op.evidence) && op.evidence.length > 0, '事件整合需要依据');
             const cited = evidence(op.evidence);
             const title = plainText(op.title, '整合事件名称', 500);
@@ -113,7 +113,11 @@ export function applyMaintenance(data, result, { allowedEvidence = [], maxChars 
             const id = target?.id ?? idFactory('entry');
             invariant(target || !next.entries[id], '新事件身份重复');
             const merged = createEntry({
-                id, scopeId, title, kind: 'event', intro, retrieveWhen, text,
+                id, scopeId, title, kind: op.type === 'mergeEntries' ? sources[0].kind : 'event', intro, retrieveWhen, text,
+                ...(op.type === 'mergeEntries' ? {
+                    important: sources.some(e => e.important), constant: sources.some(e => e.constant),
+                    ...(sources.some(e => e.tier) ? {tier:sources.some(e => entryTier(e) === 'constant')?'constant':'onDemand'} : {}),
+                } : {}),
                 evidence: mergedEvidence, lineage,
                 version: target ? target.version + 1 : 1,
                 enabled: true,

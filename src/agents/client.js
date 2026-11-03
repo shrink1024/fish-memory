@@ -1,3 +1,4 @@
+import { readStreamResponse } from './stream-response.js';
 import { throwIfAborted, combineSignals, timeoutSignal } from '../platform/abort.js';
 import { invariant, plainText } from '../core/util.js';
 import { DEFAULT_SETTINGS, validTimeout } from '../core/state.js';
@@ -187,7 +188,7 @@ export function boundedResponseLength(requested, configured, metadata) {
 export function assertCompleteModelResponse(payload) {
     const reason = String(payload?.choices?.[0]?.finish_reason ?? payload?.stop_reason ?? payload?.candidates?.[0]?.finishReason ?? '').toLowerCase();
     if (['length', 'max_tokens', 'max_output_tokens'].includes(reason) || payload?.stopped_limit === true) {
-        throw Object.assign(new Error('辅助模型达到输出长度上限，返回结果已截断或未生成正文，本次未采用。请提高输出上限、调低思考强度、减少每批扫描量或改用支持更长输出的辅助模型后重试。'), { name: 'OutputLimitError' });
+        throw Object.assign(new Error('辅助模型达到输出长度上限，返回结果已截断或未生成正文，本次未采用。请提高输出上限、调低思考强度、减少每批扫描量或改用支持更长输出的辅助模型后重试。'), { name: 'OutputLimitError', dwmStreamFault: 'length' });
     }
     if (BLOCK_FINISH.has(reason) || payload?.promptFeedback?.blockReason || payload?.prompt_feedback?.block_reason) {
         throw blockedResponse(payload?.promptFeedback?.blockReason ?? payload?.prompt_feedback?.block_reason
@@ -207,13 +208,38 @@ export function blockedResponse(reason = '') {
 }
 
 /** Return fixed, useful error categories without exposing server text/secrets. */
-export function modelApiError(payload, status) {
+export function modelApiError(payload, status, { nativeTauri = false } = {}) {
     const raw = typeof payload?.error === 'string' ? payload.error : payload?.error?.message ?? payload?.message ?? '';
-    const message = String(raw), http = Number.isInteger(status) ? `（HTTP ${status}）` : '';
+    const message = String(raw), transportStatus = status;
+    // TT's native custom backend wraps non-success upstream responses in 502.
+    // Accept its observed, anchored envelope only; do not infer codes from
+    // arbitrary provider text (or from story content).
+    const tauriStatus = status === 502 || nativeTauri ? /^Custom OpenAI endpoint failed with status ([45]\d\d):/.exec(message) : null;
+    if (tauriStatus) status = Number(tauriStatus[1]);
+    // ST may report an upstream failure as HTTP 200 and retain only its
+    // standard status text. Read codes/flags before discarding provider text.
+    if (!Number.isInteger(status) || status < 400) {
+        const codes = [payload?.error?.status, payload?.error?.status_code, payload?.error?.code, payload?.status, payload?.status_code];
+        status = codes.map(Number).find(code => Number.isInteger(code) && code >= 400 && code <= 599)
+            ?? ({'gateway timeout':504,'payment required':402,'too many requests':429,'unauthorized':401,'forbidden':403,
+                'bad gateway':502,'service unavailable':503,'internal server error':500}[message.trim().toLowerCase()]);
+    }
+    const error = modelApiErrorCategory(payload, status, message);
+    // Keep unknown API errors distinguishable from persistence or cancellation.
+    if (!error.kind) error.kind = 'model';
+    if (Number.isInteger(status)) error.httpStatus = status;
+    if (Number.isInteger(transportStatus) && transportStatus !== status) error.transportStatus = transportStatus;
+    return error;
+}
+function modelApiErrorCategory(payload, status, message) {
+    const http = Number.isInteger(status) ? `（HTTP ${status}）` : '';
     if (/candidate text empty/i.test(message)) return missingResponse('empty');
     if (/prompt was blocked|block_?reason|PROHIBITED_CONTENT|content[_ ]?filter|content_policy_violation|ResponsibleAIPolicyViolation/i.test(message)) {
         return blockedResponse(/\b(PROHIBITED_CONTENT|SAFETY|BLOCKLIST|SPII|IMAGE_SAFETY|OTHER)\b/.exec(message)?.[1] ?? '');
     }
+    if (status === 504) return Object.assign(new Error('辅助接口网关等待超时（HTTP 504），结果未采用。请检查服务方状态后重试。'), {httpStatus:status,kind:'timeout'});
+    if (status === 402 || payload?.quota_error === true || payload?.error?.type === 'insufficient_quota'
+        || /no active subscription|insufficient[_ ]quota|订阅额度不足|未配置订阅|余额不足/i.test(message)) return Object.assign(new Error(`辅助接口订阅或额度不可用${http}，结果未采用。请检查账户订阅与模型权限。`), {httpStatus:status,kind:'quota'});
     if (status === 401) return new Error(`辅助模型连接鉴权失败${http}。请检查辅助连接的 API 密钥是否填写正确、是否已失效，再重试。`);
     if (status === 403) return new Error(`辅助模型连接被拒绝${http}。请检查 API 密钥、账户和所选模型的访问权限，再重试。`);
     if (status === 429) return new Error(`辅助模型请求受到频率或额度限制${http}。请检查账户额度或稍后重试。`);
@@ -232,17 +258,17 @@ export class AgentClient {
         this.timeoutMs = timeoutMs ?? DEFAULT_SETTINGS.timeoutMs;
         // An explicit legacy timeout still covers every purpose unless separately overridden.
         this.initializationTimeoutMs = initializationTimeoutMs ?? timeoutMs ?? DEFAULT_SETTINGS.initializationTimeoutMs;
-        invariant(validTimeout(this.timeoutMs) && validTimeout(this.initializationTimeoutMs), '辅助模型等待时间应为 0（关闭插件限时）或 1000–86400000 毫秒的整数');
+        invariant(validTimeout(this.timeoutMs) && validTimeout(this.initializationTimeoutMs), '辅助模型超时时间应为 0（关闭插件限时）或 1000–86400000 毫秒的整数');
         this.getTimeouts = getTimeouts;
     }
     async completeValidated(request, validate) { return this.complete({ ...request, validate }); }
-    async complete({ purpose, system, input, head, tail, signal, validate = result => result, onAttempt }) {
+    async complete({ purpose, system, input, head, tail, signal, validate = result => result, onAttempt, onProgress }) {
         throwIfAborted(signal);
         // Read settings once for this request. Saving new limits does not alter work already in flight.
         const current = this.getTimeouts?.();
         const longTask = ['initialize', 'strategy', 'maintain', 'compact', 'sourceMerge'].includes(purpose);
         const timeoutMs = longTask ? current?.initializationTimeoutMs ?? this.initializationTimeoutMs : current?.timeoutMs ?? this.timeoutMs;
-        invariant(validTimeout(timeoutMs), '辅助模型等待时间应为 0（关闭插件限时）或 1000–86400000 毫秒的整数');
+        invariant(validTimeout(timeoutMs), '辅助模型超时时间应为 0（关闭插件限时）或 1000–86400000 毫秒的整数');
         const deadline = timeoutSignal(timeoutMs);
         const combinedScope = combineSignals([signal, deadline.signal]);
         const combined = combinedScope.signal;
@@ -255,6 +281,7 @@ export class AgentClient {
                     ...(head?.length ? { head } : {}), ...(tail?.length ? { tail } : {}),
                     ...(recovery ? { recovery } : {}),
                     reasoningEffort: current?.auxReasoningEffort ?? DEFAULT_SETTINGS.auxReasoningEffort,
+                    stream: Boolean(current?.auxiliaryStream), onProgress,
                     signal: combined, responseLength: auxiliaryResponseLength(purpose, input) };
                 const started = onAttempt?.({ ...request, attempt });
                 if (started && typeof started.then === 'function') await started;
@@ -279,7 +306,7 @@ export class AgentClient {
         } catch (error) {
             // A host may throw its own AbortError; preserve the caller's cancellation first.
             throwIfAborted(signal);
-            if (deadline.signal?.aborted) throw new DOMException(`辅助模型请求已等待 ${timeoutMs / 1000} 秒，现已超时，迟到结果不会采用。可在“设置 → 辅助模型等待时间”提高上限或关闭插件限时后重试。`, 'TimeoutError');
+            if (deadline.signal?.aborted) throw new DOMException(`辅助模型请求已等待 ${timeoutMs / 1000} 秒，现已超时，迟到结果不会采用。可在“设置 → 高级 → 超时时间”提高上限或关闭插件限时后重试。`, 'TimeoutError');
             throw error;
         } finally { combinedScope.dispose(); deadline.dispose(); }
     }
@@ -349,10 +376,10 @@ export function compatibleConnection({ endpoint, model, apiKey = '', fetchImpl =
     // Some gateways reject reasoning_effort outright. A rejected (unbilled)
     // request is resent once without it and the parameter is dropped afterwards.
     let effortRejected = false;
-    return async ({ purpose, system, input, head, tail, recovery, reasoningEffort, signal, responseLength = auxiliaryResponseLength(purpose) }) => {
+    return async ({ purpose, system, input, head, tail, recovery, reasoningEffort, stream = false, onProgress, signal, responseLength = auxiliaryResponseLength(purpose) }) => {
         const send = effort => fetchImpl(url.href.replace(/\/$/, '') + '/chat/completions', {
             method: 'POST', headers: { 'Content-Type': 'application/json', ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
-            body: JSON.stringify({ model, messages: requestMessages({ system, input, head, tail, recovery }), stream: false,
+            body: JSON.stringify({ model, messages: requestMessages({ system, input, head, tail, recovery }), stream,
                 ...(omitLength ? {} : { [lengthParameter]: explicitLength ? Number(maxOutputTokens) : responseLength }),
                 ...(effort ? { reasoning_effort: effort } : {}) }), signal,
         });
@@ -366,9 +393,11 @@ export function compatibleConnection({ endpoint, model, apiKey = '', fetchImpl =
         }
         if ([401, 403].includes(response.status)) throw modelApiError(null, response.status);
         let payload;
-        try { payload = await response.json(); }
-        catch {
+        try { payload = stream && response.headers?.get('content-type')?.includes('text/event-stream')
+            ? await readStreamResponse(response, { signal, onProgress, mapError: value => modelApiError(value, response.ok ? undefined : response.status) }) : await response.json(); }
+        catch (error) {
             throwIfAborted(signal);
+            if (error?.dwmStreamFault) throw error;
             if (!response.ok) throw modelApiError(null, response.status);
             throw new Error('辅助模型接口未返回有效的 JSON 响应。请检查辅助连接地址是否为兼容接口，再重试。');
         }

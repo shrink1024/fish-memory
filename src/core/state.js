@@ -6,6 +6,7 @@ export const KINDS = ['fact', 'rule', 'npc', 'npc_pool', 'event', 'inventory'];
 export const MAINTENANCE_EVERY_MAX = 1000;
 export const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
+    lazyMode: false,
     inventoryEnabled: true,
     windowEnabled: true,
     // 'worldbook' keeps only dynamic entries plus selection: no summary, events or inventory.
@@ -16,6 +17,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
     scanConcurrency: 3,
     // Thinking effort for auxiliary tasks; 'inherit' follows the story preset.
     auxReasoningEffort: 'low',
+    auxiliaryStream: false,
     recentTurns: 12,
     batchChars: 18000,
     // Initialization history batches. Each batch carries fixed memory overhead,
@@ -76,6 +78,7 @@ export function scannedTier(entry) {
     return !entry?.enabled ? 'off' : entry.constant || entry.important ? 'constant' : 'onDemand';
 }
 export function entryTier(entry) { return TIERS.includes(entry?.tier) ? entry.tier : scannedTier(entry); }
+export const canCompactEntry = entry => Boolean(entry?.enabled && !entry.source && entry.origin !== 'import' && ['fact', 'npc', 'npc_pool', 'event'].includes(entry.kind) && entry.segments.every(s => s.writable));
 export const alwaysSent = entry => entryTier(entry) === 'constant';
 /** Tier under an author `gate`: the gate yields to a source blue lamp or a
  * player-set constant, not to the scan's guess that an entry is important. */
@@ -110,10 +113,11 @@ export function createEntry(input) {
         ...(input.origin === 'import' ? { origin: 'import' } : {}),
         // The auxiliary provider refused to scan it; sent as the original book does.
         ...(input.scanBlocked === true ? { scanBlocked: true } : {}),
+        ...(input.scanPiece ? {scanPiece: clone(input.scanPiece)} : {}),
     };
     invariant(KINDS.includes(entry.kind), `未知条目类型：${entry.kind}`);
     invariant(typeof entry.id === 'string' && entry.id.length < 1000, '无效条目身份');
-    invariant(Array.isArray(entry.segments) && entry.segments.length > 0 && entry.segments.length <= 100, '条目必须包含 1–100 个片段');
+    invariant(Array.isArray(entry.segments) && entry.segments.length > 0 && entry.segments.length <= 4096, '条目必须包含 1–4096 个片段');
     invariant(Array.isArray(entry.lineage) && entry.lineage.length <= 10000
         && entry.lineage.every(id => typeof id === 'string' && id.length > 0 && id.length < 1000)
         && new Set(entry.lineage).size === entry.lineage.length, '事件来源链无效');
@@ -171,16 +175,44 @@ export function validateSave(save) {
             '原书分类基准无效');
         }
     }
+    for (const [id, held] of Object.entries(save.sourceHeld ?? {})) {
+        const next = createEntry(held?.next);
+        invariant(next.id === id && next.source && save.data.entries[id]?.source
+            && next.source.book === save.data.entries[id].source.book
+            && String(next.source.uid) === String(save.data.entries[id].source.uid), '待决定的来源条目无效');
+        invariant(entryText(next) === next.source.original && Array.isArray(next.source.baselineSegments)
+            && next.source.baselineSegments.map(segment => segment.text).join('') === next.source.original, '待决定的来源基线不完整');
+    }
     return save;
 }
 
+/** Exact source slices, never cut a UTF-16 surrogate pair or discard bytes. */
+export function splitSourceText(text, size = 100000) {
+    invariant(typeof text === 'string', '源正文必须是文本');
+    invariant(Number.isInteger(size) && size >= 2 && size <= 100000, '源正文片段大小无效');
+    const segments = [];
+    for (let start=0; start<text.length;) {
+        let end=Math.min(text.length,start+size);
+        if (end<text.length && /[\uD800-\uDBFF]/.test(text[end-1]) && /[\uDC00-\uDFFF]/.test(text[end])) end--;
+        segments.push({id:segments.length?`body-${segments.length}`:'body',text:text.slice(start,end),writable:false});start=end;
+    }
+    return segments.length?segments:[{id:'body',text:'',writable:false}];
+}
+
 export function makeSourceEntry(book, raw) {
+    for (const [field, value, limit] of [['title', raw.comment || `条目 ${raw.uid}`, 500], ['body', raw.content ?? '', 10000000]]) {
+        if (typeof value !== 'string' || value.length > limit) {
+            const info = { book: String(book), uid: String(raw.uid), title: String(raw.comment || `条目 ${raw.uid}`).slice(0, 500), field, length: typeof value === 'string' ? value.length : null, limit };
+            const label = field === 'title' ? '条目名称' : '源条目正文';
+            throw Object.assign(new Error(`${label} 必须是长度不超过 ${limit} 的文本；条目 ${String(raw.uid)}（${info.title.slice(0,80)}），${info.length === null ? '当前字段不是文本' : `实际 ${info.length} 字符`}。原资料保留。`), { dwmEntryError: info });
+        }
+    }
     return createEntry({
         id: sourceId(book, raw.uid), title: raw.comment || `条目 ${raw.uid}`,
         text: raw.content ?? '', enabled: !raw.disable, constant: raw.constant,
         source: { book, uid: raw.uid, original: raw.content ?? '', metadata: clone(raw) },
         // Initialization must classify before this entry can be maintained.
-        segments: [{ id: 'body', text: raw.content ?? '', writable: false }],
+        segments: splitSourceText(raw.content ?? ''),
         needsReview: true,
     });
 }

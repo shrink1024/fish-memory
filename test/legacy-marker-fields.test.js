@@ -67,7 +67,7 @@ test('merged events carry only their sources’ markers, once per batch', async 
     save.data.entries.e3 = createEntry({ id: 'e3', kind: 'event', title: '无关', intro: '无关', retrieveWhen: '无关', text: '无关。', evidence: ['m0'] });
     const merge = extra => ({ type: 'mergeEvents', sources: [{ id: 'e1', expectedVersion: 1 }, { id: 'e2', expectedVersion: 1 }],
         title: '相识', intro: '两次见面', retrieveWhen: '回忆相识', text: `初遇${M}。重逢。`, evidence: ['m0'], ...extra });
-    const tidy = operations => compact({ complete: async () => ({ operations }) }, save);
+    const tidy = operations => compact({ complete: async ({input}) => ({ operations:operations.map(op=>({...op,evidence:input.memory.entries[0].evidence})) }) }, save);
     const merged = apply(save, await tidy([merge()]));
     assert.equal(count(Object.values(merged.entries)), 1);
     for (const operations of [

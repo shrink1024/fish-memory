@@ -40,3 +40,9 @@ export function createSettingsPersistence({ extensionSettings, saveSettings, get
         }
     };
 }
+
+/** New installations opt in; an existing subtree never silently opts in. */
+export function initialSettings(extensionSettings) {
+    const existing = extensionSettings.dwm;
+    return { ...(existing ?? {}), lazyMode: existing == null ? true : existing.lazyMode === true };
+}

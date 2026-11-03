@@ -73,7 +73,7 @@ test('invalid stored timeouts fall back safely while invalid updates never save 
         assert.equal(f.controller.settings.timeoutMs, 300000);
         assert.equal(f.controller.settings.initializationTimeoutMs, 1800000);
         for (const key of ['timeoutMs', 'initializationTimeoutMs']) {
-            await assert.rejects(f.controller.updateSettings({ [key]: value }), /等待时间/);
+            await assert.rejects(f.controller.updateSettings({ [key]: value }), /超时时间/);
         }
         assert.equal(f.controller.settings.timeoutMs, 300000);
         assert.equal(f.controller.settings.initializationTimeoutMs, 1800000);

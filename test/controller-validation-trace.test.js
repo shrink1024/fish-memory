@@ -82,7 +82,7 @@ test('Controller preset scan records candidate validation failures in request di
 for (const { task, reply, error, run } of [
     { task: 'strategy', reply: { strategy: 7 }, error: /记忆策略/, run: client => alignStrategy(client, ['策略甲', '策略乙'], [], '') },
     { task: 'select', reply: { ids: ['unavailable-entry'] }, error: /不允许的资料/, run: client => select(client, createSave('synthetic', 'world'), []) },
-    { task: 'compact', reply: { operations: [{ type: 'inventory', items: [] }] }, error: /整理只能更新/, run: client => compact(client, createSave('synthetic', 'world')) },
+    { task: 'compact', reply: { operations: [{ type: 'inventory', items: [] }] }, error: /整理只能更新/, run: client => {const save=createSave('synthetic','world');save.data.summary='合成脉络';return compact(client,save);} },
 ]) test(`${task} task validation remains inside the Controller request diagnostics`, async () => {
     const f = fixture({ answer: () => clone(reply) });
     await assert.rejects(run(f.controller.client), error);

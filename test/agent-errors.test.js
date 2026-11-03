@@ -47,7 +47,7 @@ test('timed out requests explain their actual budget and never adopt a late host
     const rejected = assert.rejects(pending, error => {
         assert.equal(error.name, 'TimeoutError');
         assert.match(error.message, /180\s*秒/);
-        assert.match(error.message, /设置.*辅助模型等待时间/);
+        assert.match(error.message, /设置.*高级.*超时时间/);
         assert.match(error.message, /关闭插件限时/);
         assert.match(error.message, /重试/);
         return true;

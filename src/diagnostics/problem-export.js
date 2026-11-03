@@ -68,12 +68,13 @@ export function createProblemExporter({ controller, context = () => ({}), timers
                 // Reuse the trace store's credential filtering and hard size bound.
                 const filter = createTraceStore({ maxRecords: 1, maxChars: 5000000, maxRecordChars: 5000000 });
                 const id = filter.start({ context: current, memory: {
-                    status: view.status, error: view.error, initialized: currentStore?.initialized ?? false,
+                    status: view.status, error: view.error, errorInfo: view.errorInfo, connectionSave: controller.connectionDiagnostics?.(), initialized: currentStore?.initialized ?? false,
                     enabled: view.enabled, saveEnabled: view.saveEnabled, initialization: view.initialization,
                     readiness: view.readiness, worldbook: view.worldbook,
                     revision: currentStore?.revision, activity: view.activity, autoPostPaused: view.autoPostPaused,
                     scope: currentStore?.data?.scopeContext, pendingCount: view.diagnostics?.pendingCount,
                     window: view.window, warnings: view.warnings,
+                    lazy: view.lazy, lazyTrigger: controller.diagnostics?.lazy,
                     lastPlan: currentStore ? controller.diagnostics?.lastPlan : null,
                 }, sources: attached }); filter.finish(id);
                 const captured = filter.snapshot().records[0];

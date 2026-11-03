@@ -162,3 +162,15 @@ test('review 10-29: an unsaved key stays put across a refresh but never follows 
     button('应用连接').click(); await tick();
     assert.equal(store.data.profiles.find(profile => profile.name === 'B').apiKey, 'fake-b', 'B keeps its own key');
 });
+
+
+test('failed persistence is distinct from the live connection and retries contain no credential diagnostics',async()=>{
+ const store=memoryStore();let fail=false;const save=store.save,profiles=store.saveProfiles;
+ store.save=value=>{if(fail)throw new DOMException('private message','QuotaExceededError');save(value)};
+ store.saveProfiles=value=>{if(fail)throw new DOMException('private message','SecurityError');profiles(value)};
+ const c=new Controller(host(),{connectionStore:store});await c.updateConnection({mode:'compatible',endpoint:'https://a.example/v1',model:'old',apiKey:'old-fake'});
+ fail=true;await c.updateConnection({mode:'compatible',endpoint:'https://b.example/v1',model:'new',apiKey:'new-fake'});await assert.rejects(c.saveConnectionProfile('new-profile'),/本机保存失败/);
+ assert.equal(c.view().connection.model,'new');assert.equal(c.view().connectionPersist.lastSaved,'old');
+ const diagnostics=JSON.stringify(c.connectionDiagnostics());assert.doesNotMatch(diagnostics,/example|fake|private message|new-profile/);assert.match(diagnostics,/QuotaExceededError/);
+ fail=false;await c.retryConnectionSave();assert.equal(c.view().connectionPersist.state,'saved');assert.equal(store.data.current.model,'new');assert.equal(store.data.profiles[0].name,'new-profile');
+});

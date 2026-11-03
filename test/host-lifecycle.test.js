@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createSillyTavernHost } from '../src/adapters/sillytavern.js';
+import { Controller } from '../src/runtime/controller.js';
 
 const deferred = () => { let resolve; const promise = new Promise(yes => { resolve = yes; }); return { promise, resolve }; };
 const tick = () => new Promise(resolve => setImmediate(resolve));
@@ -188,4 +189,44 @@ test('only a matching native reply retires the used plan', async () => withHost(
     assert.equal(hasMemory(f), false);
     assert.equal(f.state.locked, true, 'Fish never takes over native completion UI cleanup');
     assert.equal(f.state.ended, 1);
+}));
+
+for (const outcome of ['disconnected', 'stopped', 'idle-before-input', 'resumed-after-idle']) test(`scanning resumes after an owned native ${outcome} turn`, async () => withHost(async (f, host) => {
+    const previousTemplate=globalThis.EjsTemplate, entered=deferred(), gate=deferred(); let disk;
+    globalThis.EjsTemplate={getFeatures:()=>({enabled:true})};
+    f.live.chat=[{is_user:true,mes:'合成旧剧情',extra:{}}];
+    f.deps.worldInfo.loadWorldInfo=async()=>({entries:{1:{uid:1,content:'合成资料'}}});
+    host.storage.read=async()=>structuredClone(disk);host.storage.write=async(_,value)=>{disk=structuredClone(value)};
+    const c=new Controller(host,{settings:{lazyMode:true},lazyClock:{setTimer:()=>1,clearTimer(){}},model:{complete:async r=>{
+        if(r.purpose!=='initialize')return {operations:[]};entered.resolve();await gate.promise;
+        return {strategy:'s',entries:r.input.entries.map(e=>({id:e.id,kind:'fact',intro:'i',segments:[{id:'body',writable:true}]}))};
+    }}});
+    host.bindController(c);
+    try {
+        await c.start();await entered.promise;
+        if(outcome==='disconnected'){
+            f.live.onlineStatus='no_connection';await assert.rejects(f.send(),{name:'AbortError'});
+        }else if(outcome==='stopped'){await f.send();f.activate();await f.events.emit(f.types.GENERATION_STOPPED);}
+        else{
+            await beforeNative(f);
+            f.activate();await tick(); // ST ping/CSRF failure before reading the textarea.
+            assert.equal(c.view().lazy.status.deferredTurn,false,'idle host with an untouched draft must release the scan wait');
+            if(outcome==='resumed-after-idle'){
+                // END can also be foreign: the same native send may later
+                // consume the draft. Keep a partial assistant reply out of memory.
+                f.state.locked=true;
+                f.live.chat.push({is_user:true,mes:f.textarea.value,extra:{}});f.textarea.edit('',false);
+                await f.events.emit(f.types.MESSAGE_SENT,1);
+                assert.equal(c.view().lazy.status.deferredTurn,true);
+                gate.resolve();await tick();assert.equal(c.store.state.initialized,false);
+                f.live.chat.push({is_user:false,mes:'partial',extra:{}});
+                f.activate();await tick();
+                assert.equal(c.view().lazy.status.deferredTurn,true,'an unrelated END after input consumption must not release the scan');
+                assert.equal(c.store.state.initialized,false);
+                f.live.chat[2].mes='complete reply';await f.events.emit(f.types.MESSAGE_RECEIVED,2,'normal');
+            }
+        }
+        assert.equal(c.view().lazy.status.deferredTurn,false,'the cancelled native turn must not pin initialization forever');
+        gate.resolve();await c.readinessChanged();assert.equal(c.store.state.initialized,true);
+    }finally{gate.resolve();c.cancel();await c.setLazyMode(false);globalThis.EjsTemplate=previousTemplate;}
 }));

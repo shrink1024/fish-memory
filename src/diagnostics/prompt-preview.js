@@ -1,3 +1,4 @@
+import { compactPlans } from '../agents/compact-plan.js';
 import { clone, isPrefix } from '../core/util.js';
 import { DEFAULT_SETTINGS, makeSourceEntry, entryText, normalizeScopeId, readableScopes, entryScope } from '../core/state.js';
 import { applyRules, compileRules, discoverRules, evaluateRules } from '../rules/index.js';
@@ -136,6 +137,6 @@ export function buildPromptPreview({ snapshot, save = null, selectionSave = save
     if (pending.length || busy.maintaining) compactNotes.push('下方 memory 是当前版本；维护完成后的脉络与事件可能变化。');
     if (deferred) compactNotes.push('角色卡提交范围前不会启动整理。');
     stages.push(stage(AGENTS.maintain, 'compact', '整理事件', 'conditional', '展示当前活动范围的脉络与可读事件；玩家主动整理时也使用此请求结构。',
-        compactRequest(safeSave, normalizeScopeId(save.data.scopeContext?.activeScopeId)), compactNotes));
+        compactPlans(compactRequest(safeSave, normalizeScopeId(save.data.scopeContext?.activeScopeId)))[0]?.request ?? {system:COMPACT,input:{memory:{entries:[]}}}, [...compactNotes,'整理按总输入预算分批；此处只展示第一批，来源 key 已映射为短引用。']));
     return { at, chatId: context.chatId ?? null, revision: save.revision, warnings, stages };
 }

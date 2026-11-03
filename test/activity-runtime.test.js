@@ -202,12 +202,13 @@ test('cancelled automatic maintenance does not continue into automatic compactio
 test('event compaction exposes its own task and logical cancellation ignores its late result', async () => {
     const response = gate();
     const f = await ready({ handler: request => request.purpose === 'compact' ? response.promise : undefined });
+    f.controller.store.state.data.summary = '已有脉络';
     const compacting = f.controller.compact(); compacting.catch(() => {});
     await until(() => f.calls.some(call => call.purpose === 'compact'));
     assert.equal(f.controller.view().activity.kind, 'compact');
     await f.controller.requestStop(); await assert.rejects(compacting, /用户已停止/);
     response.resolve({ operations: [{ type: 'summary', text: '迟到整理' }] }); await tick();
-    assert.equal(f.controller.view().save.data.summary, ''); assert.equal(f.stops, 0);
+    assert.equal(f.controller.view().save.data.summary, '已有脉络'); assert.equal(f.stops, 0);
 });
 
 test('successful event compaction clears a previous failure status and error', async () => {
@@ -215,10 +216,11 @@ test('successful event compaction clears a previous failure status and error', a
     const f = await ready({ handler: request => {
         if (request.purpose === 'compact' && fail) throw new Error('整理接口失败');
     } });
+    f.controller.store.state.data.summary = '已有脉络';
     await assert.rejects(f.controller.compact(), /整理接口失败/);
     assert.equal(f.controller.view().status, '整理未完成');
     fail = false; await f.controller.compact();
-    assert.equal(f.controller.view().status, '整理已完成'); assert.equal(f.controller.view().error, '');
+    assert.equal(f.controller.view().status, '无可合并或精简的内容，资料未变'); assert.equal(f.controller.view().error, '');
 });
 
 test('successful inventory catch-up clears a previous failure without losing retained history', async () => {
