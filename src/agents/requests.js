@@ -1,3 +1,4 @@
+import { encodeMaintenanceEvidence } from './evidence-codec.js';
 import { clone } from '../core/util.js';
 import { encodeSelectionInput } from './selection-codec.js';
 import { entryText, scopeSummary, readableScopes, canCompactEntry, GLOBAL_SCOPE } from '../core/state.js';
@@ -49,8 +50,8 @@ export function maintainRequest(save, messages, scopeId = GLOBAL_SCOPE, observed
     // Keep this projection's private reference capability for task validation;
     // serialized requests and diagnostics contain only the masked plain data.
     return { purpose: 'maintain', system: [save.summaryRewrite ? MAINTAIN_REWRITE : MAINTAIN, ...notes].join('\n'),
-        input: { memory, ...referenceInstructions(memory), ...(observedState ? { observedState: clone(observedState) } : {}),
-            messages: messages.filter(isReadableMessage).map(({ key, role, content }) => ({ key, role: sourceRole(role), content, source: '存档正文', scopeId })) } };
+        input: encodeMaintenanceEvidence({ memory, ...referenceInstructions(memory), ...(observedState ? { observedState: clone(observedState) } : {}),
+            messages: messages.filter(isReadableMessage).map(({ key, role, content }) => ({ key, role: sourceRole(role), content, source: '存档正文', scopeId })) }) };
 }
 export function selectRequest(save, messages, { eligible = () => true, selectionLimit = 16, selectionChars = 24000, observedState = null, forced = [], authorGuidance = '', messageCount = null } = {}) {
     messages = messages.filter(isReadableMessage);

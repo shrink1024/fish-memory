@@ -1,3 +1,4 @@
+import { decodeMaintenanceEvidence } from './evidence-codec.js';
 import { compactPlans, decodeCompactResult } from './compact-plan.js';
 import { selectionCatalog, decodeSelectionIds } from './selection-codec.js';
 import { classificationPieces, joinClassifications } from './classification-pieces.js';
@@ -108,7 +109,9 @@ export async function maintain(client, save, messages, signal, scopeId = GLOBAL_
             if (!followUp) needed.add(op.id);
             return false;
         }) };
-        const restored = restoreProtectedReferences(kept, request.input.memory);
+        const decoded = decodeMaintenanceEvidence(request.input, kept, op => !(save.worldbookOnly || followUp)
+            || op.type === 'update' && (!followUp || full.has(op.id)));
+        const restored = restoreProtectedReferences(decoded, request.input.memory);
         // Worldbook-only saves never keep narrative memory; ignore such operations
         // instead of failing the batch (the history window does not trim here).
         if (save.worldbookOnly || followUp) restored.operations = restored.operations.filter(op => op?.type === 'update' && (!followUp || full.has(op.id)));
