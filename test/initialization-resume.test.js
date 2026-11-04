@@ -253,3 +253,38 @@ test('a truncated checkpoint with a matching source header cannot certify missin
     assert.equal(f.calls.slice(before).filter(call => call.purpose === 'initialize').length, 2);
     assert.equal(Object.keys(resumed.store.state.data.entries).length, 2);
 });
+
+test('history reading protocol change retains book classification but discards the old filtered-history checkpoint', async () => {
+    let fail=true;
+    const f=fixture({handler:request=>{
+        if(fail&&request.purpose==='maintain'&&request.input.messages[0].key==='floor-2')throw Error('hold-history');
+    }});
+    // Initialization has its own cleaned projection; regular snapshots remain hidden.
+    f.state.messages[0].hidden=true;
+    f.host.initializationSnapshot=()=>({...clone(f.state),messages:f.state.messages.map(m=>({...m,hidden:false}))});
+    await f.controller.start();await assert.rejects(f.controller.initialize(),/hold-history/);
+    const persisted=f.saved.get('old-chat');
+    assert.equal(persisted.initializationCheckpoint.draft.processed.length,1);
+    // Simulate a history checkpoint made under the old outgoing-filter contract.
+    persisted.initializationCheckpoint.inputFingerprint='f'.repeat(64);
+    fail=false;const count=f.calls.length;const resumed=f.make();await resumed.start();
+    assert.equal(resumed.initializationResumeSummary().processedCount,0);
+    await resumed.initialize();
+    assert.deepEqual(histories(f.calls.slice(count)),['floor-1','floor-2','floor-3']);
+    assert.equal(f.calls.slice(count).some(r=>['initialize','strategy'].includes(r.purpose)),false);
+    assert.equal(resumed.store.state.rememberedKeys.length,3);
+    assert.equal(f.state.messages[0].hidden,true);
+});
+
+test('current history checkpoint resumes cleaned hidden floors without resending earlier batches', async () => {
+    let fail=true;
+    const f=fixture({handler:request=>{
+        if(fail&&request.purpose==='maintain'&&request.input.messages[0].key==='floor-2')throw Error('hold-history');
+    }});
+    f.state.messages.forEach(m=>{m.hidden=true;});
+    f.host.initializationSnapshot=()=>({...clone(f.state),messages:f.state.messages.map(m=>({...m,hidden:false}))});
+    await f.controller.start();await assert.rejects(f.controller.initialize(),/hold-history/);
+    fail=false;const count=f.calls.length;const resumed=f.make();await resumed.start();await resumed.initialize();
+    assert.deepEqual(histories(f.calls.slice(count)),['floor-2','floor-3']);
+    assert.equal(resumed.store.state.rememberedKeys.length,3);
+});

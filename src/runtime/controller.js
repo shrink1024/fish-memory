@@ -184,7 +184,7 @@ export class Controller {
                 captureNote: '辅助接口记录，未捕获网络包；模拟模式的输出为合成数据。' });
             let fallbackId = trace ? null : startFallback(serializedInput);
             const wrapChars = [...(request.head ?? []), ...(request.tail ?? [])].reduce((n, m) => n + m.content.length, 0);
-            const metric = { ...(this.#lazy?.task ? {automatic:clone(this.diagnostics.lazy)} : {}), regexSkipped: this.host.snapshot().messages.filter(m => m.regexSkipped).length, connectionToken: this.#connectionToken, task: request.purpose, at: new Date(start).toISOString(),
+            const metric = { ...(this.#lazy?.task ? {automatic:clone(this.diagnostics.lazy)} : {}), regexSkipped: (this.#initializing && request.purpose === 'maintain' ? this.#initializationSnapshot() : this.host.snapshot()).messages.filter(m => m.regexSkipped).length, connectionToken: this.#connectionToken, task: request.purpose, at: new Date(start).toISOString(),
                 inputChars: request.system.length + serializedInput.length + wrapChars, outputChars: 0, ok: false };
             try {
                 throwIfAborted(request.signal);
@@ -1239,10 +1239,13 @@ export class Controller {
             check();
         });
     }
+    #initializationSnapshot() {
+        return this.host.initializationSnapshot?.() ?? this.host.snapshot();
+    }
     #initializationInputs(store) {
         return { scopeContext: store.state.data.scopeContext, messageScopes: store.state.data.messageScopes,
             inventoryEnabled: store.state.data.inventoryEnabled, externalSources: this.#externalFingerprintEntries(store), promptRegex: this.host.promptRegexSignature?.() ?? null, ...this.#appliedRequestInputs(store),
-            classificationProtocol: 3, batchItems: INITIALIZATION_BATCH_ITEMS };
+            classificationProtocol: 3, historyReadProtocol: 2, batchItems: INITIALIZATION_BATCH_ITEMS };
     }
     /** Only what actually reaches auxiliary requests: the applied preset entries
      * and confirmed language/term preferences. The whole preset and unrelated
@@ -1446,11 +1449,11 @@ export class Controller {
                         await this.#saveActivity(activity, () => draft.initialize(ruled.entries, strategy, { baseEntries: retainedBases }));
                     }
                     await this.#saveActivity(activity, () => draft.reconcile(this.host.snapshot().messages.map(m => m.key)));
-                    await this.#processBatches(draft, this.host.snapshot().messages, signal, activity);
+                    await this.#processBatches(draft, this.#initializationSnapshot().messages, signal, activity);
                     await this.#waitForInitializationContext(activity); assertDraftCurrent();
                     // Strong sends during scanning use native prompts and are
                     // caught up only after their selected reply/scope settles.
-                    const latest = this.host.snapshot().messages, keys = latest.map(m => m.key);
+                    const latest = this.#initializationSnapshot().messages, keys = latest.map(m => m.key);
                     if (!isPrefix(draft.state.processed, keys)) await this.#saveActivity(activity, () => draft.reconcile(keys));
                     if (draft.state.processed.length < latest.length) await this.#processBatches(draft, latest, signal, activity);
                     assertDraftCurrent();

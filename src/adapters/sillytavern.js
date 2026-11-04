@@ -265,14 +265,14 @@ export async function createSillyTavernHost(deps = {}) {
         const character = live.characters?.[live.characterId ?? live.this_chid];
         const bookName = primaryBookName(character);
         const chatId = currentIdentity(live);
-        const projected = promptOptions.project === false ? (live.chat ?? []).map(m=>({content:String(m.mes??''),regexSkipped:false})) : promptRegex.project(live.chat ?? [], promptOptions);
+        const projected = promptOptions.project === false ? (live.chat ?? []).map(m=>({content:String(m.mes??''),regexSkipped:false})) : promptOptions.history ? promptRegex.projectHistory(live.chat ?? []) : promptRegex.project(live.chat ?? [], promptOptions);
         const messages = (live.chat ?? []).map((message, index) => ({
             key: messageKey(message, index, readOnly),
             role: message.is_user ? 'user' : message.extra?.dwmHidden?.owner === OWNER ? 'assistant' : message.is_system ? 'system' : 'assistant',
             content: projected[index].content,
             ...(projected[index].regexSkipped ? { regexSkipped: true } : {}),
             index,
-            hidden: Boolean(message.is_system || (windowChatId === chatId && windowKeys.has(messageKey(message, index, readOnly)))),
+            hidden: !promptOptions.history && Boolean(message.is_system || (windowChatId === chatId && windowKeys.has(messageKey(message, index, readOnly)))),
             hiddenBy: message.extra?.dwmHidden?.owner === OWNER || (!message.is_system && windowChatId === chatId && windowKeys.has(messageKey(message, index, readOnly))) ? OWNER : null,
         }));
         const template = templateStatus();
@@ -1177,7 +1177,7 @@ export async function createSillyTavernHost(deps = {}) {
         return result;
     }
 
-    return { statusSnapshot: () => snapshot(true,{project:false}), listWorldbooks, promptRegexSignature: promptRegex.signature, supplementaryBooks, readSupplementaryBook, snapshot, generationSnapshot, pendingReplacement, previewSnapshot: () => snapshot(true), previewEligible: entry => eligible(entry, { silent: true, type: 'normal' }), loadWorldbook, worldbookStatus, checkWorldbook, eligible, storage, setPlan, clearPlan, applyWorldInfoEntries, applyWindow, restoreLegacyWindow, filterOutgoingHistory, bindController, rawGenerate, stopGeneration, auxiliaryReadiness,
+    return { initializationSnapshot: () => snapshot(false,{history:true}), statusSnapshot: () => snapshot(true,{project:false}), listWorldbooks, promptRegexSignature: promptRegex.signature, supplementaryBooks, readSupplementaryBook, snapshot, generationSnapshot, pendingReplacement, previewSnapshot: () => snapshot(true), previewEligible: entry => eligible(entry, { silent: true, type: 'normal' }), loadWorldbook, worldbookStatus, checkWorldbook, eligible, storage, setPlan, clearPlan, applyWorldInfoEntries, applyWindow, restoreLegacyWindow, filterOutgoingHistory, bindController, rawGenerate, stopGeneration, auxiliaryReadiness,
         readMvu: settings => readMvuProjection({ context: ctx, settings, globals: deps.globals ?? globalThis }),
         getWarnings: () => copy(warnings), windowStatus: () => copy(outgoingWindow) };
 }
