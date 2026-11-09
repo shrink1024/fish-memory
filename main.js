@@ -104,7 +104,7 @@ async function boot() {
     bindManagerEntry(openManager);
     drawer.append(title, extStatus, openManager);
     (document.querySelector('#extensions_settings2') ?? document.querySelector('#extensions_settings') ?? document.body).append(drawer);
-    const toolbarWatch = watchToolbarEntry(document, bindManagerEntry);
+    const toolbarWatch = watchToolbarEntry(document, button => manager.bindEntry(button, { toggle: true }));
     const problems = createProblemExporter({ controller, context: () => {
         const live = SillyTavern.getContext();
         return { chatId: live.getCurrentChatId?.() ?? live.chatId ?? '', character: live.name2 ?? '', memoryChatId: host.snapshot().chatId,

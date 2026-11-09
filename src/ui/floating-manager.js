@@ -52,7 +52,7 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
     });
     element.append(panel, bubble); doc.body.append(element);
 
-    let opened = false, destroyed = false, opener = null, drag = null, suppressClick = false, observedComposer = null;
+    let opened = false, destroyed = false, opener = null, drag = null, suppressClick = false, observedComposer = null, observedToolbar = null;
     // 超级懒人模式的新安装默认不显示气泡；玩家调过的设置优先。
     let dock = { edge: 'right', fraction: 0.65, size: 'compact', visible: bubbleVisible !== false };
     let frame = null, maximized = false, moving = null, lazyPos = null;
@@ -103,23 +103,34 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
     // The 超级懒人模式 window is a narrow card: it keeps its own position and grows with its content.
     const placeWindow = () => {
         const v = viewport(), compact = v.width <= COMPACT_WIDTH, lazy = panel.dataset.variant === 'lazy';
+        const toolbar = doc.getElementById?.('top-settings-holder');
+        if (toolbar !== observedToolbar) {
+            if (observedToolbar) observer?.unobserve(observedToolbar);
+            observedToolbar = toolbar; if (toolbar) observer?.observe(toolbar);
+        }
+        const bar = toolbar?.getBoundingClientRect(), barStyle = toolbar && win?.getComputedStyle?.(toolbar);
+        const visibleBar = bar?.width > 0 && bar.height > 0 && bar.height < v.height / 4
+            && bar.bottom > v.top && bar.top < v.top + v.height / 3
+            && barStyle?.display !== 'none' && barStyle?.visibility !== 'hidden' && barStyle?.opacity !== '0';
+        const toolbarBottom = visibleBar ? Math.max(0, bar.bottom - v.top) + 8 : 0;
+        element.style.setProperty('--dwm-toolbar-bottom', `${toolbarBottom}px`);
         panel.dataset.layout = compact ? 'compact' : maximized && !lazy ? 'maximized' : 'window';
         maximizeButton.hidden = compact || lazy;
         maximizeButton.title = maximized ? '还原' : '最大化'; maximizeButton.setAttribute('aria-label', maximizeButton.title);
         panel.style.maxHeight = '';
         if (compact || maximized && !lazy) { for (const key of ['left', 'top', 'width', 'height']) panel.style[key] = ''; return; }
-        const margin = 12;
+        const margin = 12, topMargin = Math.max(margin, toolbarBottom);
         if (lazy) {
             const width = Math.min(LAZY_WIDTH, v.width - margin * 2);
             const x = clamp(lazyPos?.x ?? v.width - width - 24, margin, v.width - width - margin);
-            const y = clamp(lazyPos?.y ?? 58, margin, v.height - margin - 160);
+            const y = clamp(lazyPos?.y ?? 58, topMargin, v.height - margin - 160);
             Object.assign(panel.style, { left: `${x}px`, top: `${y}px`, width: `${width}px`, height: '', maxHeight: `${v.height - y - margin}px` });
             return;
         }
         const width = clamp(frame?.width ?? Math.min(1040, v.width - margin * 2), Math.min(MIN_WIDTH, v.width - margin * 2), v.width - margin * 2);
-        const height = clamp(frame?.height ?? Math.min(780, v.height * 0.78), Math.min(MIN_HEIGHT, v.height - margin * 2), v.height - margin * 2);
+        const height = clamp(frame?.height ?? Math.min(780, v.height * 0.78), Math.min(MIN_HEIGHT, v.height - topMargin - margin), v.height - topMargin - margin);
         const x = clamp(frame?.x ?? v.width - width - margin, margin, v.width - width - margin);
-        const y = clamp(frame?.y ?? margin, margin, v.height - height - margin);
+        const y = clamp(frame?.y ?? topMargin, topMargin, v.height - height - margin);
         Object.assign(panel.style, { left: `${x}px`, top: `${y}px`, width: `${width}px`, height: `${height}px` });
     };
     function layout() {
@@ -164,11 +175,13 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
         }
         opener = null;
     }
-    function bindEntry(entry) {
+    function toggleEntry(event) { if (opened) close({ restoreFocus: false }); else open(event); }
+    function bindEntry(entry, { toggle = false } = {}) {
         if (entries.has(entry)) return;
-        for (const old of entries) if (!old.isConnected) { old.removeEventListener('click', open); entries.delete(old); }
+        for (const old of entries) if (!old.isConnected) { old.removeEventListener('click', open); old.removeEventListener('click', toggleEntry); entries.delete(old); }
         entries.add(entry); entry.setAttribute('aria-haspopup', 'dialog'); entry.setAttribute('aria-controls', panel.id); entry.setAttribute('aria-expanded', String(opened));
-        entry.addEventListener('click', open);
+        entry.classList.toggle('openIcon', opened); entry.classList.toggle('closedIcon', !opened);
+        entry.addEventListener('click', toggle ? toggleEntry : open);
     }
     bubble.setAttribute('aria-haspopup', 'dialog'); bubble.setAttribute('aria-controls', panel.id); bubble.setAttribute('aria-expanded', 'false');
     listen(bubble, 'click', event => {
@@ -319,7 +332,7 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
             if (opened && element.contains(doc.activeElement)) close();
             destroyed = true; releaseTt?.(); releaseTt = null;
             for (const remove of listeners) remove(); observer?.disconnect();
-            for (const entry of entries) { entry.setAttribute('aria-expanded', 'false'); entry.removeEventListener('click', open); }
+            for (const entry of entries) { entry.setAttribute('aria-expanded', 'false'); entry.removeEventListener('click', open); entry.removeEventListener('click', toggleEntry); }
             entries.clear(); drag = null; element.remove();
         } };
 }

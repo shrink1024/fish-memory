@@ -32,8 +32,8 @@
     box-shadow: 0 18px 56px #0004, 0 2px 8px #0002;
 }
 #dwm-management-dialog[data-layout='window'] { right: auto; }
-#dwm-management-dialog[data-layout='maximized'] { inset: max(12px, var(--dwm-safe-top, env(safe-area-inset-top))) max(12px, var(--dwm-safe-right, env(safe-area-inset-right))) max(12px, var(--dwm-safe-bottom, env(safe-area-inset-bottom))) max(12px, var(--dwm-safe-left, env(safe-area-inset-left))); width: auto; height: auto; }
-#dwm-management-dialog[data-layout='compact'] { inset: var(--dwm-safe-top, env(safe-area-inset-top, 0px)) var(--dwm-safe-right, env(safe-area-inset-right, 0px)) var(--dwm-safe-bottom, env(safe-area-inset-bottom, 0px)) var(--dwm-safe-left, env(safe-area-inset-left, 0px)); width: auto; height: auto; border-radius: 0; border: 0; }
+#dwm-management-dialog[data-layout='maximized'] { inset: max(12px, var(--dwm-toolbar-bottom, 0px), var(--dwm-safe-top, env(safe-area-inset-top))) max(12px, var(--dwm-safe-right, env(safe-area-inset-right))) max(12px, var(--dwm-safe-bottom, env(safe-area-inset-bottom))) max(12px, var(--dwm-safe-left, env(safe-area-inset-left))); width: auto; height: auto; }
+#dwm-management-dialog[data-layout='compact'] { inset: max(var(--dwm-toolbar-bottom, 0px), var(--dwm-safe-top, env(safe-area-inset-top, 0px))) var(--dwm-safe-right, env(safe-area-inset-right, 0px)) var(--dwm-safe-bottom, env(safe-area-inset-bottom, 0px)) var(--dwm-safe-left, env(safe-area-inset-left, 0px)); width: auto; height: auto; border-radius: 0; border: 0; }
 .dwm-management-chrome { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; min-width: 0; height: 46px; padding: 0 6px 0 14px; border-bottom: 1px solid var(--dwm-float-line); cursor: grab; user-select: none; -webkit-user-select: none; touch-action: none; }
 #dwm-management-dialog:not([data-layout='window']) .dwm-management-chrome { cursor: default; touch-action: auto; }
 .dwm-management-chrome:active { cursor: grabbing; }
@@ -86,8 +86,10 @@
 }
 @media (prefers-reduced-motion: reduce) { .dwm-floating-root * { transition: none !important; scroll-behavior: auto !important; } }
 
-#dwm-toolbar-entry { display: flex; align-items: center; justify-content: center; min-width: 32px; }
-#dwm-toolbar-button { appearance: none; width: 100%; max-width: 44px; min-height: min(44px, var(--topBarBlockSize, 44px)); margin: 0; border: 0; border-radius: 4px; background: transparent; color: inherit; line-height: 1; }
+/* Match the host's .drawer layout, without registering a fake native drawer.
+ * Icon size/padding/opacity/hover/transition come from its .drawer-icon rules. */
+#dwm-toolbar-entry { display: flex; align-items: center; justify-content: center; flex-flow: row; width: 100%; }
+#dwm-toolbar-button { appearance: none; margin: 0; border: 0; border-radius: 0; background: transparent; color: inherit; }
 #dwm-toolbar-button:focus-visible { opacity: 1; outline: 2px solid currentColor; outline-offset: 2px; }
 
 /* 超级懒人模式: a narrow window that grows with its content, and a yellow dot on every entry when the player must look. */
@@ -97,6 +99,7 @@
 .dwm-floating-root .dwm-floating-bubble[data-attention='true'] { border-color: var(--dwm-float-warn); }
 .dwm-floating-root[data-bubble-size='compact'] .dwm-floating-bubble[data-state='attention'][data-attention='true']::after { background: var(--dwm-float-warn); }
 #dwm-toolbar-button { position: relative; }
+#dwm-toolbar-button[data-dwm-attention='true'] { opacity: 1; }
 #dwm-toolbar-button[data-dwm-attention='true']::after { content: ''; position: absolute; top: 18%; right: 14%; width: 8px; height: 8px; border-radius: 50%; background: #b88a2e; box-shadow: 0 0 0 2px var(--SmartThemeBlurTintColor, #222); }
 .dwm-ext-dot { display: inline-block; width: 8px; height: 8px; margin-left: 8px; border-radius: 50%; background: #b88a2e; vertical-align: middle; }
 :is(.dwm-ext-dot, .dwm-ext-status)[hidden] { display: none; }

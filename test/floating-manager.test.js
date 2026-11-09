@@ -237,3 +237,20 @@ test('hidden bubble remains hidden across collapse/render/reload and drag preser
     f.ui.bubble.fire('pointerdown',{button:0,pointerId:8,clientX:320,clientY:400});f.win.fire('pointermove',{pointerId:8,clientX:30,clientY:300});f.win.fire('pointerup',{pointerId:8});
     assert.equal(f.ui.dock().size,'compact');assert.equal(f.writes.at(-1).value.size,'compact');assert.equal(f.ui.panel.hidden,true);f.ui.destroy();
 });
+
+test('toolbar entry toggles the panel and is disconnected on manager teardown',()=>{
+ const f=fixture(),entry=f.doc.createElement('button');f.doc.body.append(entry);f.ui.bindEntry(entry,{toggle:true});
+ entry.fire('click');assert.equal(f.ui.panel.hidden,false);assert.equal(entry.getAttribute('aria-expanded'),'true');
+ entry.fire('click');assert.equal(f.ui.panel.hidden,true);assert.equal(entry.getAttribute('aria-expanded'),'false');
+ entry.fire('click');assert.equal(f.ui.panel.hidden,false);
+ f.ui.destroy();assert.equal(entry.listeners.get('click').size,0);
+});
+
+test('native toolbar remains reachable above the manager window and compact surface',()=>{
+ const f=fixture();Object.assign(f.win.visualViewport,{width:1440,height:900});
+ const toolbar=f.doc.createElement('div');toolbar.getBoundingClientRect=()=>({top:0,bottom:35,width:900,height:35});
+ f.doc.getElementById=id=>id==='top-settings-holder'?toolbar:null;
+ f.ui.open();assert.equal(parseFloat(f.ui.panel.style.top),43);assert.equal(f.ui.element.style['--dwm-toolbar-bottom'],'43px');
+ Object.assign(f.win.visualViewport,{width:375,height:812});f.win.visualViewport.fire('resize');
+ assert.equal(f.ui.panel.dataset.layout,'compact');assert.equal(f.ui.element.style['--dwm-toolbar-bottom'],'43px');
+});
