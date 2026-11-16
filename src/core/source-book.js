@@ -9,11 +9,39 @@ function canonical(value) {
 // decide whether an entry is used this turn, not what the author wrote, so they
 // are read live (nativeSwitchOverlay) instead of blocking sends as a change.
 const SWITCHES = ['disable', 'constant'];
-function comparableMetadata(entry) {
+function comparableMetadata(entry, compareSelective) {
     // Native editor drag ordering is presentation only; insertion order uses
     // the separate `order` field and must still invalidate the baseline.
     const { displayIndex: _displayIndex, ...metadata } = entry ?? {};
     for (const key of SWITCHES) delete metadata[key];
+    // Compare effective native values, not the serialization shape. Helper
+    // get/update/replace writes defaults across the whole book (4.11.2 fixture
+    // in source-normalization.test.js). Keep unknown fields strict.
+    const defaults = { comment: '', content: '', key: [], keysecondary: [], selectiveLogic: 0, scanDepth: null, vectorized: false,
+        role: 0, depth: 4, order: 100, excludeRecursion: false, preventRecursion: false,
+        addMemo: true, matchPersonaDescription: false, matchCharacterDescription: false,
+        matchCharacterPersonality: false, matchCharacterDepthPrompt: false, matchScenario: false,
+        matchCreatorNotes: false, group: '', groupOverride: false, groupWeight: 100,
+        caseSensitive: null, matchWholeWords: null, useGroupScoring: null, automationId: '',
+        ignoreBudget: false, outletName: '', triggers: [] };
+    for (const [key, value] of Object.entries(defaults)) metadata[key] ??= value;
+    for(const key of ['key','keysecondary'])if(Array.isArray(metadata[key]))metadata[key]=metadata[key].map(value=>{
+        if(typeof value!=='string')return value;
+        const match=value.match(/^\/(.*)\/([a-z]*)$/s);if(!match)return value;
+        try{return new RegExp(match[1],match[2]).toString();}catch{return value;}
+    });
+    if(metadata.uid!==undefined)metadata.uid=String(metadata.uid);
+    metadata.probability = entry?.useProbability ? entry.probability : 100;
+    delete metadata.useProbability;
+    for (const key of ['sticky', 'cooldown', 'delay', 'delayUntilRecursion']) {
+        if (metadata[key] == null || metadata[key] === false || metadata[key] === 0) metadata[key] = 0;
+    }
+    // Secondary-key enablement is dormant without keys or under a blue lamp;
+    // the helper derives this flag from its strategy enum when writing back.
+    if (!compareSelective) delete metadata.selective;
+    else metadata.selective ??= false;
+    metadata.characterFilter = { isExclude: false, names: [], tags: [], ...(metadata.characterFilter ?? {}) };
+    for(const [key,value] of Object.entries({isExclude:false,names:[],tags:[]}))metadata.characterFilter[key]??=value;
     if (metadata.extensions && typeof metadata.extensions === 'object' && !Array.isArray(metadata.extensions)) {
         const { display_index: _displayIndexExtension, ...extensions } = metadata.extensions;
         if (Object.keys(extensions).length) metadata.extensions = extensions;
@@ -22,8 +50,10 @@ function comparableMetadata(entry) {
     return canonical(metadata);
 }
 export function sourceMatches(source, raw) {
+    const compareSelective = Boolean(source?.metadata?.keysecondary?.length || raw?.keysecondary?.length)
+        && !source?.metadata?.constant && !raw?.constant;
     return Boolean(source && raw && source.original === (raw.content ?? '')
-        && JSON.stringify(comparableMetadata(source.metadata)) === JSON.stringify(comparableMetadata(raw)));
+        && JSON.stringify(comparableMetadata(source.metadata, compareSelective)) === JSON.stringify(comparableMetadata(raw, compareSelective)));
 }
 function compareBook(save, raw, configEntryUids = []) {
     if (!save?.initialized) return { changed: false, added: [], removed: [], updated: [] };

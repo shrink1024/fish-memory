@@ -19,6 +19,7 @@ export const RUNTIME_FILES = [
 ];
 export const PLAYER_FILES = ['README.md', 'INSTALL.md', 'COMPATIBILITY.md', 'docs/public/CHANGELOG.md', 'docs/public/FEEDBACK.md'];
 export const SOURCE_FILES = [
+    'test/fixtures/tavernhelper-4.11.2-worldbook-roundtrip.json',
     'package.json', 'scripts/build.mjs', 'scripts/release.mjs', 'scripts/check.mjs', 'scripts/dev.mjs',
     'demo/index.html', 'demo/main.js', 'docs/public/SOURCE-BUILD.md',
 ];
