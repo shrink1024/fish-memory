@@ -1,7 +1,17 @@
 import { invariant } from '../core/util.js';
 import { projectProtectedReferences } from '../core/views.js';
+import { titleKey } from '../core/entry-changes.js';
 
 export const COMPACT_INPUT_CHARS = 24000;
+const targetIndexes=new WeakMap(),normalizedBodies=new WeakMap();
+function matchingTargets(request,entries){
+    if(!entries.length||entries.some(e=>e.mergeable===false))return [];
+    if(!targetIndexes.has(request))targetIndexes.set(request,(request.input.memory.sourceTargets??[]).map(target=>({target,names:(target.matchNames??[target.title]).map(titleKey)})));
+    const titles=new Set(entries.map(e=>titleKey(e.title)));
+    const text=entries.map(e=>{if(!normalizedBodies.has(e))normalizedBodies.set(e,titleKey(e.segments.map(s=>s.text).join('\n')));return normalizedBodies.get(e)}).join('\n');
+    return targetIndexes.get(request).map(({target,names})=>({target,score:names.reduce((score,name)=>Math.max(score,titles.has(name)?100:name.length>=2&&text.includes(name)?10:0),0)}))
+        .filter(item=>item.score).sort((a,b)=>b.score-a.score).slice(0,3).map(({target:{matchNames,...target}})=>target);
+}
 /** Split at Unicode and protected-reference boundaries; never expose a partial token. */
 function pieces(text, limit) {
     const result=[];
@@ -19,8 +29,9 @@ function envelope(request, entries, summary) {
     const references=new Map(),reverse=new Map();
     const alias=key=>{if(!reverse.has(key)){const id=`k${reverse.size+1}`;reverse.set(key,id);references.set(id,key);}return reverse.get(key)};
     const projected=entries.map(({lastEvidence,evidenceTrimmed,lineage,...entry})=>({...entry,evidence:[...new Set(entry.evidence??[])].map(alias)}));
-    const {inventory,catalog,...memory}=request.input.memory;
-    const projection={...memory,summary,entries:projected};
+    const {inventory,catalog,sourceTargets=[],...memory}=request.input.memory;
+    const targets=matchingTargets(request,entries);
+    const projection={...memory,summary,entries:projected,...(targets.length?{sourceTargets:targets}:{})};
     projectProtectedReferences(request.input.memory,projection);
     return {request:{...request,input:{...request.input,memory:projection}},references};
 }
@@ -52,7 +63,16 @@ export function compactPlans(request, limit=COMPACT_INPUT_CHARS) {
         flush();
     }
     const summaryCount=plans.filter(plan=>plan.summaryIndex!==undefined).length;
-    for(const plan of plans)plan.request.system += plan.fragment?'\n本批只包含同一条目的一个正文分段。仅精简给出的这段，保留本段事实，不补齐其他片段，不合并身份。':summaryCount>1&&plan.summaryIndex!==undefined?'\n本批是长脉络的一段。只精简这一段，不重复补写其他段，尽量压缩到本段长度的六成以内。':'';
+    for(const plan of plans){
+        plan.request.system+=plan.summaryIndex!==undefined
+            ? '\n本批操作范围：只处理memory.summary，只允许返回一条summary或空operations；不新建、更新或合并条目。'
+            : '\n本批操作范围：只处理提供的条目，memory.summary为空是未提供脉络。禁止返回summary或appendSummary，也不要把条目内容再抄成脉络；没有条目改动时返回空operations。';
+        if (plan.summaryIndex !== undefined && request.summaryTarget) {
+            const target = Math.max(1, Math.floor(request.summaryTarget * plan.original.length / summary.length));
+            plan.request.system += `\n只依据这批当前脉络整理，保留关键因果和现状，不补写资料库中的其他旧经历。本段目标最多${target}个字符，返回完整的精简文本。`;
+        }
+        plan.request.system+=plan.fragment?'\n本批只包含同一条目的一个正文分段。仅精简给出的这段，保留本段事实，不补齐其他片段，不合并身份。':summaryCount>1&&plan.summaryIndex!==undefined?'\n本批是长脉络的一段。只精简这一段，不重复补写其他段，尽量压缩到本段长度的六成以内。':'';
+    }
     return plans.sort((a,b)=>Number(a.summaryIndex!==undefined)-Number(b.summaryIndex!==undefined));
 }
 export function decodeCompactResult(result, plan) {

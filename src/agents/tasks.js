@@ -49,7 +49,7 @@ async function classifyBatch(client, entries, naturalLanguage = '', signal) {
                 invariant(item, `初始化漏掉了条目 ${source.title}`);
                 const rebuilt = sourceSegments(entryText(source), item.segments);
                 const next = createEntry({ ...source, kind: item.kind, intro: item.intro, retrieveWhen: item.retrieveWhen,
-                    important: item.important, needsReview: item.needsReview || rebuilt.needsReview, segments: rebuilt.segments, scanBlocked: false });
+                    important: item.important, importanceIndependent: true, needsReview: item.needsReview || rebuilt.needsReview, segments: rebuilt.segments, scanBlocked: false });
                 invariant(entryText(next) === entryText(source), '初始化分类不得改写原文');
                 return next;
             }),
@@ -109,6 +109,10 @@ export async function maintain(client, save, messages, signal, scopeId = GLOBAL_
             if (!followUp) needed.add(op.id);
             return false;
         }) };
+        for(const op of kept.operations)if(op.type==='update'&&Array.isArray(op.edits))op.edits=op.edits.map(edit=>{
+            const text=request.input.memory.entries.find(e=>e.id===op.id)?.segments.find(s=>s.id===edit.segmentId)?.text;
+            return {...edit,outsideInput:Object.hasOwn(edit,'append')?false:typeof text==='string'&&typeof edit.oldText==='string'?!text.includes(edit.oldText):true};
+        });
         const decoded = decodeMaintenanceEvidence(request.input, kept, op => !(save.worldbookOnly || followUp)
             || op.type === 'update' && (!followUp || full.has(op.id)));
         const restored = restoreProtectedReferences(decoded, request.input.memory);
@@ -132,8 +136,8 @@ export async function select(client, save, messages, { eligible = () => true, se
         return decodeSelectionIds(request.input, ids);
     });
 }
-export async function compact(client, save, signal, scopeId = GLOBAL_SCOPE, { summaryOnly = false } = {}) {
-    const request = compactRequest(save, scopeId, { summaryOnly }), memory=request.input.memory;
+export async function compact(client, save, signal, scopeId = GLOBAL_SCOPE, { summaryOnly = false, summaryLength } = {}) {
+    const request = compactRequest(save, scopeId, { summaryOnly, summaryLength }), memory=request.input.memory;
     const plans=compactPlans(request), operations=[], summaries=[], fragments=new Map();
     let summaryChanged=false;
     for(const plan of plans){
@@ -141,10 +145,19 @@ export async function compact(client, save, signal, scopeId = GLOBAL_SCOPE, { su
         const input=plan.request.input.memory,ids=new Set(input.entries.map(e=>e.id));
         const result=await completeTask(client,{...plan.request,signal},raw=>{
             const decoded=decodeCompactResult(raw,plan);
-            invariant(decoded.operations.every(op=>op&&['summary','update','mergeEvents','mergeEntries'].includes(op.type)),'整理只能更新脉络与给出的历史事件');
+            invariant(decoded.operations.every(op=>op&&['summary','update','mergeEvents','mergeEntries','mergeIntoSource'].includes(op.type)),'整理只能更新脉络与给出的历史事件');
             invariant(decoded.operations.every(op=>op.type==='summary'?plan.summaryIndex!==undefined
-                : ['mergeEvents','mergeEntries'].includes(op.type)?!plan.fragment&&Array.isArray(op.sources)&&op.sources.every(s=>ids.has(s.id)):ids.has(op.id)),'整理不得修改本批之外的资料');
-            if(plan.fragment)invariant(decoded.operations.length<=1&&decoded.operations.every(op=>op.type==='update'&&op.segments?.every(s=>s.id===plan.fragment.segmentId)),'分段整理只能精简本片段');
+                : ['mergeEvents','mergeEntries','mergeIntoSource'].includes(op.type)?!plan.fragment&&Array.isArray(op.sources)&&op.sources.every(s=>ids.has(s.id))
+                    &&(op.type!=='mergeIntoSource'||input.sourceTargets?.some(t=>t.id===op.targetId&&t.version===op.expectedTargetVersion)):ids.has(op.id)),'整理不得修改本批之外的资料');
+            if (plan.summaryIndex !== undefined) {
+                invariant(decoded.operations.every(op => typeof op.text === 'string' && op.text.trim().length > 0), 'summary-compact:invalid');
+            }
+            if(plan.fragment)invariant(decoded.operations.length<=1&&decoded.operations.every(op=>op.type==='update'&&(Array.isArray(op.edits)
+                ?op.edits.every(edit=>edit.segmentId===plan.fragment.segmentId&&!Object.hasOwn(edit,'append')):op.segments?.every(s=>s.id===plan.fragment.segmentId))),'分段整理只能精简本片段');
+            for(const op of decoded.operations)if(op.type==='update'&&Array.isArray(op.edits))op.edits=op.edits.map(edit=>{
+                const text=input.entries.find(e=>e.id===op.id)?.segments.find(s=>s.id===edit.segmentId)?.text;
+                return {...edit,outsideInput:Object.hasOwn(edit,'append')?false:typeof text==='string'&&typeof edit.oldText==='string'?!text.includes(edit.oldText):true};
+            });
             restoreProtectedReferences(decoded,plan.request.input.memory);
             return decoded;
         });
@@ -153,17 +166,23 @@ export async function compact(client, save, signal, scopeId = GLOBAL_SCOPE, { su
             summaries[plan.summaryIndex]=result.operations[0]?.text??plan.original;summaryChanged ||=result.operations.length>0;
         }else if(plan.fragment){
             const f=plan.fragment,entry=memory.entries.find(e=>e.id===f.entryId);
-            if(!fragments.has(f.entryId))fragments.set(f.entryId,{entry,parts:new Map(),changed:false,evidence:new Set()});
+            if(!fragments.has(f.entryId))fragments.set(f.entryId,{entry,parts:new Map(),edits:[],legacy:false,changed:false,evidence:new Set()});
             const merged=fragments.get(f.entryId),op=result.operations[0];
             if(!merged.parts.has(f.segmentId))merged.parts.set(f.segmentId,[]);
             merged.parts.get(f.segmentId)[f.index]=op?.segments?.[0]?.text??f.original;
+            if(op?.edits)merged.edits.push(...op.edits);else if(op)merged.legacy=true;
             merged.changed ||=Boolean(op);for(const key of op?.evidence??[])merged.evidence.add(key);
         }else operations.push(...result.operations);
     }
     if(summaryChanged)operations.unshift({type:'summary',text:summaries.join('')});
-    for(const {entry,parts,changed,evidence} of fragments.values())if(changed)operations.push({type:'update',id:entry.id,expectedVersion:entry.version,
-        segments:entry.segments.map(segment=>({id:segment.id,text:parts.has(segment.id)?parts.get(segment.id).join(''):segment.text})),evidence:[...evidence]});
-    return restoreProtectedReferences({operations},memory);
+    for(const {entry,parts,edits,legacy,changed,evidence} of fragments.values())if(changed)operations.push({type:'update',id:entry.id,expectedVersion:entry.version,
+        ...(legacy?{segments:entry.segments.map(segment=>({id:segment.id,text:parts.has(segment.id)?parts.get(segment.id).join(''):segment.text}))}:{edits}),evidence:[...evidence]});
+    const restored = restoreProtectedReferences({operations},memory);
+    if (request.summaryTarget) {
+        restored.operations = restored.operations.filter(op => op.type !== 'summary'
+            || (typeof op.text === 'string' && op.text.trim().length > 0 && op.text.length <= request.summaryTarget));
+    }
+    return restored;
 }
 
 /** Author changed source entries that this save had already rewritten from the

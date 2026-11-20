@@ -13,6 +13,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
     memoryMode: 'full',
     // 'append' adds a short paragraph per batch; 'rewrite' rewrites the whole summary.
     summaryMode: 'append',
+    summaryLength: 8000,
     // Independent worldbook classification batches sent at the same time.
     scanConcurrency: 3,
     // Thinking effort for auxiliary tasks; 'inherit' follows the story preset.
@@ -20,10 +21,15 @@ export const DEFAULT_SETTINGS = Object.freeze({
     auxiliaryStream: false,
     recentTurns: 12,
     batchChars: 18000,
+    sourceBatchChars: 18000,
     // Initialization history batches. Each batch carries fixed memory overhead,
     // so fewer, larger batches cost less than per-turn sized ones.
     historyBatchChars: 40000,
     maintenanceEvery: 3,
+    economyMode: false,
+    maintenanceKeepRecent: 1,
+    selectionRecentTurns: 12,
+    rerollSelection: 'reuse',
     timeoutMs: 300000,
     initializationTimeoutMs: 1800000,
     timeoutSettingsVersion: 1,
@@ -62,6 +68,10 @@ export function entryScope(entry) { return normalizeScopeId(entry.scopeId); }
 export function scopeSummary(data, scopeId = GLOBAL_SCOPE) {
     return scopeId === GLOBAL_SCOPE ? data.summary : (data.scopeSummaries?.[normalizeScopeId(scopeId)] ?? '');
 }
+export function normalizeInventoryItems(items) {
+    invariant(Array.isArray(items) && items.length <= 200, '物品清单无效');
+    return items.map(item => ({name:plainText(item?.name,'物品名称',300),description:plainText(item?.description,'物品简介',3000)}));
+}
 export function scopeInventory(data, scopeId = GLOBAL_SCOPE) {
     return scopeId === GLOBAL_SCOPE ? data.inventory : (data.scopeInventories?.[normalizeScopeId(scopeId)] ?? []);
 }
@@ -71,11 +81,11 @@ export function readableScopes(context) {
 export function sourceId(book, id) { return `source:${encodeURIComponent(book)}:${id}`; }
 export function entryText(entry) { return entry.segments.map(s => s.text).join(''); }
 /** Player-set tier for an entry: always sent, chosen by selection, or unused.
- * Absent means the scanned flags decide (source blue lamp, important NPC,
- * source disable). The tier only changes this save's dynamic copy. */
+ * Absent means the scanned flags decide (source switches and legacy implicit
+ * important-NPC constants). New importance is independent of sending tier. */
 export const TIERS = Object.freeze(['constant', 'onDemand', 'off']);
 export function scannedTier(entry) {
-    return !entry?.enabled ? 'off' : entry.constant || entry.important ? 'constant' : 'onDemand';
+    return !entry?.enabled ? 'off' : entry.constant || entry.important && !entry.importanceIndependent ? 'constant' : 'onDemand';
 }
 export function entryTier(entry) { return TIERS.includes(entry?.tier) ? entry.tier : scannedTier(entry); }
 export const canCompactEntry = entry => Boolean(entry?.enabled && !entry.source && entry.origin !== 'import' && ['fact', 'npc', 'npc_pool', 'event'].includes(entry.kind) && entry.segments.every(s => s.writable));
@@ -99,6 +109,9 @@ export function createEntry(input) {
         constant: Boolean(input.constant),
         enabled: input.enabled !== false,
         important: Boolean(input.important),
+        ...(input.identityNames?{identityNames:clone(input.identityNames)}:{}),
+        // Missing on old archives: preserve their existing implicit constant tier.
+        ...(input.importanceIndependent === true ? { importanceIndependent: true } : {}),
         segments: clone(input.segments ?? [{ id: 'body', text: input.text ?? '', writable: input.kind !== 'rule' }]),
         source: input.source ? clone(input.source) : null,
         evidence: clone(input.evidence ?? []),
@@ -116,6 +129,7 @@ export function createEntry(input) {
         ...(input.scanPiece ? {scanPiece: clone(input.scanPiece)} : {}),
     };
     invariant(KINDS.includes(entry.kind), `未知条目类型：${entry.kind}`);
+    if(entry.identityNames)invariant(Array.isArray(entry.identityNames)&&entry.identityNames.length<=1000&&entry.identityNames.every(name=>typeof name==='string'&&name.length<=500),'合并名称记录无效');
     invariant(typeof entry.id === 'string' && entry.id.length < 1000, '无效条目身份');
     invariant(Array.isArray(entry.segments) && entry.segments.length > 0 && entry.segments.length <= 4096, '条目必须包含 1–4096 个片段');
     invariant(Array.isArray(entry.lineage) && entry.lineage.length <= 10000
@@ -145,6 +159,16 @@ export function createSave(chatId, bookName) {
 
 export function validateSave(save) {
     invariant(save?.schema === SCHEMA_VERSION, '不支持的存档格式，请勿覆盖现有数据');
+    const layered = value => {
+        const rows=[...Object.values(value?.data?.entries??{}),...Object.values(value?.base?.entries??{}),
+            ...(value?.journal??[]).flatMap(c=>Object.values(c.patch?.entries??{})),
+            ...Object.values(value?.sourceHeld??{}).map(item=>item.next),
+            ...Object.values(value?.entryChanges?.undo?.before??{}),...Object.values(value?.entryChanges?.undo?.after??{})];
+        return rows.some(entry=>entry&&Object.hasOwn(entry,'sourceLayer'));
+    };
+    if(layered(save)||layered(save.initializationCheckpoint?.draft))throw Object.assign(new Error('不支持的持久化存档格式，请勿覆盖现有数据'),
+        {kind:'storage-version',dwmStorageFormat:'reverted-dev2-source-layers'});
+
     invariant(typeof save.id === 'string' && Number.isInteger(save.revision), '存档身份无效');
     invariant(Array.isArray(save.processed) && Array.isArray(save.storyKeys) && Array.isArray(save.journal) && Array.isArray(save.audit), '存档进度无效');
     invariant(save.processed.length <= save.storyKeys.length && save.processed.every((key, i) => key === save.storyKeys[i]), '已处理进度与剧情路径不符');
@@ -156,6 +180,26 @@ export function validateSave(save) {
         invariant(Number.isInteger(commit.anchorLength) && commit.anchorLength >= 0 && commit.anchorLength <= save.storyKeys.length, '提交锚点无效');
         invariant(commit.endKey === (commit.anchorLength ? save.storyKeys[commit.anchorLength - 1] : null), '提交末端与剧情路径不符');
         invariant(commit.inventoryDisabledAt === null || Number.isInteger(commit.inventoryDisabledAt), '物品停用进度无效');
+        if (commit.automatic === true) invariant(['maintenance','compact'].includes(commit.reason) && Array.isArray(commit.readKeys) && commit.readKeys.every(k=>typeof k==='string'), '自动整理来源记录无效');
+        if (commit.summaryEdit) {
+            const edit = commit.summaryEdit;
+            normalizeScopeId(edit.scopeId);
+            invariant(commit.reason === 'manual' && typeof edit.before === 'string'
+                && Array.isArray(edit.removed) && edit.removed.every(s => typeof s === 'string' && s.length > 0)
+                && (edit.undoOf === undefined || typeof edit.undoOf === 'string')
+                && typeof (edit.scopeId === GLOBAL_SCOPE ? commit.patch.summary : commit.patch.scopeChanges?.scopeSummaries?.[edit.scopeId]) === 'string', 'summary-edit:journal');
+        }
+        if (commit.summaryBasis) {
+            const basis = commit.summaryBasis;
+            normalizeScopeId(basis.scopeId);
+            invariant(typeof basis.id === 'string' && (basis.readKeys === undefined ||
+                Array.isArray(basis.readKeys) && basis.readKeys.every(key => typeof key === 'string')), 'summary-edit:basis');
+        }
+        if (commit.inventoryEdit) {
+            invariant(commit.reason === 'manual', '物品编辑记录无效');
+            normalizeScopeId(commit.inventoryEdit.scopeId); normalizeInventoryItems(commit.inventoryEdit.before);
+            invariant(commit.inventoryEdit.undoOf === undefined || typeof commit.inventoryEdit.undoOf === 'string', '物品撤销记录无效');
+        }
     }
     for (const [scopeId, summary] of Object.entries(save.data.scopeSummaries ?? {})) { normalizeScopeId(scopeId); plainText(summary, '范围脉络'); }
     for (const [scopeId, items] of Object.entries(save.data.scopeInventories ?? {})) { normalizeScopeId(scopeId); invariant(Array.isArray(items), '范围物品无效'); }
@@ -182,6 +226,24 @@ export function validateSave(save) {
             && String(next.source.uid) === String(save.data.entries[id].source.uid), '待决定的来源条目无效');
         invariant(entryText(next) === next.source.original && Array.isArray(next.source.baselineSegments)
             && next.source.baselineSegments.map(segment => segment.text).join('') === next.source.original, '待决定的来源基线不完整');
+    }
+    if(save.entryChanges !== undefined){
+        const ledger=save.entryChanges;
+        invariant(ledger && typeof ledger==='object' && !Array.isArray(ledger) && ledger.removed && typeof ledger.removed==='object' && !Array.isArray(ledger.removed),'entry-change:ledger');
+        for(const [id,item] of Object.entries(ledger.removed)){
+            invariant(item && item.id===id && typeof item.title==='string' && KINDS.includes(item.kind)
+                && Array.isArray(item.lineage) && item.lineage.every(value=>typeof value==='string')
+                && (item.targetId===undefined || typeof item.targetId==='string'),'entry-change:ledger');
+            normalizeScopeId(item.scopeId);
+        }
+        for(const undo of [ledger.undo,ledger.automaticUndo].filter(Boolean)){
+            invariant(typeof undo.id==='string' && ['delete','merge','condense'].includes(undo.kind)
+                && Array.isArray(undo.titles) && Array.isArray(undo.storyKeys) && undo.before && undo.after && undo.removedBefore,'entry-change:undo');
+            for(const entry of [...Object.values(undo.before),...Object.values(undo.after)])if(entry!==null){createEntry(entry);invariant(!entry.source||undo.automatic===true&&undo.kind==='merge','entry-change:source');}
+            for(const [id,before] of Object.entries(undo.before))if(before?.source)invariant(JSON.stringify(before.source)===JSON.stringify(undo.after[id]?.source),'entry-change:source');
+            for(const [id,before] of Object.entries(undo.before))if(before?.source)invariant(before.segments.every((segment,i)=>JSON.stringify(segment)===JSON.stringify(undo.after[id]?.segments?.[i])),'entry-change:source');
+            if(undo===ledger.automaticUndo)invariant(undo.automatic===true&&undo.kind==='merge'&&typeof undo.commitId==='string','entry-change:undo');
+        }
     }
     return save;
 }

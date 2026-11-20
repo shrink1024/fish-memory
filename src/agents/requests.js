@@ -1,4 +1,7 @@
+import { summaryThreshold } from '../core/summary-edits.js';
 import { encodeMaintenanceEvidence } from './evidence-codec.js';
+import { serializeAgentInput } from './client.js';
+import { activeRemovals, titleKey } from '../core/entry-changes.js';
 import { clone } from '../core/util.js';
 import { encodeSelectionInput } from './selection-codec.js';
 import { entryText, scopeSummary, readableScopes, canCompactEntry, GLOBAL_SCOPE } from '../core/state.js';
@@ -44,9 +47,27 @@ function referenceInstructions(memory) {
 export const WORLDBOOK_ONLY_NOTE = '本存档使用“仅动态世界书”模式：只用 update 更新已有条目；不要新增条目或晋升人物，不要返回 create、promote、summary、inventory 或 mergeEvents。';
 /** Second pass for entries the first pass listed in needEntries. */
 export const FOLLOW_UP_NOTE = '补充更新：上一步已处理这批正文，并请求了 memory.entries 中这些条目的全文。本次只用 update 修改其中被本批正文改变的事实；不要返回 appendSummary、summary、create、promote、inventory、mergeEvents 或 needEntries。无需修改时返回空数组。';
+export const KNOWN_NAMES_CHARS = 4000;
+function compactKnownNames(memory,messages,needed){
+    const known=memory.knownCharacters??[];delete memory.knownCharacters;
+    if(!needed)return;
+    const listed=new Set([...(memory.entries??[]),...(memory.catalog??[])].map(e=>titleKey(e.title)));
+    const candidates=new Map();for(const {title} of known){const key=titleKey(title);if(key&&!listed.has(key)&&!candidates.has(key))candidates.set(key,title);}
+    if(!candidates.size)return;
+    const text=titleKey(messages.map(m=>m.content??'').join('\n'));
+    const ordered=[...candidates].sort(([a],[b])=>Number(text.includes(b))-Number(text.includes(a)));
+    const supplement={knownNames:[],knownNamesTruncated:true};let chars=JSON.stringify(supplement).length;
+    for(const [,name] of ordered){const size=serializeAgentInput(name).length+(supplement.knownNames.length?1:0);if(chars+size>KNOWN_NAMES_CHARS)continue;supplement.knownNames.push(name);chars+=size;}
+    if(supplement.knownNames.length===candidates.size)delete supplement.knownNamesTruncated;
+    Object.assign(memory,supplement);
+}
 export function maintainRequest(save, messages, scopeId = GLOBAL_SCOPE, observedState = null, { focus = null, followUp = false } = {}) {
     const memory = maintenanceView(save, scopeId, { includeProvenance: false, focus });
-    const notes = [save.worldbookOnly ? WORLDBOOK_ONLY_NOTE : '', followUp ? FOLLOW_UP_NOTE : ''].filter(Boolean);
+    compactKnownNames(memory,messages.filter(isReadableMessage),!followUp&&!save.worldbookOnly);
+    const removed = activeRemovals(save).filter(e=>e.scopeId===scopeId);
+    if (removed.length) memory.removedEntries = removed.map(({id,title,kind})=>({id,title,kind}));
+    const edited = save.journal?.some(commit => commit.summaryEdit?.scopeId === scopeId);
+    const notes = [edited && !save.worldbookOnly && !followUp ? '当前范围的脉络经过玩家编辑。以当前正文为准。只加入本批确实新发生的事情，不从条目、旧引文或其他资料补回被删掉的旧经历。' : '', save.worldbookOnly ? WORLDBOOK_ONLY_NOTE : '', followUp ? FOLLOW_UP_NOTE : ''].filter(Boolean);
     // Keep this projection's private reference capability for task validation;
     // serialized requests and diagnostics contain only the masked plain data.
     return { purpose: 'maintain', system: [save.summaryRewrite ? MAINTAIN_REWRITE : MAINTAIN, ...notes].join('\n'),
@@ -64,11 +85,18 @@ export function selectRequest(save, messages, { eligible = () => true, selection
             ...(Number.isInteger(messageCount) ? { progress: { messageCount } } : {}),
             messages: messages.map(({ key, role, content }) => ({ key, role: sourceRole(role), content, source: '存档正文' })) }, Object.keys(save.data.entries)) };
 }
-export function compactRequest(save, scopeId = GLOBAL_SCOPE, { summaryOnly = false } = {}) {
+export function compactRequest(save, scopeId = GLOBAL_SCOPE, { summaryOnly = false, summaryLength } = {}) {
     const memory = maintenanceView(save, scopeId);
     delete memory.catalog;
+    delete memory.knownCharacters;
+    memory.sourceTargets=summaryOnly?[]:memory.entries.filter(e=>save.data.entries[e.id].source&&e.kind!=='rule'
+        && !/<%|@@/.test(save.data.entries[e.id].source.original??'')).map(e=>({id:e.id,title:save.data.entries[e.id].title,kind:e.kind,version:e.version,
+            intro:e.intro.includes('⟦鱼忆引用:')?'':e.intro.slice(0,160),...(e.intro.length>160||e.intro.includes('⟦鱼忆引用:')?{introIncomplete:true}:{}),
+            matchNames:[save.data.entries[e.id].title,...(save.data.entries[e.id].identityNames??[]),...(Array.isArray(save.data.entries[e.id].source.metadata?.key)?save.data.entries[e.id].source.metadata.key:[])].filter(v=>typeof v==='string'&&v.trim())}));
     memory.entries = memory.entries.filter(e => !summaryOnly && canCompactEntry(save.data.entries[e.id])).map(e => ({ ...e, mergeable: true }));
-    return { purpose: 'compact', system: COMPACT, input: { memory, ...referenceInstructions(memory) } };
+    const threshold = summaryThreshold(summaryLength);
+    const summaryTarget = summaryLength && scopeSummary(save.data,scopeId).length >= threshold ? Math.floor(threshold * 0.6) : null;
+    return { purpose: 'compact', ...(summaryTarget ? {summaryTarget} : {}), system: COMPACT, input: { memory, ...referenceInstructions(memory) } };
 }
 export function requestBatches(items, maxChars, text = item => item.content, maxItems = Infinity) {
     const result = []; let current = [], size = 0;
@@ -80,17 +108,12 @@ export function requestBatches(items, maxChars, text = item => item.content, max
     if (current.length) result.push(current);
     return result;
 }
-/** Unmaintained messages older than the recent turns are not in memory yet, so
- * selection reads them too, but only the newest part: a long backlog made the
- * request hundreds of thousands of characters and timed out at the gateway. */
-export const SELECTION_BACKLOG_CHARS = 40000;
+/** The reference window limits already-maintained history only. All readable
+ * pending story remains in selection until committed, including long backlogs. */
 export function selectionMessages(snapshot, save, recentTurns) {
     const starts = snapshot.messages.flatMap((m, i) => m.role === 'user' && isReadableMessage(m) ? [i] : []);
     const start = starts.length > recentTurns ? starts[starts.length - recentTurns] : 0;
-    const backlog = snapshot.messages.slice(Math.min(start, save.processed.length), start).filter(isReadableMessage);
-    let kept = 0, used = 0;
-    for (let i = backlog.length - 1; i >= 0 && used + String(backlog[i].content ?? '').length <= SELECTION_BACKLOG_CHARS; i--) { used += String(backlog[i].content ?? '').length; kept++; }
-    const recent = [...backlog.slice(backlog.length - kept), ...snapshot.messages.slice(start).filter(isReadableMessage)];
+    const recent = snapshot.messages.slice(Math.min(start, save.processed.length)).filter(isReadableMessage);
     if (snapshot.userInput) recent.push({ key: 'current-input', role: 'user', content: snapshot.userInput });
     return recent;
 }

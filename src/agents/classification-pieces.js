@@ -40,7 +40,7 @@ export function joinClassifications(originals, classified) {
         const tooMany=segments.length>4096;
         const intro=[...new Set(pieces.map(e=>e.intro).filter(Boolean))].join('\n');
         const guidance=[...new Set(pieces.map(e=>e.retrieveWhen).filter(Boolean))].join('\n');
-        return createEntry({...source,kind,important:first.important,
+        return createEntry({...source,kind,important:first.important,importanceIndependent:true,
             intro:intro.slice(0,2000),
             retrieveWhen:guidance.slice(0,4000),
             segments:tooMany?splitSourceText(entryText(source)):segments,

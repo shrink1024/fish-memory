@@ -58,7 +58,7 @@ function classify(input) {
 }
 
 async function ready(f, settings = {}) {
-    const controller = new Controller(f.host, { model: f.model, settings: { enabled: true, maintenanceEvery: 1, batchChars: 30, ...settings } });
+    const controller = new Controller(f.host, { model: f.model, settings: { enabled: true, maintenanceKeepRecent: 0, maintenanceEvery: 1, batchChars: 30, ...settings } });
     await controller.start();
     await controller.initialize();
     return controller;
@@ -414,7 +414,7 @@ test('raw AgentClient keeps active maintenance while selecting a stable committe
     const maintaining = c.maintain();
     await until(() => rawCalls.some(call => call.purpose === 'maintain' && call.input.messages.some(item => item.key === 'later')));
     const before = c.generationBefore({ type: 'normal' });
-    await new Promise(resolve => setImmediate(resolve));
+    await until(() => rawCalls.some(call => call.purpose === 'select'));
     assert.equal(rawCalls.some(call => call.purpose === 'select'), true);
     gate.resolve(JSON.stringify({ operations: [{ type: 'summary', text: '维护后的脉络' }] }));
     await maintaining; await before;

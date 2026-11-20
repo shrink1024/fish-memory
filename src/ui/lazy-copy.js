@@ -46,6 +46,13 @@ export function lazyAttention(attention, { connectionMode = 'raw', capacityPerce
         '剧情不受影响，期间按原世界书发送。请确认酒馆仍在运行、当前聊天可以正常保存后，点击“重试”。如仍失败，请导出本次问题反馈给作者。'],
     actions: ['retry', 'export'], retryLabel: '重试',
     fine: '同一聊天在多个页面或设备上同时打开时，也可能导致保存失败。' };
+    if (attention.reason === 'source-rebound') {
+        const current = attention.currentBook ? `《${attention.currentBook}》` : '另一本世界书', previous = attention.previousBook ? `《${attention.previousBook}》` : '原来的世界书';
+        return { sub: '主世界书已更换', title: '需要处理', body: [
+            `角色卡现在绑定的是${current}，当前记忆建立在${previous}上。重新扫描之前，鱼忆暂停整理和挑选资料，按原世界书发送，旧记忆保留。`,
+            '请先在酒馆导出本聊天的 JSONL 备份，再切换到高级模式，在“设置 → 高级”中点“重新扫描整个存档”。扫描会多次调用模型，成功后替换动态资料，失败时保留旧资料。'],
+        actions: ['to-manual'] };
+    }
     if (attention.reason === 'capacity') {
         const percent = Number.isFinite(attention.percent) ? attention.percent : capacityPercent;
         return { sub: '存档容量即将用尽', title: '需要处理', body: [
@@ -111,7 +118,7 @@ export function lazyHeadline(view, now = Date.now()) {
 export function lazyShortStatus(view) {
     const lazy = view.lazy ?? {}, status = lazy.status ?? {};
     if (view.enabled === false || view.settings?.enabled === false) return '记忆已暂停';
-    if (lazy.attention) return lazy.attention.reason === 'capacity' ? '存档容量即将用尽' : `记忆暂停更新：${lazyAttention(lazy.attention).sub}`;
+    if (lazy.attention) return lazy.attention.reason === 'capacity' ? '存档容量即将用尽' : lazy.attention.reason === 'source-rebound' ? '主世界书已更换' : `记忆暂停更新：${lazyAttention(lazy.attention).sub}`;
     if (status.state === 'stopped') return TASKS[status.stoppedTask] ? `已停止${TASKS[status.stoppedTask]}` : '自动处理已停止';
     if (status.state === 'building') return view.activity ? '正在建立记忆' : '等待建立记忆';
     const busy = { maintaining: '正在记录新剧情', syncing: '正在同步原世界书', compacting: '正在整理记忆', retrying: '正在重试' }[status.state];

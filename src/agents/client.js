@@ -1,3 +1,4 @@
+import { requestHeaders } from './connection-headers.js';
 import { readStreamResponse } from './stream-response.js';
 import { throwIfAborted, combineSignals, timeoutSignal } from '../platform/abort.js';
 import { invariant, plainText } from '../core/util.js';
@@ -342,11 +343,11 @@ function connectionUrl(endpoint) {
 
 /** Model ids an OpenAI-compatible endpoint advertises at GET /models. Only a
  * convenience for filling the model name; manual entry always remains. */
-export async function listModels({ endpoint, apiKey = '', fetchImpl = globalThis.fetch, signal } = {}) {
+export async function listModels({ endpoint, apiKey = '', headers = [], fetchImpl = globalThis.fetch, signal } = {}) {
     const url = connectionUrl(endpoint);
     let response;
     try {
-        response = await fetchImpl(url.href.replace(/\/$/, '') + '/models', { method: 'GET', headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {}, signal });
+        response = await fetchImpl(url.href.replace(/\/$/, '') + '/models', { method: 'GET', headers: requestHeaders(apiKey, headers), signal });
     } catch {
         throwIfAborted(signal);
         throw new Error('无法连接该接口获取模型列表：地址可能有误，或该接口不允许网页直接访问。请检查地址后重试，或直接手动填写模型名称。');
@@ -364,7 +365,7 @@ export async function listModels({ endpoint, apiKey = '', fetchImpl = globalThis
 }
 
 /** Optional separate connection; credentials are supplied at runtime, never in save data. */
-export function compatibleConnection({ endpoint, model, apiKey = '', fetchImpl = fetch, tokenParameter = 'auto', maxOutputTokens }) {
+export function compatibleConnection({ endpoint, model, apiKey = '', headers = [], fetchImpl = fetch, tokenParameter = 'auto', maxOutputTokens }) {
     const url = connectionUrl(endpoint);
     invariant(['auto', 'max_tokens', 'max_completion_tokens'].includes(tokenParameter), '不支持的辅助输出长度参数');
     const openaiReasoning = /(?:^|\/)(?:gpt-[56](?:[.\-]|$)|o[134](?:-|$))/i.test(model);
@@ -378,7 +379,7 @@ export function compatibleConnection({ endpoint, model, apiKey = '', fetchImpl =
     let effortRejected = false;
     return async ({ purpose, system, input, head, tail, recovery, reasoningEffort, stream = false, onProgress, signal, responseLength = auxiliaryResponseLength(purpose) }) => {
         const send = effort => fetchImpl(url.href.replace(/\/$/, '') + '/chat/completions', {
-            method: 'POST', headers: { 'Content-Type': 'application/json', ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
+            method: 'POST', headers: requestHeaders(apiKey, headers, true),
             body: JSON.stringify({ model, messages: requestMessages({ system, input, head, tail, recovery }), stream,
                 ...(omitLength ? {} : { [lengthParameter]: explicitLength ? Number(maxOutputTokens) : responseLength }),
                 ...(effort ? { reasoning_effort: effort } : {}) }), signal,

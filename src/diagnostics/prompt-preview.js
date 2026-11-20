@@ -1,3 +1,4 @@
+import { maintenanceBatches, maintenanceSchedule } from '../runtime/maintenance-policy.js';
 import { compactPlans } from '../agents/compact-plan.js';
 import { clone, isPrefix } from '../core/util.js';
 import { DEFAULT_SETTINGS, makeSourceEntry, entryText, normalizeScopeId, readableScopes, entryScope } from '../core/state.js';
@@ -39,7 +40,7 @@ function pendingBatches(snapshot, save, settings) {
         if (runs.at(-1)?.[0].scopeId === scoped.scopeId) runs.at(-1).push(scoped);
         else runs.push([scoped]);
     }
-    return runs.flatMap(run => requestBatches(run, settings.batchChars));
+    return runs.flatMap(run => maintenanceBatches(run, settings.batchChars));
 }
 
 /** Read-only request assembly. Does not select entries, refresh variables, mutate
@@ -72,7 +73,7 @@ export function buildPromptPreview({ snapshot, save = null, selectionSave = save
     if (Array.isArray(rawEntries) && context.bookName) {
         const entries = rawEntries.filter(entry => !rules.configEntryUids.includes(entry.uid)).map(entry => makeSourceEntry(context.bookName, entry));
         // Disabled and pure-script entries are settled without a model call.
-        groups = requestBatches(prescan(entries).pending, settings.batchChars, entryText, INITIALIZATION_BATCH_ITEMS);
+        groups = requestBatches(prescan(entries).pending, settings.sourceBatchChars ?? settings.batchChars, entryText, INITIALIZATION_BATCH_ITEMS);
         if (!groups.length) stages.push(stage(AGENTS.initialize, 'initialize', '扫描世界书', 'skipped', '主书没有需要分类的条目，本步不调用模型。', { system: INITIALIZE }));
         for (const [index, batch] of groups.entries()) stages.push(stage(AGENTS.initialize, `initialize-${index + 1}`, `扫描世界书 · ${index + 1}/${groups.length}`,
             initialized || busy.initializing ? 'conditional' : 'ready',
@@ -92,7 +93,7 @@ export function buildPromptPreview({ snapshot, save = null, selectionSave = save
         return { at, chatId: context.chatId ?? null, revision: sameSave ? save.revision : null, warnings, stages };
     }
 
-    const recent = selectionMessages(context, save, settings.recentTurns);
+    const recent = selectionMessages(context, save, settings.selectionRecentTurns);
     const scopes = readableScopes(save.data.scopeContext);
     const eligibleHere = entry => scopes.has(entryScope(entry)) && eligible(entry);
     const selectObservation = observationFor(observedState, context, recent, settings);
@@ -108,6 +109,9 @@ export function buildPromptPreview({ snapshot, save = null, selectionSave = save
             authorGuidance: rules.naturalLanguage, messageCount: context.messages.length }), selectUncertainties));
 
     const safeSave = guarded(save, compiledRules), pending = pendingBatches(context, save, settings);
+    // This preview describes an explicit catch-up, including deferred tail rows.
+    // Automatic scheduling is separate, exposed for the UI to label honestly.
+    const automaticSchedule = maintenanceSchedule(context.messages, save.processed, settings);
     if (settings.summaryMode === 'rewrite' && settings.memoryMode !== 'worldbook') safeSave.summaryRewrite = true;
     const deferred = Boolean(save.data.scopeContext?.deferPost);
     const maintenanceNotes = deferred ? ['角色卡尚未提交本轮资料范围，后置暂停。解除暂停后的归属范围仍可能变化。'] : [];
@@ -124,7 +128,7 @@ export function buildPromptPreview({ snapshot, save = null, selectionSave = save
             if (settings.mvuEnabled && batch.at(-1)?.key === context.messages.at(-1)?.key) unknown.push('仅最新剧情所在批次可能读取 MVU；发送前会重新校验 observedState。');
             stages.push(stage(AGENTS.maintain, `maintain-${index + 1}`, `后置维护 · ${index + 1}/${pending.length}`,
                 index || deferred || !settings.enabled || busy.maintaining || busy.initializing ? 'conditional' : 'ready',
-                `按当前积压剧情展示；本批 ${batch.length} 条消息，归属 ${batch[0].scopeId}。后置只看到允许维护的正文片段。`, request, unknown));
+                `按“立即整理”处理全部积压展示${automaticSchedule.retainedReplies ? `；自动整理会暂缓最新 ${automaticSchedule.retainedReplies} 条回复，不一定包含本批全部内容` : ''}；本批 ${batch.length} 条消息，归属 ${batch[0].scopeId}。后置只看到允许维护的正文片段。`, request, unknown));
         }
     } else {
         const request = maintainRequest(safeSave, [], normalizeScopeId(save.data.scopeContext?.activeScopeId));
@@ -137,6 +141,6 @@ export function buildPromptPreview({ snapshot, save = null, selectionSave = save
     if (pending.length || busy.maintaining) compactNotes.push('下方 memory 是当前版本；维护完成后的脉络与事件可能变化。');
     if (deferred) compactNotes.push('角色卡提交范围前不会启动整理。');
     stages.push(stage(AGENTS.maintain, 'compact', '整理事件', 'conditional', '展示当前活动范围的脉络与可读事件；玩家主动整理时也使用此请求结构。',
-        compactPlans(compactRequest(safeSave, normalizeScopeId(save.data.scopeContext?.activeScopeId)))[0]?.request ?? {system:COMPACT,input:{memory:{entries:[]}}}, [...compactNotes,'整理按总输入预算分批；此处只展示第一批，来源 key 已映射为短引用。']));
-    return { at, chatId: context.chatId ?? null, revision: save.revision, warnings, stages };
+        compactPlans(compactRequest(safeSave, normalizeScopeId(save.data.scopeContext?.activeScopeId), {summaryLength:settings.summaryLength}))[0]?.request ?? {system:COMPACT,input:{memory:{entries:[]}}}, [...compactNotes,'整理按总输入预算分批；此处只展示第一批，来源 key 已映射为短引用。']));
+    return { at, chatId: context.chatId ?? null, revision: save.revision, warnings, stages, maintenancePreview: 'manual-catchup', automaticSchedule };
 }

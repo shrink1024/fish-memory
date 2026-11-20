@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Controller } from '../src/runtime/controller.js';
-import { selectionMessages, SELECTION_BACKLOG_CHARS } from '../src/agents/requests.js';
+import { selectionMessages } from '../src/agents/requests.js';
 import { externalLabel } from '../src/diagnostics/capture.js';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
@@ -61,14 +61,15 @@ test('an edit inside the batch being written still cancels it', async () => {
     assert.deepEqual(f.controller.store.state.processed, ['m0', 'm1', 'm2', 'm3', 'm4']);
 });
 
-test('selection keeps recent turns whole and only the newest part of an unmaintained backlog', () => {
+test('selection keeps recent turns and the complete unmaintained backlog', () => {
     const messages = Array.from({ length: 40 }, (_, i) => ({ key: `k${i}`, role: i % 2 ? 'assistant' : 'user', content: 'x'.repeat(5000) }));
     const recent = selectionMessages({ messages }, { processed: [] }, 2);
     const recentStart = messages.length - 4;
     assert.deepEqual(recent.slice(-4).map(m => m.key), messages.slice(recentStart).map(m => m.key));
     const backlog = recent.slice(0, -4);
-    assert.ok(backlog.reduce((n, m) => n + m.content.length, 0) <= SELECTION_BACKLOG_CHARS);
-    assert.deepEqual(backlog.map(m => m.key), messages.slice(recentStart - backlog.length, recentStart).map(m => m.key), 'the newest backlog floors, in order');
+    assert.ok(backlog.reduce((n, m) => n + m.content.length, 0) > 40000);
+    assert.deepEqual(recent.map(m=>m.key),messages.map(m=>m.key));
+    assert.deepEqual(backlog.map(m => m.key), messages.slice(recentStart - backlog.length, recentStart).map(m => m.key), 'all backlog floors, in order');
     const caughtUp = selectionMessages({ messages }, { processed: messages.slice(0, 30).map(m => m.key) }, 2);
     assert.deepEqual(caughtUp.map(m => m.key), messages.slice(30).map(m => m.key), 'a short backlog is kept whole');
 });

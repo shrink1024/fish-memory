@@ -29,7 +29,7 @@ async function fixture({lazyMode=true,messages=3,blocked=false}={}){
  const book=[{uid:1,comment:'设定',content:'合成资料'}];
  const host={snapshot:()=>structuredClone(live),generationSnapshot:()=>structuredClone(live),loadWorldbook:async()=>structuredClone(book),storage:{read:async()=>structuredClone(saved),write:async(_,v)=>{saved=structuredClone(v)}},clearPlan(){},setPlan(){},applyWindow:async()=>{}};
  const model={complete:async r=>{requests.push(r);if(r.purpose==='initialize')return {strategy:'s',entries:r.input.entries.map(e=>({id:e.id,kind:'fact',intro:'i',retrieveWhen:'w',segments:[{id:'body',writable:true}]}))};if(r.purpose==='maintain'&&block)throw Object.assign(Error('blocked'),{dwmBlocked:true});if(r.purpose==='select')return {ids:[]};return {operations:[]}}};
- const c=new Controller(host,{model,settings:{lazyMode,enabled:true,maintenanceEvery:1},lazyClock:{setTimer:()=>({unref(){}}),clearTimer(){}}});await c.start();
+ const c=new Controller(host,{model,settings:{lazyMode,enabled:true,maintenanceKeepRecent:0,maintenanceEvery:1},lazyClock:{setTimer:()=>({unref(){}}),clearTimer(){}}});await c.start();
  return {c,live,requests,book,unblock:()=>{block=false},saved:()=>saved,host};
 }
 test('old players keep manual initialization; lazy mode initializes existing 312-floor histories',async()=>{

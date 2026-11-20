@@ -1,3 +1,4 @@
+import { trackRerollIntent } from './reroll-intent.js';
 import { createPromptRegex } from './prompt-regex.js';
 /** SillyTavern boundary. All persistent state belongs to the current chat. */
 import { tauriPersistence } from './tauritavern.js';
@@ -270,6 +271,7 @@ export async function createSillyTavernHost(deps = {}) {
             key: messageKey(message, index, readOnly),
             role: message.is_user ? 'user' : message.extra?.dwmHidden?.owner === OWNER ? 'assistant' : message.is_system ? 'system' : 'assistant',
             content: projected[index].content,
+            rawHasContent: Boolean(String(message.mes ?? '').trim()),
             ...(projected[index].regexSkipped ? { regexSkipped: true } : {}),
             index,
             hidden: !promptOptions.history && Boolean(message.is_system || (windowChatId === chatId && windowKeys.has(messageKey(message, index, readOnly)))),
@@ -823,6 +825,8 @@ export async function createSillyTavernHost(deps = {}) {
         let active = true, currentRun = null, pendingStart = null;
         let lockedRun = null;
         const preflights = new WeakMap();
+        const rerollIntent = trackRerollIntent(globalThis.document, () => ctx().chat, () => currentIdentity(ctx()), () => script.isGenerating?.());
+        disposers.push(() => rerollIntent.dispose());
         const foreground = (type, dryRun) => !dryRun && !['quiet', 'impersonate'].includes(type);
         // ST 1.19 copies these same fields into two distinct event payloads.
         // TH 4.11 emits AFTER_COMMANDS with {} and no START. Merely seeing an
@@ -914,7 +918,7 @@ export async function createSillyTavernHost(deps = {}) {
             if (!foreground(type, dryRun) || !nativeOptions(options)) return;
             cancelRun(true);
             clearPlan();
-            currentRun = pendingStart = { type, options: { ...options }, phase: 'pending', cancelled: false,
+            currentRun = pendingStart = { type, options: { ...options }, phase: 'pending', cancelled: false, playerReroll: rerollIntent.consume(type, options),
                 abort: new AbortController(), replacement: captureReplacement(type) };
             replacement = currentRun.replacement;
         };
@@ -969,6 +973,7 @@ export async function createSillyTavernHost(deps = {}) {
             // stopGenerationById/stopAllGeneration pass its generation id; those
             // stops belong to that tool's request, not to the player's send.
             if (args.length && args[0] !== undefined) return;
+            rerollIntent.clear();
             cancelRun(true); pendingStart = null; cancelMessageTimers(); clearPlan();
             generationType = null; controller.generationStopped?.();
         };
@@ -1048,7 +1053,7 @@ export async function createSillyTavernHost(deps = {}) {
             generationType = type;
             const stopBefore = nativeStopSerial;
             try {
-                const result = await controller.generationBefore?.({ type, options, dryRun, isCurrent, signal: run.abort.signal });
+                const result = await controller.generationBefore?.({ type, options, dryRun, isCurrent, signal: run.abort.signal, playerReroll: run.playerReroll });
                 if (run && isCurrent() && !result?.cancel) run.prepared = true;
                 if (isCurrent() && result?.cancel) {
                     if (run) run.cancelled = true;
@@ -1103,6 +1108,7 @@ export async function createSillyTavernHost(deps = {}) {
         });
         listen(types.MESSAGE_SENT, consumeInput);
         listen(types.CHAT_CHANGED, async () => {
+            rerollIntent.clear();
             cancelRun(); cancelMessageTimers(); clearPlan(); generationType = null; eligibilityWarned.clear();
             await controller.chatChanged?.(); checkReadiness();
         });
@@ -1115,6 +1121,7 @@ export async function createSillyTavernHost(deps = {}) {
         listen(types.MESSAGE_SWIPED, index => {
             const message = ctx().chat?.[index];
             if (message?.swipes?.[message.swipe_id ?? 0] === undefined) return;
+            rerollIntent.clear();
             cancelRun();
             Promise.resolve(controller.messageSwiped?.({ index })).catch(console.error);
         });
@@ -1148,6 +1155,15 @@ export async function createSillyTavernHost(deps = {}) {
         return () => { for (const dispose of disposers) dispose(); disposers = []; cancelMessageTimers(); clearPlan(); };
     }
 
+    async function selectionContextSignature({ includeConnection = true } = {}) {
+        const live = ctx(), api = includeConnection ? live.mainApi ?? script.main_api : undefined;
+        let settings;
+        if (api === 'openai') settings = live.chatCompletionSettings ?? (deps.openai ?? (deps.script ? {} : await import('/scripts/openai.js'))).oai_settings;
+        else if (api === 'textgenerationwebui') settings = (deps.textgen ?? (deps.script ? {} : await import('/scripts/textgen-settings.js'))).textgenerationwebui_settings;
+        // Local cache invalidation only; never included in a prompt or trace.
+        return JSON.stringify({ api, settings, char: live.name2, user: live.name1 });
+    }
+
     async function rawGenerate(params) {
         // Explicit dependency injection is kept for deterministic adapter tests.
         // Production never enters ST generateRaw's template/cleanup pipeline.
@@ -1177,7 +1193,7 @@ export async function createSillyTavernHost(deps = {}) {
         return result;
     }
 
-    return { initializationSnapshot: () => snapshot(false,{history:true}), statusSnapshot: () => snapshot(true,{project:false}), listWorldbooks, promptRegexSignature: promptRegex.signature, supplementaryBooks, readSupplementaryBook, snapshot, generationSnapshot, pendingReplacement, previewSnapshot: () => snapshot(true), previewEligible: entry => eligible(entry, { silent: true, type: 'normal' }), loadWorldbook, worldbookStatus, checkWorldbook, eligible, storage, setPlan, clearPlan, applyWorldInfoEntries, applyWindow, restoreLegacyWindow, filterOutgoingHistory, bindController, rawGenerate, stopGeneration, auxiliaryReadiness,
+    return { selectionContextSignature, initializationSnapshot: () => snapshot(false,{history:true}), statusSnapshot: () => snapshot(true,{project:false}), listWorldbooks, promptRegexSignature: promptRegex.signature, supplementaryBooks, readSupplementaryBook, snapshot, generationSnapshot, pendingReplacement, previewSnapshot: () => snapshot(true), previewEligible: entry => eligible(entry, { silent: true, type: 'normal' }), loadWorldbook, worldbookStatus, checkWorldbook, eligible, storage, setPlan, clearPlan, applyWorldInfoEntries, applyWindow, restoreLegacyWindow, filterOutgoingHistory, bindController, rawGenerate, stopGeneration, auxiliaryReadiness,
         readMvu: settings => readMvuProjection({ context: ctx, settings, globals: deps.globals ?? globalThis }),
         getWarnings: () => copy(warnings), windowStatus: () => copy(outgoingWindow) };
 }

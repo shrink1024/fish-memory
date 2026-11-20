@@ -28,7 +28,7 @@ test('maintenance preserves existing protected references without exposing locke
         const npc = memory.entries.find(entry => entry.id === 'npc');
         return JSON.stringify({ operations: [
             { type: 'summary', text: memory.summary + '随后去了市场。' },
-            { type: 'update', id: 'npc', expectedVersion: 1, evidence: ['m1'], segments: [{ id: 'body', text: npc.segments[0].text + '现在出门了。' }] },
+            { type: 'update', id: 'npc', expectedVersion: 1, evidence: ['m1'], edits: [{ segmentId: 'body', append: '现在出门了。' }] },
         ] });
     });
     const result = await maintain(client, save, messages, undefined, 'global', null, result => apply(save, result));
@@ -123,7 +123,7 @@ test('Controller validates and commits restored narrative while preserving origi
         const npc = request.input.memory.entries[0];
         assert.doesNotMatch(JSON.stringify(request.input.memory), new RegExp(place));
         return { operations: [{ type: 'update', id: npc.id, expectedVersion: npc.version, evidence: ['m1'],
-            segments: [{ id: 'body', text: npc.segments[0].text + '现在出门了。' }] }] };
+            edits: [{ segmentId: 'body', append: '现在出门了。' }] }] };
     } }, settings: { enabled: true, maintenanceEvery: 1 } });
     await c.start(); await c.initialize(); state.messages.push(messages[0]); await c.maintain();
     assert.equal(entryText(c.store.state.data.entries['source:book:2']), `艾琳住在${place}南区。现在出门了。`);

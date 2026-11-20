@@ -1,5 +1,5 @@
 import { watchToolbarEntry } from './src/ui/toolbar-entry.js';
-import { orderedPresetEntries } from './src/agents/preset-application.js';
+import { createPresetLibrary } from './src/adapters/preset-library.js';
 import { createSillyTavernHost } from './src/adapters/sillytavern.js';
 import { createSettingsPersistence, initialSettings } from './src/adapters/settings.js';
 import { Controller } from './src/runtime/controller.js';
@@ -9,9 +9,11 @@ import { installCapture } from './src/diagnostics/capture.js';
 import { createProblemExporter } from './src/diagnostics/problem-export.js';
 import { createFloatingManager } from './src/ui/floating-manager.js';
 import { lazyShortStatus } from './src/ui/lazy-copy.js';
+import { createFallbackDialog } from './src/ui/fallback-dialog.js';
+import { createRerollDialog } from './src/ui/reroll-dialog.js';
 
 // Loaded by index.js. Keep in step with manifest.json; test/version.test.js checks it.
-const PLUGIN_VERSION = '1.1.1';
+const PLUGIN_VERSION = '1.1.6';
 
 async function boot() {
     if (!globalThis.SillyTavern?.getContext || document.getElementById('dynamic-world-memory')) return;
@@ -39,13 +41,7 @@ async function boot() {
             ].filter(entry => typeof entry.text === 'string' && entry.text.length > 8);
         },
     });
-    host.readPreset = () => {
-        if (SillyTavern.getContext().mainApi !== 'openai') return { name: '当前连接没有可读取的聊天补全预设', entries: [] };
-        const manager = openai.promptManager;
-        const order = manager?.getPromptOrderForCharacter?.(manager.activeCharacter) ?? [];
-        return { name: openai.oai_settings?.preset_settings_openai ?? '',
-            entries: orderedPresetEntries(openai.oai_settings?.prompts ?? [], order) };
-    };
+    Object.assign(host, createPresetLibrary(openai, () => SillyTavern.getContext()));
     const extensionSettings = context.extensionSettings ?? (await import('/scripts/extensions.js')).extension_settings;
     const freshInstall = extensionSettings.dwm == null;
     const settings = initialSettings(extensionSettings);
@@ -64,31 +60,8 @@ async function boot() {
             saveSettings: async () => (await import('/script.js')).saveSettings(),
             getRequestHeaders: () => SillyTavern.getContext().getRequestHeaders(),
             fetch: (...args) => globalThis.fetch(...args) }),
-        chooseFallback: (error, { signal } = {}) => new Promise(resolve => {
-            if (signal?.aborted) { resolve('cancel'); return; }
-            const dialog = document.createElement('dialog');
-            dialog.className = 'dwm-fallback';
-            const title = document.createElement('h3'); title.textContent = '本轮记忆选材未完成';
-            const detail = document.createElement('details'); const summary = document.createElement('summary'); summary.textContent = '技术信息';
-            const errorText = document.createElement('p'); errorText.textContent = error.message; detail.append(summary, errorText);
-            const hint = document.createElement('p'); hint.textContent = '按原世界书发送会撤去本轮动态资料，保留酒馆和其他工具的正常内容。';
-            dialog.append(title, detail, hint);
-            let finished = false;
-            const finish = value => {
-                if (finished) return; finished = true;
-                signal?.removeEventListener('abort', aborted);
-                if (dialog.open) dialog.close(); dialog.remove(); resolve(value);
-            };
-            const aborted = () => finish('cancel');
-            for (const [value, text] of [['original', '按原世界书发送'], ['retry', '重新选材（调用模型）'], ['cancel', '停止本轮']]) {
-                const button = document.createElement('button'); button.textContent = text;
-                if (value === 'cancel') button.autofocus = true;
-                button.addEventListener('click', () => finish(value)); dialog.append(button);
-            }
-            dialog.addEventListener('cancel', event => { event.preventDefault(); finish('cancel'); });
-            signal?.addEventListener('abort', aborted, { once: true });
-            document.body.append(dialog); dialog.showModal();
-        }),
+        // Created once the manager exists; only called during a send, long after start-up.
+        chooseFallback: (error, options) => fallbackDialog.choose(error, options),
     });
     const mount = document.createElement('div'); mount.id = 'dynamic-world-memory';
     const drawer = document.createElement('details');
@@ -98,7 +71,16 @@ async function boot() {
     const extStatus = document.createElement('p'); extStatus.className = 'dwm-ext-status'; extStatus.hidden = true; extStatus.setAttribute('role', 'status');
     const openManager = document.createElement('button'); openManager.type = 'button'; openManager.textContent = '打开管理窗口';
     const manager = createFloatingManager(document, { bubbleVisible: !freshInstall });
+    const fallbackDialog = createFallbackDialog(document, {
+        openManager: () => manager.open(),
+        stop: () => controller.requestStop?.(controller.uiStatus().activity?.id),
+        isSelecting: () => controller.uiStatus().activity?.kind === 'select',
+        subscribe: listener => controller.subscribe(listener),
+    });
     manager.body.append(mount);
+    // “每次询问”：重新生成前问玩家沿用还是重新挑选。管理窗口收起时也要能显示，所以挂在页面上。
+    const rerollDialog = createRerollDialog(document);
+    const unregisterReroll = controller.registerRerollChoiceHandler?.(choice => rerollDialog.present(choice));
     const showManager = event => manager.open(event);
     const bindManagerEntry = button => manager.bindEntry(button);
     bindManagerEntry(openManager);
@@ -144,6 +126,8 @@ async function boot() {
         controller.cancel('页面已关闭，辅助等待已结束');
         toolbarWatch.destroy();
         unsubscribeManager();
+        unregisterReroll?.();
+        rerollDialog.destroy();
         panel.destroy();
         manager.destroy();
         host.traceCapture.dispose();

@@ -8,6 +8,8 @@ export function elapsedLabel(startedAt, now = Date.now()) {
     return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
 }
 
+const ACTIVITY_LABELS = { 'entry-change:merge': '正在生成合并方案', 'entry-change:condense': '正在生成精简方案', 'entry-change:save': '正在保存修改' };
+
 export function createActivityIndicator(doc, { onStop, onRecover, now = Date.now, timers = doc.defaultView ?? globalThis } = {}) {
     const make = (tag, className) => { const node = doc.createElement(tag); node.className = className; return node; };
     const element = make('section', 'dwm-activity'); element.hidden = true; element.setAttribute('aria-label', '鱼忆运行状态');
@@ -30,7 +32,7 @@ export function createActivityIndicator(doc, { onStop, onRecover, now = Date.now
         if (destroyed) return;
         element.hidden = !activity && !notice;
         element.dataset.phase = activity ? activity.phase : 'finished';
-        set(label, activity ? `鱼忆 · ${activity.label}` : `鱼忆 · ${notice}`);
+        set(label, activity ? `鱼忆 · ${ACTIVITY_LABELS[activity.label] ?? activity.label}` : `鱼忆 · ${notice}`);
         set(hint, actionError || activity?.hint || ''); hint.hidden = !actionError && !activity?.hint;
         bar.hidden = progress === null;
         if (progress !== null) { const percent = String(Math.round(progress * 100)); bar.setAttribute('aria-valuenow', percent); fill.style.width = `${percent}%`; }

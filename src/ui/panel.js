@@ -13,9 +13,40 @@ const KIND_NAMES = { fact: '设定', rule: '规则', npc: '人物', npc_pool: '�
 const TASK_NAMES = { initialize: '扫描世界书', strategy: '统合记忆策略', maintain: '后台整理', select: '发送前选材', compact: '整理事件', preferences: '扫描预设', sourceMerge: '合并原书更新' };
 const REASONS = { 'extra-book': '从其他世界书加入', maintenance: '后台整理', compact: '整理记忆', compaction: '整理记忆', 'source-sync': '同步原书', 'inventory-catchup': '补记物品',
     edit: '编辑正文', reset: '复原', classify: '调整保护', promote: '晋升人物', 'promote-from-pool': '从路人建立条目',
-    tier: '调整档位', tiers: '批量调整档位', 'tier-reset': '恢复扫描档位', 'import-memory': '导入旧总结' };
+    tier: '调整档位', tiers: '批量调整档位', 'tier-reset': '恢复扫描档位', 'import-memory': '导入旧总结',
+    'restore-entry': '复原', 'source-held-resolve': '处理原书新版本', 'entry-delete': '删除资料', 'entry-merge': '合并资料', 'entry-condense': '精简资料',
+    'entry-undo': '撤销', 'automatic-merge': '整理记忆 · 自动合并', 'rollback-remove': '删楼回退',
+    'summary-edit': '修改故事脉络', 'summary-edit-undo': '撤销脉络修改' };
+// Rejected records keep the old text; they explain why one change was not applied.
+const REJECTED = { 'patch-not-found': '要修改的原句在正文中找不到', 'patch-ambiguous': '要修改的原句在正文中出现了多次，无法确定位置',
+    'patch-overlap': '与同一次整理的另一处修改范围重叠', 'patch-duplicate-update': '同一次整理重复修改了这条资料', 'patch-protected': '要修改的部分受保护',
+    'patch-protected-reference': '修改会复制受保护的内容', 'patch-segment-missing': '要修改的段落已不存在', 'patch-invalid': '修改内容不完整',
+    'patch-rewrite-rejected': '后台试图整段改写正文', 'patch-span-too-long': '一处修改的范围过长', 'patch-span-multiline': '一处修改跨越了多行',
+    'patch-span-too-wide': '一处修改覆盖了正文的大部分', 'patch-merge-needs-confirmation': '日常整理不合并条目', 'merge-identity-unconfirmed': '未能确认是同一对象',
+    'merge-overlap': '同一条资料被重复用于合并', 'merge-target-protected': '目标条目受保护，不能追加', 'duplicate-character': '已有同名条目，未重复建立',
+    'summary-edited-content': '整理结果带回了你从故事脉络中删掉的内容' };
+// Summary edits fail with plain machine codes (summary-edit:<code>).
+const SUMMARY_ISSUES = { changed: '故事脉络在你编辑时已有变化，请核对后再保存。', busy: '正在挑选资料或生成回复，完成后再保存。',
+    unavailable: '当前无法编辑故事脉络。', 'undo-changed': '故事脉络之后又有更新，这次修改已经不能撤销。' };
+const summaryFailure = error => {
+    const code = /^summary-edit:(.+)$/.exec(error?.message ?? '')?.[1];
+    return code ? new Error(SUMMARY_ISSUES[code] ?? '故事脉络未能保存，请稍后重试。') : error;
+};
+const rejected = record => record?.outcome === 'rejected';
+const reasonOf = record => rejected(record) ? '后台整理 · 未采用' : REASONS[record?.reason] ?? record?.reason ?? '资料更新';
 let panelSequence = 0;
 const textOf = entry => (entry?.segments ?? []).map(segment => segment.text).join('');
+// Backend errors carry machine codes; the panel writes the player-facing sentence.
+const ISSUES = {
+    dwmEntryChangeIssue: { selection: '选中的条目里有不能处理的条目，请重新选择。', protected: '有条目受保护或被作者锁定，不能合并或精简。', source: '原书条目不能删除、合并或精简，需要时可以设为关闭。',
+        scope: '只能合并同一资料范围里的条目。', mode: '操作类型无效，请重新操作。', result: '方案内容不完整，请重新生成。', length: '有条目超出长度上限，请删减后再保存。',
+        changed: '资料在这期间有变化，请重新核对后再操作。', confirmation: '操作需要确认，请重新操作。', busy: '后台正在处理，请稍后再试。',
+        'undo-changed': '相关条目之后又被修改过，这次操作已经不能撤销。', 'source-changed': '原世界书在这期间有变化，请先同步后再操作。' },
+    dwmPresetSourceIssue: { busy: '后台正在处理，请稍后再切换预设。', missing: '这套预设已不存在或被改名，请重新选择。', changed: '预设在这期间有变化，请重新选择。' },
+    dwmHeaderIssue: { limit: '自定义请求头最多 20 条。', name: '请求头名称无效，或者是浏览器自行管理的名称（如 Host、Cookie、Origin）。', duplicate: '请求头名称重复了。',
+        missing: '有请求头没有填写值，也没有可以沿用的已保存值。', value: '请求头的值含有换行或非法字符，或者超过 16384 个字符。' },
+};
+const issueText = error => { for (const [field, table] of Object.entries(ISSUES)) if (error?.[field]) return table[error[field]] ?? ''; return ''; };
 const display = value => typeof value === 'string' ? value : JSON.stringify(value, null, 2) ?? '';
 const timeOf = value => {
     if (!value) return '尚无时间记录';
@@ -59,13 +90,18 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
     let extraDraft = null, extraSearch = '', recentlyAdded = new Set();
     let connectionDownload = null;
     let transferDraft = null, transferBook = '', transferSource = 'book', transferDownload = null;
+    // 1.1.4: deleting own entries, and model proposals that the player confirms before saving.
+    let deleteIds = [], proposal = null, proposalEdit = null, undoDismissed = null, rollbackDismissed = null;
     const clearTransferDownload = () => { if (transferDownload) { transferDownload.api.revokeObjectURL(transferDownload.url); transferDownload = null; } };
     let ruleNL = '', ruleScript = '', ruleOutput = '', ruleMatch = { field: 'title', op: 'contains', value: '', action: 'lock', limit: '' };
-    let recentTurnsDraft = null, timeoutDraft = null, cadenceDraft = null, mvuDraft = null, lastSaveId = null, localPreview = null;
+    let recentTurnsDraft = null, timeoutDraft = null, mvuDraft = null, lastSaveId = null, localPreview = null;
+    const numberDrafts = new Map();
+    let inventoryDraft = null;
+    const summaryDrafts = new Map();
     let applicationSelection = new Set(), applicationPositions = {}, applicationKey = null;
     let connectionChoice = null, profileNameDraft = '', connectionDraftKey = null;
     const entryDrafts = new Map(), poolDrafts = new Map(), expanded = new Set(), scrollPositions = new Map();
-    const connectionDraft = { endpoint: '', model: '', apiKey: '', maxOutputTokens: undefined };
+    const connectionDraft = { endpoint: '', model: '', apiKey: '', maxOutputTokens: undefined, headers: [] };
     const storage = (() => { try { return doc.defaultView?.localStorage ?? null; } catch { return null; } })();
     let listWidth = (() => { try { return Number(storage?.getItem('dwm.list-width.v1')) || null; } catch { return null; } })();
     // 超级懒人模式: the upgrade note is per browser; switching to 高级模式 on purpose also dismisses it.
@@ -174,7 +210,7 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         if (busy || destroyed) return;
         busy = true; cancelRequested = false; localError = ''; notice = ''; render();
         try { const result = await operation(); if (!cancelRequested) notice = result?.executed === false ? result.reason : result?.message || success; }
-        catch (error) { if (cancelRequested || error?.dwmCancelled || error?.dwmYielded) notice = controller.view().status; else localError = error?.message || '操作未完成，请稍后重试。'; }
+        catch (error) { if (cancelRequested || error?.dwmCancelled || error?.dwmYielded) notice = controller.view().status; else localError = issueText(error) || error?.message || '操作未完成，请稍后重试。'; }
         finally { busy = false; cancelRequested = false; if (!destroyed) render(); }
     }
     /** Long automatic work (a retry can rerun a whole scan) must not lock the window the way `call` does. */
@@ -326,7 +362,13 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         else if (view.error) state.append(dot('dwm-status-error'), h('span', '', view.status || '需要处理'));
         else if (!view.save?.initialized) state.append(dot('dwm-status-idle'), h('span', '', view.status && view.status !== '未初始化' ? view.status : '此存档还没有建立记忆'));
         else if (view.autoPostPaused && !view.activity) state.append(dot('dwm-status-busy'), h('span', '', '自动整理暂停到下一条回复'), button('立即补记', () => call(() => controller.maintain()), { ghost: true, className: 'dwm-link-button' }));
-        else if (pending > 0) state.append(dot(''), h('span', '', `${countOf(pending)} 条消息待整理`), button('立即整理', () => call(() => controller.maintain(), '补记完成'), { ghost: true, className: 'dwm-link-button', disabled: Boolean(view.activity) }));
+        // The newest replies are held back on purpose; only replies that can be recorded count as waiting.
+        else if (pending > 0 && view.maintenance?.eligibleReplies !== 0) {
+            const m = view.maintenance, counted = Number.isInteger(m?.eligibleReplies);
+            const text = counted ? `已积累 ${m.eligibleReplies}/${m.every} 条回复` : `${countOf(pending)} 条消息待整理`;
+            state.append(dot(''), h('span', '', text), button('立即整理', () => call(() => controller.maintain(), '补记完成'), { ghost: true, className: 'dwm-link-button', disabled: Boolean(view.activity),
+                title: m?.retainedReplies ? `处理全部待整理剧情，包括暂缓的最新 ${m.retainedReplies} 条回复` : '' }));
+        }
         else state.append(dot(''), h('span', '', view.status && !['可用', '已就绪'].includes(view.status) ? view.status : '已就绪'));
         return state;
     }
@@ -343,14 +385,49 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
             feedback.append(box);
         }
         if (view.error) {
-            const error = details(`出了点问题：${view.status || '任务未完成'}`, 'task-error', 'dwm-disclosure dwm-error-box'); error.append(prose(view.error));
+            const info = view.errorInfo ?? {};
+            const explain = info.kind === 'storage-version' && info.storageFormat === 'reverted-dev2-source-layers'
+                ? '这份存档由测试版 1.1.5-dev.2 写入，该存档格式已在后续版本撤回，当前版本无法读取。为避免覆盖原有数据，鱼忆已暂停处理这个聊天。请恢复使用 dev.2 之前导出的聊天备份。'
+                : info.action === 'rollback' ? '删除或切换楼层后，鱼忆未能保存回退后的记忆。为避免发送已删除楼层的内容，下次发送前会再次回退，回退完成前不注入记忆。请确认酒馆仍在运行、聊天可以正常保存。' : '';
+            const error = details(`任务未完成：${view.status || '需要处理'}`, 'task-error', 'dwm-disclosure dwm-error-box');
+            if (explain) error.append(h('p', '', explain));
+            error.append(prose(view.error));
             error.append(row(view.save?.initialized && /记忆待补齐|正在维护|补记/.test(view.status) && button('重试补记', () => call(() => controller.maintain())),
                 typeof exportProblem === 'function' && button('导出本次问题', () => {
                     // The export and its fallback download link live on the 收发 page.
                     tab = 'log'; logView = 'traces'; diagnosticsMode = 'actual'; render(); traceViewer.exportProblem();
                 }, { ghost: true, key: 'error-export-problem' })));
-            error.append(h('p', 'dwm-muted', '找作者反馈时，把导出的文件一起发过去。文件里有相关剧情和提示词，发之前可以先核对。'));
+            error.append(h('p', 'dwm-muted', '向作者反馈时，请附上导出的文件。文件包含相关剧情与提示词，发送前可先核对。'));
             feedback.append(error);
+        }
+        const back = view.rollback;
+        const summaryReverts = back?.revertedSummaryEdits ?? [];
+        if (back && back.id !== rollbackDismissed && (back.affectedEntries?.length || back.summaryChanged || back.inventoryChanged || summaryReverts.length)) {
+            const restored = back.affectedEntries.filter(e => e.action === 'restored'), removed = back.affectedEntries.filter(e => e.action === 'removed');
+            // A rollback past the player's own summary edit must say so, even when no entry changed.
+            const summaryPart = summaryReverts.some(e => e.action === 'edit') ? '故事脉络回到你手动修改之前的版本'
+                : summaryReverts.length ? '你撤销过的故事脉络修改重新生效' : back.summaryChanged ? '故事脉络回到之前的版本' : '';
+            const parts = [restored.length && `恢复 ${restored.length} 条资料`, removed.length && `移除 ${removed.length} 条资料`,
+                summaryPart, back.inventoryChanged && '物品回到之前的状态'].filter(Boolean);
+            const box = h('div', 'dwm-banner dwm-rollback-banner'); box.setAttribute('role', 'status');
+            const line = h('p');
+            line.append(h('strong', '', '记忆已随聊天回退'), h('span', '', `：删除或切换楼层后，鱼忆撤回了这些楼层带来的记忆，${parts.join('，')}。`));
+            box.append(line);
+            if (back.affectedEntries.length) {
+                const names = h('p', 'dwm-muted');
+                back.affectedEntries.slice(0, 6).forEach((item, index) => {
+                    if (index) names.append('、');
+                    const live = item.action === 'restored' && view.save?.data?.entries?.[item.id];
+                    names.append(live ? button(item.title || '未命名条目', () => openEntry(item.id), { navigation: true, ghost: true, className: 'dwm-link-button', key: `rollback-${item.id}` })
+                        : h('span', '', `${item.title || '未命名条目'}（已移除）`));
+                });
+                if (back.affectedEntries.length > 6) names.append(` 等 ${back.affectedEntries.length} 条`);
+                box.append(names);
+            }
+            if (summaryReverts.length) box.append(row(button('查看故事脉络', () => { tab = 'library'; section = 'summary'; mobileDetail = false; render(); },
+                { navigation: true, ghost: true, className: 'dwm-link-button', key: 'rollback-summary' })));
+            box.append(button('×', () => { rollbackDismissed = back.id; render(); }, { key: 'rollback-dismiss', ghost: true, navigation: true, className: 'dwm-link-button dwm-banner-close', title: '不再显示这条提示' }));
+            feedback.append(box);
         }
         const changes = view.sourceChanges;
         if (changes?.unavailable?.length) feedback.append(h('p','dwm-muted',`来源世界书不可用：${changes.unavailable.join('、')}。已加入的条目照常使用；该书恢复后可同步更新。`));
@@ -360,7 +437,14 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
             if (changes.held.length > 6) line.append(` 等 ${changes.held.length} 条`);
             box.append(line, h('p', 'dwm-muted', '选择之前，这些条目按当前版本使用，不影响其他条目。')); box.setAttribute('role', 'status'); feedback.append(box);
         }
-        if (changes?.changed) {
+        if (changes?.rebound) {
+            // A new binding is not a list of edits to the old book; only a rescan (or, later, a migration) can adopt it.
+            const box = h('div', 'dwm-banner dwm-banner-warn');
+            box.append(h('p', '', `主世界书已从《${changes.previousBook ?? '原世界书'}》更换为《${changes.currentBook ?? '新世界书'}》。重新扫描之前，鱼忆暂停整理和挑选资料，按原世界书发送，旧记忆保留。`),
+                h('p', 'dwm-muted', '请先在酒馆导出本聊天的 JSONL 备份，再重新扫描整个存档。扫描会多次调用模型，成功后替换动态资料，失败时保留旧资料。'),
+                row(button('备份后重新扫描…', () => { settingsNav = 'advanced'; navigate('settings'); }, { primary: true, navigation: true, key: 'rebound-rescan' })));
+            box.setAttribute('role', 'status'); feedback.append(box);
+        } else if (changes?.changed) {
             const box = h('div', 'dwm-banner dwm-banner-warn');
             box.append(h('p', '', `角色卡的世界书更新了：新增 ${changes.added.length} 条、修改 ${changes.updated.length} 条、删除 ${changes.removed.length} 条。同步前，相关的整理先暂停。`),
                 row(button('只同步变化的条目', () => call(() => controller.syncSourceChanges(), '原书变化已同步'), { primary: true, disabled: Boolean(view.activity) || !view.save?.initialized }),
@@ -430,6 +514,9 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         } else section.append(h('p', 'dwm-lazy-empty', '暂无自动处理记录。'));
         page.append(section);
         const foot = h('footer', 'dwm-lazy-foot');
+        const economyLabel = h('span', 'dwm-lazy-label', '省钱模式'); economyLabel.title = economyCopy(view.settings ?? {});
+        economyLabel.append(economySwitch(view.settings ?? {}, 'lazy-economy')); foot.append(economyLabel);
+        if (view.settings?.economyMode === true) page.append(h('p', 'dwm-lazy-note', `省钱模式已开启：挑选资料只参考最近 ${view.settings.selectionRecentTurns ?? 12} 轮，每 ${view.settings.maintenanceEvery ?? DEFAULT_SETTINGS.maintenanceEvery} 次 AI 回复整理一次，偶尔会漏掉较早的细节。`));
         if (appearance) { const label = h('span', 'dwm-lazy-label', '悬浮气泡'); label.append(bubbleSegments()); foot.append(label); }
         if (!attention?.actions.includes('to-manual')) foot.append(button('高级模式', () => { dialog = 'lazy-to-manual'; render(); }, { navigation: true, key: 'lazy-to-manual' }));
         page.append(foot);
@@ -495,8 +582,10 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         const bar = h('div', 'dwm-library-top');
         bar.append(segments([['entries', '世界书'], ['summary', '故事脉络'], ['inventory', '物品']], section, id => { section = id; mobileDetail = false; moreMenu = false; render(); },
             { key: 'section', label: '资料类别', small: true }));
-        const more = button('⋯', () => { moreMenu = !moreMenu; tierMenu = null; render(); }, { navigation: true, ghost: true, key: 'more-menu', className: 'dwm-icon-button', title: '导出、导入' });
-        more.setAttribute('aria-haspopup', 'menu'); more.setAttribute('aria-expanded', String(moreMenu)); more.setAttribute('aria-label', '导出、导入');
+        if (typeof controller.exportMemory === 'function') bar.append(button('导出世界书', () => { clearTransferDownload(); moreMenu = false; dialog = 'export'; render(); },
+            { ghost: true, key: 'export-book', className: 'dwm-export-button', disabled: Boolean(view.activity) || !view.save?.initialized, title: '将鱼忆维护后的世界书另存为酒馆世界书，供新聊天使用' }));
+        const more = button('⋯', () => { moreMenu = !moreMenu; tierMenu = null; render(); }, { navigation: true, ghost: true, key: 'more-menu', className: 'dwm-icon-button', title: '导入、同步' });
+        more.setAttribute('aria-haspopup', 'menu'); more.setAttribute('aria-expanded', String(moreMenu)); more.setAttribute('aria-label', '导入、同步');
         const anchor = h('div', 'dwm-menu-anchor'); anchor.append(more);
         if (moreMenu) {
             const menu = h('div', 'dwm-menu'); menu.setAttribute('role', 'menu');
@@ -509,9 +598,10 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
                 extraDraft = { ...(await controller.extraBookPreview()), chosen: new Set() }; extraSearch = ''; dialog = 'extra-book';
             }, '已读取世界书列表'), unavailable || !view.save?.initialized || Boolean(view.sourceChanges?.rebound)));
             if (typeof controller.exportMemory === 'function') menu.append(
-                item('导出为世界书', '给新聊天接着用', () => { clearTransferDownload(); dialog = 'export'; render(); }, unavailable),
-                item('导入旧总结', '从附加世界书或文件', () => { transferDraft = null; dialog = 'import'; render(); }, unavailable));
-            menu.append(item('同步原世界书的更新', '主世界书及已加入条目的来源世界书', () => call(() => controller.syncSourceChanges()), unavailable || !view.sourceChanges?.changed && !view.sourceChanges?.pendingScan?.length));
+                item('导入旧总结', '从附加世界书或文件导入', () => { transferDraft = null; dialog = 'import'; render(); }, unavailable));
+            const rebound = Boolean(view.sourceChanges?.rebound);
+            menu.append(item('同步原世界书的更新', rebound ? '主世界书已更换，需要重新扫描' : '主世界书及已加入条目的来源世界书', () => call(() => controller.syncSourceChanges()),
+                unavailable || rebound || !view.sourceChanges?.changed && !view.sourceChanges?.pendingScan?.length));
             anchor.append(menu);
         }
         bar.append(anchor); return bar;
@@ -571,7 +661,7 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
             search_.wrap.classList.add('dwm-search');
             const kinds = selectField('类型', kindFilter, [['', '全部类型'], ...Object.entries(KIND_NAMES)], value => { kindFilter = value; visibleCount = 120; render(); }, 'kind-filter');
             kinds.wrap.classList.add('dwm-kind');
-            tools.append(row(search_.wrap, kinds.wrap, button('多选', () => { selectMode = true; picked.clear(); tierMenu = null; render(); }, { navigation: true, title: '勾选多条，一次改档位' })));
+            tools.append(row(search_.wrap, kinds.wrap, button('多选', () => { selectMode = true; picked.clear(); tierMenu = null; render(); }, { navigation: true, title: '勾选多条，一次改档位，或合并、精简、删除' })));
         }
         const chips = h('div', 'dwm-chips'); chips.setAttribute('role', 'group'); chips.setAttribute('aria-label', '按档位筛选');
         const chip = (id, label, count, active, onClick, mark) => {
@@ -583,6 +673,15 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         for (const [id, name] of TIERS) chips.append(chip(id, name, entries.filter(e => tierOf(e) === id).length, tierFilter === id, () => { tierFilter = tierFilter === id ? '' : id; render(); }, lamp(id)));
         chips.append(chip('changed', '存在改动', entries.filter(e => origin(e) !== 'same').length, changedOnly, () => { changedOnly = !changedOnly; render(); }, h('span', 'dwm-mark dwm-mark-changed', '改')));
         tools.append(chips); sidebar.append(tools);
+        const undo = view.entryUndo;
+        if (undo?.canUndo && undo.kind !== 'summary' && undoDismissed !== undo.id) {
+            const banner = h('div', 'dwm-banner dwm-undo-banner'); banner.setAttribute('role', 'status');
+            const names = undo.titles.slice(0, 2).map(t => `「${t}」`).join('、') + (undo.titles.length > 2 ? ` 等 ${undo.titles.length} 条` : '');
+            banner.append(h('span', '', undo.automatic ? `整理记忆时自动合并了${names}` : { delete: `已删除${names}`, merge: `已合并为「${undo.titles[0]}」`, condense: `已精简${names}` }[undo.kind] ?? '已修改资料'),
+                button('撤销', () => call(() => controller.manual({ type: 'entry-change-undo', undoId: undo.id, confirmed: true, expectedSaveId: undo.saveId, expectedRevision: undo.revision }), '已撤销'), { key: 'entry-undo', ghost: true, className: 'dwm-link-button', disabled: Boolean(view.activity) }),
+                button('×', () => { undoDismissed = undo.id; render(); }, { key: 'entry-undo-dismiss', ghost: true, navigation: true, className: 'dwm-link-button', title: '不再显示这条提示' }));
+            tools.append(banner);
+        }
         const column = h('div', 'dwm-library-scroll'); column.dataset.scroll = 'library-list';
         const list = h('div', 'dwm-list');
         list.setAttribute('role', 'listbox'); list.setAttribute('aria-multiselectable', String(selectMode)); list.setAttribute('aria-label', `资料 · ${matching.length} 条`);
@@ -687,35 +786,215 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         bar.append(line);
         const unscanned = entries.filter(e => picked.has(e.id) && e.status === 'deferred').length;
         if (unscanned) bar.append(h('p', 'dwm-batch-note', `其中 ${unscanned} 条还没扫描过，设为常驻或按需时会先调用模型扫描。`));
+        const deletable = new Set(view.entryEditing?.deleteIds ?? []), changeable = new Set(view.entryEditing?.changeIds ?? []);
+        const chosen = entries.filter(e => picked.has(e.id)), own = chosen.filter(e => deletable.has(e.id)), workable = chosen.filter(e => changeable.has(e.id));
+        const busyNow = Boolean(view.activity), propose = mode => call(async () => {
+            proposal = await controller.proposeEntryChange({ mode, ids: workable.map(e => e.id) });
+            proposalEdit = structuredClone(proposal.result); dialog = 'entry-proposal';
+            return { executed: true, message: '方案已生成，确认后才会保存' };
+        });
+        const tidy = h('div', 'dwm-batch-line');
+        tidy.append(h('span', '', '整理选中的条目'),
+            button('合并为一条', () => propose('merge'), { key: 'batch-merge', disabled: workable.length < 2 || busyNow, title: '调用一次辅助模型，先给出方案' }),
+            button('精简', () => propose('condense'), { key: 'batch-condense', disabled: !workable.length || busyNow, title: '调用一次辅助模型，先给出方案' }),
+            button('删除', () => { deleteIds = own.map(e => e.id); dialog = 'delete-entry'; render(); }, { key: 'batch-delete', ghost: true, className: 'dwm-danger-text', disabled: !own.length || busyNow }));
+        bar.append(tidy);
+        const notes = [chosen.length > own.length ? `${chosen.length - own.length} 条原书条目不能合并、精简或删除，需要时可以设为关闭` : '',
+            own.length > workable.length ? `${own.length - workable.length} 条受保护或被作者锁定，不参与合并和精简` : ''].filter(Boolean);
+        if (notes.length) bar.append(h('p', 'dwm-batch-note', `${notes.join('；')}。`));
+        else if (workable.length) bar.append(h('p', 'dwm-muted dwm-hint', '合并和精简会调用一次辅助模型，确认方案后才保存。'));
         return bar;
     }
 
+    const SUMMARY_LENGTHS = { short: ['较短', 4000], standard: ['标准', 8000], long: ['较长', 16000] };
+    const scopeSummaryText = (data, scopeId) => (scopeId === 'global' ? data.summary : data.scopeSummaries?.[scopeId]) ?? '';
+    const countOfText = text => `${(text ?? '').length.toLocaleString('zh-CN')} 字`;
+    // Older saves store the three named lengths; the box always shows the number of characters.
+    const summaryLengthChars = settings => Number.isInteger(settings?.summaryLength) ? settings.summaryLength : SUMMARY_LENGTHS[settings?.summaryLength]?.[1] ?? 8000;
+    const SUMMARY_LENGTH_MIN = 2000, SUMMARY_LENGTH_MAX = 50000;
+    function summaryLengthBox(view) {
+        const value = summaryLengthChars(view.settings), key = 'summary-length', draft = numberDrafts.get(key);
+        const input = focusKey(h('input', 'dwm-number'), key); input.type = 'number'; input.min = String(SUMMARY_LENGTH_MIN); input.max = String(SUMMARY_LENGTH_MAX); input.step = '1';
+        input.value = draft?.value ?? value; input.setAttribute('aria-label', '脉络长度（字）');
+        const commit = () => call(async () => {
+            const number = Number(numberDrafts.get(key)?.value ?? input.value);
+            if (!Number.isInteger(number) || number < SUMMARY_LENGTH_MIN || number > SUMMARY_LENGTH_MAX) throw new Error(`脉络长度请填写 ${SUMMARY_LENGTH_MIN}–${SUMMARY_LENGTH_MAX} 的整数。`);
+            await controller.updateSettings({ summaryLength: number }); numberDrafts.delete(key);
+            return { message: `脉络长度已改为 ${number.toLocaleString('zh-CN')} 字，从下一次整理起生效` };
+        });
+        const save = button('保存', commit, { key: `${key}-save`, disabled: !draft });
+        input.addEventListener('input', () => { numberDrafts.set(key, { value: input.value }); save.disabled = busy || Number(input.value) === value; });
+        input.addEventListener('keydown', event => { if (event.key === 'Enter') commit(); });
+        return group(setting('脉络长度', [input, h('span', 'dwm-muted dwm-hint', '字'), save],
+            { description: `达到 ${value.toLocaleString('zh-CN')} 字时自动整理，整理后约为六成。不会截断，整理失败时保留原文。`, helpKey: 'summary-length',
+                helpText: `可填 ${SUMMARY_LENGTH_MIN.toLocaleString('zh-CN')}–${SUMMARY_LENGTH_MAX.toLocaleString('zh-CN')} 字，默认 8,000 字。脉络越长，保留的细节越多，每轮发送的内容也越多。只决定什么时候整理；不属于省钱模式。` }));
+    }
     function renderSummary(parent, view) {
-        const page = h('div', 'dwm-page');
+        const page = h('div', 'dwm-page'), data = view.save.data;
         page.append(heading('故事脉络', h('span', 'dwm-muted', '每轮常驻发送')));
-        page.append(prose(view.save.data.summary, '还没有故事脉络，下一次整理后会显示在这里。'));
-        for (const [scopeId, text] of Object.entries(view.save.data.scopeSummaries ?? {})) {
-            const scope = details(`独立范围 · ${scopeId}`, `summary-${scopeId}`); scope.append(prose(text)); page.append(scope);
+        if (view.settings?.memoryMode !== 'worldbook') page.append(summaryLengthBox(view));
+        const undo = view.entryUndo;
+        if (undo?.kind === 'summary' && undo.canUndo && undoDismissed !== undo.id) {
+            const banner = h('div', 'dwm-banner dwm-undo-banner'); banner.setAttribute('role', 'status');
+            banner.append(h('span', '', undo.scopeId && undo.scopeId !== 'global' ? `已修改独立范围「${undo.scopeId}」的故事脉络` : '已修改故事脉络'),
+                button('撤销', () => {
+                    if (!doc.defaultView?.confirm?.('撤销后，故事脉络恢复为这次修改之前的版本。确定撤销吗？')) return;
+                    call(() => controller.manual({ type: 'entry-change-undo', undoId: undo.id, confirmed: true, expectedSaveId: undo.saveId, expectedRevision: undo.revision })
+                        .catch(error => { throw summaryFailure(error); }), '已撤销对故事脉络的修改');
+                }, { key: 'summary-undo', ghost: true, className: 'dwm-link-button', disabled: Boolean(view.activity) }),
+                button('×', () => { undoDismissed = undo.id; render(); }, { key: 'summary-undo-dismiss', ghost: true, navigation: true, className: 'dwm-link-button', title: '不再显示这条提示' }));
+            page.append(banner);
         }
+        let editable = false;
+        for (const scopeId of ['global', ...Object.keys(data.scopeSummaries ?? {})]) {
+            const text = scopeSummaryText(data, scopeId), box = scopeId === 'global' ? page : details(`独立范围 · ${scopeId}`, `summary-${scopeId}`);
+            const state = controller.summaryEditState?.(scopeId) ?? null;
+            if (state) { editable = true; renderSummaryEditor(box, scopeId, state, text); }
+            else box.append(prose(text, scopeId === 'global' ? '还没有故事脉络，下一次整理后会显示在这里。' : '这个范围还没有故事脉络。'));
+            if (box !== page) page.append(box);
+        }
+        if (editable) page.append(h('p', 'dwm-muted dwm-hint', '可以直接修改。保存后，下一轮起按新版本发送；之后的整理在你的版本上继续，你删掉的内容不会被加回来。保存后可以撤销。'));
         page.append(row(button('补记新剧情', () => call(() => controller.maintain(), '补记完成'), { disabled: Boolean(view.activity) }),
             h('span', 'dwm-muted dwm-hint', `写法：${(view.settings?.summaryMode ?? DEFAULT_SETTINGS.summaryMode) === 'rewrite' ? '整段重写' : '追加'}，可在设置里改。`)));
         parent.append(page);
     }
+    async function saveSummary(scopeId, force) {
+        const draft = summaryDrafts.get(scopeId), state = controller.summaryEditState?.(scopeId);
+        if (!draft) return { message: '' };
+        if (!state) throw new Error(SUMMARY_ISSUES.unavailable);
+        if (state.saveId !== draft.saveId) throw new Error('已切换到其他存档，这份修改没有保存。');
+        // Other memory may move the revision meanwhile; only a change to this summary needs the player's confirmation.
+        if (!force && state.text !== draft.base) throw new Error(SUMMARY_ISSUES.changed);
+        await controller.manual({ type: 'summary-edit', scopeId, text: draft.text, expectedSaveId: state.saveId, expectedRevision: state.revision })
+            .catch(error => { throw summaryFailure(error); });
+        summaryDrafts.delete(scopeId);
+        return { message: '故事脉络已保存，下一轮起按新版本发送' };
+    }
+    // The text box is always live. Until the player types, it follows the saved summary; from the first change it holds a draft.
+    function renderSummaryEditor(box, scopeId, state, current) {
+        let draft = summaryDrafts.get(scopeId);
+        if (draft && draft.saveId !== state.saveId) { summaryDrafts.delete(scopeId); draft = null; }
+        if (draft && current !== draft.base) {
+            const warning = h('div', 'dwm-banner dwm-banner-warn');
+            warning.append(h('strong', '', '后台刚更新了故事脉络，你的修改已保留。'), h('p', '', '可以用你的版本替换这次更新，也可以载入最新的脉络后重新修改。'));
+            warning.append(row(button('保存我的版本', () => call(() => saveSummary(scopeId, true)), { key: `summary-${scopeId}-force` }),
+                button('载入最新脉络', () => {
+                    if (!doc.defaultView?.confirm?.('载入最新的脉络会放弃当前的修改。确定继续吗？')) return;
+                    summaryDrafts.delete(scopeId); render();
+                }, { navigation: true, ghost: true, key: `summary-${scopeId}-reload` })));
+            box.append(warning);
+        }
+        const count = h('span', 'dwm-muted dwm-hint', countOfText(draft ? draft.text : current));
+        const discard = button('放弃修改', () => {
+            if (!doc.defaultView?.confirm?.('放弃对故事脉络的修改吗？')) return;
+            summaryDrafts.delete(scopeId); render();
+        }, { ghost: true, navigation: true, key: `summary-${scopeId}-cancel`, disabled: !draft });
+        const save = button('保存修改', () => call(() => saveSummary(scopeId, false)), { primary: true, key: `summary-${scopeId}-save`, disabled: !draft });
+        // Typing does not re-render the panel; keep the counter and buttons in step here.
+        const input = field(scopeId === 'global' ? '故事脉络' : `故事脉络 · ${scopeId}`, draft ? draft.text : current, value => {
+            const next = summaryDrafts.get(scopeId) ?? { saveId: state.saveId, base: current, text: current };
+            next.text = value;
+            if (next.text === next.base) summaryDrafts.delete(scopeId); else summaryDrafts.set(scopeId, next);
+            count.textContent = countOfText(value);
+            save.disabled = busy || !summaryDrafts.has(scopeId); discard.disabled = !summaryDrafts.has(scopeId);
+        }, { area: true, key: `summary-${scopeId}-text`, placeholder: '还没有故事脉络。可以直接填写，保存后每轮常驻发送。' });
+        input.wrap.classList.add('dwm-summary-editor');
+        const actions = row(count, discard, save); actions.classList.add('dwm-edit-actions');
+        box.append(input.wrap, actions);
+    }
+    const INVENTORY_REASONS = { disabled: '物品记录已关闭，打开后才能编辑。', 'catch-up': '物品正在恢复补记，完成后才能编辑。', busy: '后台正在处理，完成后再保存。',
+        uninitialized: '存档还没有建立记忆。', 'no-undo': '没有可以撤销的物品编辑。', changed: '物品清单在你编辑时已有变化，请核对后再保存。' };
+    const inventoryState = scopeId => controller.inventoryEditState?.(scopeId) ?? { scopeId, canEdit: false, canUndo: false, reason: 'uninitialized', saveId: null, revision: null, undoCommitId: null };
+    const inventoryFailure = error => error?.dwmInventoryEdit ? new Error(INVENTORY_REASONS[error.dwmInventoryEdit] ?? '物品未能保存，请稍后重试。') : error;
+    const scopeItems = (data, scopeId) => (scopeId === 'global' ? data.inventory : data.scopeInventories?.[scopeId]) ?? [];
+    const plainList = items => JSON.stringify((items ?? []).map(({ name, description }) => ({ name: name ?? '', description: description ?? '' })));
     function renderInventory(parent, view) {
         const page = h('div', 'dwm-page');
-        const enabled = view.save.data.inventoryEnabled;
+        const enabled = view.save.data.inventoryEnabled, catchUp = Boolean(view.save.inventoryNeedsCatchUp);
+        const scopes = [['global', view.save.data.inventory ?? []], ...Object.entries(view.save.data.scopeInventories ?? {})];
+        const global = inventoryState('global'), editApi = typeof controller.inventoryEditState === 'function';
+        // Busy only delays saving; the other reasons keep the pencils hidden.
+        const blocked = global.reason && global.reason !== 'busy' ? INVENTORY_REASONS[global.reason] ?? '' : '';
+        if (inventoryDraft && (inventoryDraft.saveId !== global.saveId || blocked)) inventoryDraft = null;
+        const canEdit = editApi && !blocked;
         page.append(heading('我的物品'), toggle('记录物品', enabled, '角色卡已有背包系统时可关闭，已有记录会保留。', value => call(() => controller.manual({ type: 'inventory-toggle', enabled: value }))));
         if (!enabled) page.append(h('p', 'dwm-warning', '物品清单已暂停，下面是保留的记录。'));
-        if (view.save.inventoryNeedsCatchUp) page.append(h('p', 'dwm-warning', '物品待补记，暂不发送。下面的旧清单不能当作当前持有物。'));
-        const scopes = [['global', view.save.data.inventory], ...Object.entries(view.save.data.scopeInventories ?? {})];
+        if (catchUp) page.append(h('p', 'dwm-warning', '物品待补记，暂不发送。下面的旧清单不能当作当前持有物。'));
+        if (editApi && blocked && global.reason !== 'disabled') page.append(h('p', 'dwm-muted dwm-hint', blocked));
         for (const [scopeId, items] of scopes) {
             if (scopeId !== 'global') page.append(h('h4', '', `独立范围 · ${scopeId}`));
-            if (!items?.length) { if (scopeId === 'global') page.append(h('p', 'dwm-empty', '还没有记录物品。')); continue; }
             const list = h('ul', 'dwm-inventory');
-            for (const item of items) { const li = h('li'); li.append(h('strong', '', item.name || '未命名物品'), h('span', 'dwm-muted', item.description || '暂无说明')); list.append(li); }
-            page.append(list);
+            items.forEach((item, index) => list.append(inventoryDraft?.scopeId === scopeId && inventoryDraft.index === index
+                ? inventoryEditorRow(view) : inventoryRow(item, scopeId, index, items, canEdit)));
+            if (inventoryDraft?.scopeId === scopeId && inventoryDraft.index === null) list.append(inventoryEditorRow(view));
+            if (list.children.length) page.append(list);
+            else if (scopeId === 'global') page.append(h('p', 'dwm-empty', '还没有记录物品。'));
+            const state = scopeId === 'global' ? global : inventoryState(scopeId);
+            page.append(row(canEdit ? button('新增物品', () => openInventoryItem(scopeId, null, items), { navigation: true, ghost: true, key: `inventory-${scopeId}-add`,
+                disabled: items.length >= 200 || Boolean(inventoryDraft), title: items.length >= 200 ? '每个范围最多 200 项' : '' }) : null,
+            state.canUndo ? button('撤销上次物品编辑', () => {
+                if (!doc.defaultView?.confirm?.('撤销后恢复为上次编辑之前的清单，无法重做。确定撤销吗？')) return;
+                call(async () => {
+                    const fresh = inventoryState(scopeId);
+                    await controller.manual({ type: 'inventory-edit-undo', scopeId, commitId: fresh.undoCommitId, expectedSaveId: fresh.saveId, expectedRevision: fresh.revision }).catch(error => { throw inventoryFailure(error); });
+                }, '已撤销上次物品编辑');
+            }, { ghost: true, key: `inventory-${scopeId}-undo` }) : null));
         }
         parent.append(page);
+    }
+    function inventoryRow(item, scopeId, index, items, canEdit) {
+        const li = h('li'), text = h('div', 'dwm-inventory-text');
+        text.append(h('strong', '', item.name || '未命名物品'), h('span', 'dwm-muted', item.description || '暂无说明'));
+        li.append(text);
+        if (canEdit) {
+            const pencil = button('✎', () => openInventoryItem(scopeId, index, items), { ghost: true, navigation: true, className: 'dwm-inventory-pencil', key: `inventory-${scopeId}-${index}-edit`,
+                disabled: Boolean(inventoryDraft), title: `编辑“${item.name || '未命名物品'}”` });
+            pencil.setAttribute('aria-label', `编辑“${item.name || '未命名物品'}”`);
+            li.append(pencil);
+        }
+        return li;
+    }
+    function openInventoryItem(scopeId, index, items) {
+        const item = index === null ? { name: '', description: '' } : items[index];
+        inventoryDraft = { scopeId, index, saveId: inventoryState(scopeId).saveId, origName: item.name ?? '', origDescription: item.description ?? '',
+            name: item.name ?? '', description: item.description ?? '' };
+        pendingFocusKey = 'inventory-edit-name'; render();
+    }
+    function inventoryEditorRow(view) {
+        const draft = inventoryDraft, li = h('li', 'dwm-inventory-editing');
+        const name = field('名称', draft.name, value => { draft.name = value; }, { key: 'inventory-edit-name', placeholder: '物品名称' });
+        const description = field('说明', draft.description, value => { draft.description = value; }, { area: true, key: 'inventory-edit-description', placeholder: '来历、用途或当前状态' });
+        name.input.maxLength = 300; description.input.maxLength = 3000;
+        const working = inventoryState(draft.scopeId).reason === 'busy';
+        const actions = row(draft.index === null ? null : button('删除这件物品', () => {
+            if (!doc.defaultView?.confirm?.(`删除“${draft.origName || '未命名物品'}”吗？之后可以撤销。`)) return;
+            call(() => saveInventoryItem(true));
+        }, { ghost: true, key: 'inventory-edit-remove', className: 'dwm-inventory-remove', disabled: working }),
+        button('取消', () => { inventoryDraft = null; render(); }, { ghost: true, navigation: true, key: 'inventory-edit-cancel' }),
+        button('保存', () => call(() => saveInventoryItem(false)), { primary: true, key: 'inventory-edit-save', disabled: working }));
+        actions.classList.add('dwm-edit-actions');
+        li.append(name.wrap, description.wrap, actions);
+        if (working) li.append(h('p', 'dwm-muted dwm-hint', INVENTORY_REASONS.busy));
+        return li;
+    }
+    async function saveInventoryItem(remove) {
+        const draft = inventoryDraft, scopeId = draft.scopeId;
+        const name = draft.name.trim(), description = draft.description.trim();
+        if (!remove && !name) { pendingFocusKey = 'inventory-edit-name'; throw new Error('物品名称不能为空。'); }
+        const state = inventoryState(scopeId), data = controller.view().save?.data ?? {};
+        if (!state.canEdit) throw new Error(INVENTORY_REASONS[state.reason] ?? '物品未能保存，请稍后重试。');
+        if (state.saveId !== draft.saveId) throw new Error('已切换到其他存档，这份修改没有保存。');
+        const items = scopeItems(data, scopeId).map(item => ({ name: item.name ?? '', description: item.description ?? '' }));
+        let at = draft.index;
+        // The list may have changed meanwhile; apply the edit to the same item in the latest list.
+        if (at !== null && (items[at]?.name !== draft.origName || items[at]?.description !== draft.origDescription)) {
+            at = items.findIndex(item => item.name === draft.origName && item.description === draft.origDescription);
+            if (at < 0) throw new Error('这件物品刚被后台更新，请取消后重新编辑。');
+        }
+        if (remove) items.splice(at, 1); else if (at === null) items.push({ name, description }); else items[at] = { name, description };
+        await controller.manual({ type: 'inventory-edit', scopeId, items, expectedSaveId: state.saveId, expectedRevision: state.revision }).catch(error => { throw inventoryFailure(error); });
+        inventoryDraft = null;
+        return { message: remove ? '已删除这件物品，需要时可以撤销' : '物品已保存，需要时可以撤销' };
     }
     function newDraft(entry) {
         return { version: entry.version, title: entry.title, intro: entry.intro, retrieveWhen: entry.retrieveWhen, segments: (entry.segments ?? []).map(s => ({ ...s })) };
@@ -728,12 +1007,15 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         const title = focusKey(h('h3', 'dwm-entry-title', entry.title || '未命名条目'), `detail-heading-${entry.id}`); title.tabIndex = -1; title.dataset.detailHeading = 'true'; titleRow.append(title);
         if (entry.source && entry.status !== 'deferred') {
             // Adding from another book sets the baseline; that record alone is not a change.
-            const records = (view.save.audit ?? []).filter(item => item.entryId === entry.id && !['tier', 'tiers', 'tier-reset', 'extra-book'].includes(item.reason));
+            const records = (view.save.audit ?? []).filter(item => item.entryId === entry.id && !rejected(item) && !['tier', 'tiers', 'tier-reset', 'extra-book'].includes(item.reason));
             const changed = view.save.restoreChanges?.[entry.id] ?? (textOf(entry) !== (entry.source.original ?? '') || records.length > 0
                 || (view.save.scannedTiers?.[entry.id] && entryTier(entry) !== view.save.scannedTiers[entry.id]));
             titleRow.append(button('复原', () => { restoreId = entry.id; restoreTier = true; dialog = 'restore'; render(); },
                 { key: `restore-${entry.id}`, ghost: true, disabled: !changed || Boolean(view.activity), title: changed ? '恢复为扫描或同步时的版本，并清除该条目的改动记录' : '当前与初始版本一致' }));
         }
+        // Only entries 鱼忆 wrote itself can be deleted; an original-book entry would come back on the next sync.
+        if (view.entryEditing?.deleteIds?.includes(entry.id)) titleRow.append(button('删除', () => { deleteIds = [entry.id]; dialog = 'delete-entry'; render(); },
+            { key: `delete-${entry.id}`, ghost: true, className: 'dwm-danger-text', disabled: Boolean(view.activity), title: '删除这条鱼忆新增的资料，可以撤销' }));
         head.append(titleRow, h('p', 'dwm-muted', `来源：${sourceNames[sourceOf(entry)]}`));
         if (entry.source?.book && entry.source.book !== view.sourceBook) head.append(h('p', 'dwm-muted', `来自「${entry.source.book}」· UID ${entry.source.uid}`));
         const meta = [KIND_NAMES[entry.kind] ?? entry.kind, from === 'new' ? (entry.origin === 'import' ? '导入的旧总结' : '鱼忆新增') : from === 'changed' ? '存在改动' : '无改动',
@@ -757,12 +1039,12 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         sw.addEventListener('click', () => {
             const writable = locked === 'all';
             call(() => controller.manual({ type: 'classify', id: entry.id, expectedVersion: entry.version, segments: entry.segments.map(s => ({ ...s, writable })) }),
-                writable ? '已取消保护：后台可以更新该条目' : '已保护正文：后台不会再改该条目');
+                writable ? '已取消保护，后台可以更新该条目' : '已保护正文，后台不再修改该条目');
         });
         protect.append(sw, h('span', '', locked === 'part' ? '保护正文（部分）' : '保护正文'), helpButton('protect'));
         controls.append(protect);
         head.append(controls);
-        if (help.has('protect')) head.append(h('p', 'dwm-helptext', '打开后，后台整理不会改该条目正文；你自己仍然可以编辑。保护只管改不改，不管发不发：要每轮都发，请同时设为常驻。'));
+        if (help.has('protect')) head.append(h('p', 'dwm-helptext', '开启后，后台整理不会修改该条目的正文，你仍可手动编辑。保护只决定是否修改，不影响是否发送；如需每轮发送，请同时设为常驻。'));
         const held = heldSources.get(entry.id);
         if (held) {
             const box = h('div', 'dwm-banner dwm-banner-warn');
@@ -773,9 +1055,9 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
                     detailView === 'held' ? null : button('对比新原文', () => { detailView = 'held'; editing = false; render(); }, { navigation: true, ghost: true, key: `held-diff-${entry.id}` })));
             head.append(box);
         }
-        if (entry.scanBlocked) head.append(h('p', 'dwm-hint dwm-muted', '扫描时，辅助接口的内容审核拒收了该条目。鱼忆没有接管它，酒馆仍按原世界书的设置发送。换用审核较宽松的辅助接口后，把它设为常驻或按需，就会重新扫描。'));
-        else if (gatedImportant) head.append(h('p', 'dwm-hint dwm-muted', '扫描时鱼忆把该条目判为重要，但作者规则要求它的关键词出现后才可选，所以按按需处理。要每轮都发，请手动设为常驻。'));
-        else if (tier !== 'off' && entry.status === 'deferred') head.append(h('p', 'dwm-hint dwm-muted', '该条目在扫描时是关闭的，还没扫描过。'));
+        if (entry.scanBlocked) head.append(h('p', 'dwm-hint dwm-muted', '扫描时，辅助接口的内容审核拒收了该条目。鱼忆未接管该条目，酒馆仍按原世界书的设置发送。更换审核较宽松的辅助接口后，将其设为常驻或按需，即可重新扫描。'));
+        else if (gatedImportant) head.append(h('p', 'dwm-hint dwm-muted', '扫描时鱼忆把该条目判为重要，但作者规则要求它的关键词出现后才可选，因此按按需处理。如需每轮发送，请手动设为常驻。'));
+        else if (tier !== 'off' && entry.status === 'deferred') head.append(h('p', 'dwm-hint dwm-muted', '该条目在扫描时处于关闭状态，尚未扫描。'));
         parent.append(head);
         const tabs = h('div', 'dwm-detail-tabs'); tabs.setAttribute('role', 'tablist');
         const records = [...(view.save.audit ?? [])].reverse().filter(record => record.entryId === entry.id && !['tier','tiers','tier-reset'].includes(record.reason));
@@ -791,11 +1073,11 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         else if (detailView === 'held' && held) renderHeldDiff(body, entry, view);
         else if (detailView === 'history') renderHistory(body, entry, records, view);
         else {
-            if (entry.needsReview) body.append(h('p', 'dwm-banner dwm-banner-warn', '后台这次改动可能和原文有冲突，核对是否需要改回。'));
+            if (entry.needsReview) body.append(h('p', 'dwm-banner dwm-banner-warn', '后台本次改动可能与原文冲突，请核对是否需要改回。'));
             if (entry.intro) body.append(h('p', 'dwm-entry-description', entry.intro));
             body.append(prose(textOf(entry), '该条目暂时没有正文。'));
-            const usage = details('发送条件', `guidance-${entry.id}`); usage.append(prose(entry.retrieveWhen, '扫描时还没给出。')); body.append(usage);
-            if (entry.kind === 'npc' && !entry.important) body.append(row(button('晋升为重要人物', () => call(() => controller.manual({ type: 'promote', id: entry.id }), '已晋升为重要人物'), { ghost: true })));
+            const usage = details('发送条件', `guidance-${entry.id}`); usage.append(prose(entry.retrieveWhen, '扫描时未给出。')); body.append(usage);
+            if (entry.kind === 'npc' && !entry.important) body.append(row(button('晋升为重要人物', () => call(() => controller.manual({ type: 'promote', id: entry.id }), '已晋升为重要人物'), { ghost: true, title: '重要人物会单独维护；是否常驻仍按上面的档位设置' })));
             if (entry.kind === 'npc_pool') renderPool(body, entry);
         }
         parent.append(body);
@@ -985,6 +1267,77 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
                 background(() => controller.setLazyMode(true));
             }, { primary: true }));
             box.append(foot);
+        } else if (dialog === 'delete-entry') {
+            const targets = deleteIds.map(id => view.save?.data.entries[id]).filter(Boolean);
+            box.setAttribute('aria-label', '删除资料');
+            box.append(h('h3', '', targets.length > 1 ? `删除 ${targets.length} 条资料？` : '删除这条资料？'));
+            const list = h('ul', 'dwm-delete-list');
+            for (const entry of targets.slice(0, 8)) list.append(h('li', '', entry.title || '未命名条目'));
+            if (targets.length > 8) list.append(h('li', 'dwm-muted', `等 ${targets.length} 条`));
+            box.append(list, h('p', 'dwm-muted', '删除后，这些资料不再发送，后台整理也不会重新建立。可在资料页撤销本次删除。'));
+            box.append(row(button('取消', () => { deleteIds = []; close(); }, { navigation: true, ghost: true }), button('删除', () => call(async () => {
+                await controller.manual({ type: 'delete-entries', ids: targets.map(e => e.id), confirmed: true, expectedSaveId: view.entryEditing?.saveId, expectedRevision: view.entryEditing?.revision });
+                for (const id of deleteIds) picked.delete(id);
+                deleteIds = []; if (!picked.size) selectMode = false; close();
+            }, targets.length > 1 ? `已删除 ${targets.length} 条资料` : '已删除'), { danger: true, disabled: unavailable || !targets.length })));
+        } else if (dialog === 'entry-proposal' && proposal) {
+            const merging = proposal.mode === 'merge', current = view.save?.data.entries ?? {};
+            const stale = (view.entryProposal?.id === proposal.id && view.entryProposal.stale) || proposal.sources.some(source => current[source.id]?.version !== source.version);
+            const textOfItem = item => (item.segments ?? []).map(segment => segment.text).join('');
+            const discard = () => { if (proposal) controller.discardEntryProposal?.(proposal.id); proposal = null; proposalEdit = null; close(); };
+            // Protected text stays read-only; only writable segments are editable, never one whole-body box.
+            const segmentFields = (item, key) => {
+                const wrap = h('div', 'dwm-proposal-segments'), multiple = (item.segments ?? []).length > 1;
+                (item.segments ?? []).forEach((segment, index) => {
+                    if (!segment.writable) { const ro = h('div', 'dwm-proposal-locked'); ro.append(h('span', 'dwm-muted', '受保护，不会改动'), prose(segment.text)); wrap.append(ro); return; }
+                    const f = field(multiple ? `正文 · 第 ${index + 1} 段` : '正文', segment.text, value => { segment.text = value; }, { area: true, key: `${key}-segment-${index}` });
+                    f.input.classList.add('dwm-body-editor'); wrap.append(f.wrap);
+                });
+                return wrap;
+            };
+            box.classList.add('dwm-modal-wide'); box.setAttribute('aria-label', merging ? '合并方案' : '精简方案');
+            box.append(h('h3', '', merging ? `把 ${proposal.sources.length} 条合并为一条` : `精简 ${proposal.sources.length} 条资料`),
+                h('p', 'dwm-muted', '以下是辅助模型生成的方案，确认后才会保存，保存后可以撤销。下方文字可直接修改，受保护的部分不会改动。'));
+            if (stale) box.append(h('p', 'dwm-warning', '方案生成后，其中部分条目已被修改。请重新生成方案或放弃。'));
+            if (proposal.note) box.append(h('p', 'dwm-notice', proposal.note));
+            const body = h('div', 'dwm-proposal');
+            if (merging) {
+                const sources = details(`原来的 ${proposal.sources.length} 条`, 'proposal-sources');
+                for (const source of proposal.sources) { const one = details(source.title || '未命名条目', `proposal-source-${source.id}`, 'dwm-disclosure dwm-inline-disclosure'); one.append(prose(source.text)); sources.append(one); }
+                sources.open = true; expanded.add('proposal-sources');
+                const result = proposalEdit[0];
+                body.append(sources, h('h4', '', '合并后'),
+                    field('名称', result.title, value => { result.title = value; }, { key: 'proposal-title' }).wrap,
+                    field('一句话介绍', result.intro ?? '', value => { result.intro = value; }, { area: true, key: 'proposal-intro' }).wrap,
+                    segmentFields(result, 'proposal-merged'),
+                    h('p', 'dwm-muted', `${proposal.sources.reduce((n, s) => n + s.text.length, 0).toLocaleString('zh-CN')} 字 → ${textOfItem(result).length.toLocaleString('zh-CN')} 字 · 档位：${TIER_NAMES[result.tier] ?? '按需'}（取原条目中最高的一档）。保存后原来的条目合为这一条，改动记录保留来源。`));
+            } else {
+                proposal.sources.forEach((source, index) => {
+                    const result = proposalEdit[index], card = h('section', 'dwm-proposal-item');
+                    card.append(h('h4', '', `${source.title || '未命名条目'} · ${source.text.length.toLocaleString('zh-CN')} → ${textOfItem(result).length.toLocaleString('zh-CN')} 字`));
+                    card.append(inlineDiff(diffText(source.text, textOfItem(result)), ['删除', '新增']));
+                    const edit = details('直接修改', `proposal-edit-${source.id}`, 'dwm-disclosure dwm-inline-disclosure');
+                    edit.append(segmentFields(result, `proposal-${source.id}`), h('p', 'dwm-muted', '修改后点“更新对比”查看差异。'), button('更新对比', () => render(), { ghost: true, navigation: true, key: `proposal-refresh-${source.id}` }));
+                    card.append(edit); body.append(card);
+                });
+            }
+            box.append(body);
+            const foot = h('div', 'dwm-modal-foot');
+            foot.append(button('放弃', discard, { navigation: true, ghost: true }),
+                button('重新生成', () => call(async () => {
+                    const ids = proposal.ids ?? proposal.sources.map(s => s.id), mode = proposal.mode;
+                    controller.discardEntryProposal?.(proposal.id);
+                    proposal = await controller.proposeEntryChange({ mode, ids });
+                    proposalEdit = structuredClone(proposal.result);
+                    return { executed: true, message: '已重新生成方案' };
+                }), { ghost: true, disabled: unavailable, title: '会再调用一次辅助模型' }),
+                button(merging ? '确认合并' : '确认精简', () => call(async () => {
+                    if (proposalEdit.some(item => !textOfItem(item).trim())) throw new Error('正文不能为空。');
+                    if (merging && !String(proposalEdit[0].title ?? '').trim()) throw new Error('名称不能为空。');
+                    await controller.manual({ type: 'entry-change-apply', proposalId: proposal.id, result: proposalEdit, confirmed: true });
+                    picked.clear(); selectMode = false; proposal = null; proposalEdit = null; close();
+                }, merging ? '已合并，可在资料页撤销' : '已精简，可在资料页撤销'), { primary: true, disabled: unavailable || stale }));
+            box.append(foot);
         } else if (dialog === 'restore' || dialog === 'audit-clear') {
             const entry = view.save?.data.entries[restoreId], clearing = dialog === 'audit-clear';
             box.setAttribute('aria-label', clearing ? '清除记录' : '复原');
@@ -999,8 +1352,8 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
                 entryDrafts.delete(restoreId); close();
             }, clearing ? '记录已清除' : '条目已复原'), { danger: true, disabled: unavailable || !entry })));
         } else if (dialog === 'export') {
-            box.setAttribute('aria-label', '导出为世界书');
-            box.append(h('h3', '', '导出为世界书'), h('p', 'dwm-muted', '把鱼忆改过的世界书存成一本新的酒馆世界书，故事脉络和物品也在里面。导入酒馆，绑给新聊天就能接着用。'));
+            box.setAttribute('aria-label', '导出世界书');
+            box.append(h('h3', '', '导出世界书'), h('p', 'dwm-muted', '将鱼忆维护后的世界书另存为一本酒馆世界书，其中包含故事脉络与物品。导入酒馆并绑定到新聊天后，即可继续使用。'));
             const foot = h('div', 'dwm-modal-foot');
             if (transferDownload) {
                 const link = h('a', 'dwm-button dwm-primary', '下载世界书文件'); link.href = transferDownload.url; link.download = `${view.sourceBook || '鱼忆'} · 鱼忆.json`;
@@ -1013,7 +1366,7 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
             box.append(foot);
         } else {
             box.setAttribute('aria-label', '导入旧总结');
-            box.append(h('h3', '', '导入旧总结'), h('p', 'dwm-muted', '把以前写的总结加进本存档，作为常驻资料。不换世界书，也不调用模型。'));
+            box.append(h('h3', '', '导入旧总结'), h('p', 'dwm-muted', '将以往撰写的总结导入本存档，作为常驻资料。此操作不更换世界书，也不调用模型。'));
             const names = controller.supplementaryBooks?.() ?? [];
             if (!names.length) transferSource = 'file';
             if (names.length) box.append(segments([['book', '附加世界书'], ['file', '本地文件']], transferSource, id => { transferSource = id; transferDraft = null; render(); }, { key: 'import-source', small: true }));
@@ -1026,7 +1379,7 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
                         if (controller.view().save?.id !== saveId) throw new Error('存档已切换，请重新选择');
                         transferDraft = { ...result, saveId, scopeId, name, chosen: new Set(result.entries.map((_, i) => i)) };
                     }, '已读取，勾选要导入的条目'), { disabled: unavailable })));
-                box.append(h('p', 'dwm-muted dwm-hint', '导入后这本附加世界书仍会被酒馆照常发送；不想重复，可以在酒馆里解除它的绑定。'));
+                box.append(h('p', 'dwm-muted dwm-hint', '导入后，酒馆仍会照常发送这本附加世界书。如需避免重复，请在酒馆中解除其绑定。'));
             } else {
                 const input = field('选择世界书 JSON 或 TXT 文件', '', () => {}, { type: 'file', key: 'supplement-file' });
                 input.input.accept = '.json,.txt'; input.input.disabled = unavailable;
@@ -1057,7 +1410,7 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
             foot.append(button('取消', close, { navigation: true, ghost: true }), button(chosen.length ? `导入 ${chosen.length} 条` : '导入', () => call(async () => {
                 const draft = transferDraft;
                 await controller.importSupplementaryMemory(chosen, draft.saveId, draft.scopeId); transferDraft = null; dialog = null;
-            }, '已导入，设为常驻并受保护；同名同正文的重复条目已跳过'), { primary: true, disabled: unavailable || !chosen.length }));
+            }, '已导入，并设为常驻、受保护。名称与正文均相同的条目已跳过。'), { primary: true, disabled: unavailable || !chosen.length }));
             box.append(foot);
         }
         const cancel = [...box.querySelectorAll('button')].find(b => ['取消','关闭'].includes(b.textContent));
@@ -1073,10 +1426,16 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
     /* ---------- 本轮 ---------- */
     function renderRound(parent, view) {
         const page = h('div', 'dwm-page');
-        const plan = view.diagnostics?.lastPlan;
-        page.append(heading(plan ? '上一次发送用了哪些资料' : '本轮', button('试选一次', () => call(async () => {
+        const plan = view.diagnostics?.lastPlan, reuse = view.selectionReuse;
+        // The flag lives in page memory and applies to the next native send preparation only.
+        const canQueue = reuse && reuse.mode === 'reuse' && typeof controller.setNextSelectionRefresh === 'function' && view.save?.initialized;
+        const queue = canQueue && (reuse.forceNext
+            ? button('取消重新挑选', () => call(() => controller.setNextSelectionRefresh(false), '已取消，下一次按默认处理'), { ghost: true, key: 'reselect-cancel' })
+            : button('下次重新挑选', () => call(() => controller.setNextSelectionRefresh(true), '下一次发送时将重新挑选资料'), { key: 'reselect-next', title: '下一次发送或重新生成时重新调用模型挑选资料，只生效一次' }));
+        page.append(heading(plan ? '上一次发送用了哪些资料' : '本轮', row(button('试选一次', () => call(async () => {
             const result = await controller.previewPlan(); localPreview = { ...result, at: new Date().toISOString(), mode: 'preview' };
-        }, '试选已完成'), { title: '会调用一次模型，只看结果，不发送正文', disabled: Boolean(view.activity) })));
+        }, '试选已完成'), { title: '会调用一次模型，只看结果，不发送正文', disabled: Boolean(view.activity) }), queue)));
+        if (canQueue && reuse.forceNext) { const queued = h('p', 'dwm-banner', '已安排：下一次发送或重新生成时重新挑选资料，只生效一次。刷新页面或切换聊天后取消。'); queued.setAttribute('role', 'status'); page.append(queued); }
         if (!plan) page.append(h('p', 'dwm-empty', '还没有发送记录。发一条消息后，这里会列出鱼忆这一轮挑了哪些资料。'));
         else renderPlan(page, plan, view, false);
         const preview = view.diagnostics?.lastPreview ?? localPreview;
@@ -1087,7 +1446,10 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         const entries = view.save?.data?.entries ?? {};
         const facts = [timeOf(plan.at), `${(plan.selectedIds ?? []).length} 条资料`];
         if (plan.entryChars !== undefined) facts.push(`${countOf(plan.entryChars)} 字`);
+        const source = !preview && ({ reused: '沿用上次挑选', fresh: '重新挑选' })[plan.selectionSource];
+        if (source) facts.push(source);
         parent.append(h('p', 'dwm-muted', `${preview ? '试选，没有发送 · ' : ''}${facts.join(' · ')}`));
+        if (source && plan.selectionSource === 'reused') parent.append(h('p', 'dwm-muted', '同一轮重新发送，输入和资料都没有变化，沿用了上次挑选的结果，没有再调用模型挑选。挑得不合适时，可点“下次重新挑选”。'));
         if (Number(plan.pendingCount) > 0) parent.append(h('p', 'dwm-warning', `当时有 ${plan.pendingCount} 条消息待整理，它们的原文照常发送。`));
         const mandatory = new Set(plan.mandatoryIds ?? (plan.entries ?? []).filter(e => e.constant || e.important).map(e => e.id));
         const triggered = new Set((plan.triggeredIds ?? []).filter(id => !mandatory.has(id)));
@@ -1143,11 +1505,11 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
             if (!recent.length) requests.append(h('p', 'dwm-muted', '还没有请求。')); page.append(requests);
             parent.append(page); return;
         }
-        if (!view.save?.initialized) { page.append(h('p', 'dwm-empty', '建立记忆后，这里会列出每次改动。收发记录现在就能看。')); parent.append(page); return; }
+        if (!view.save?.initialized) { page.append(h('p', 'dwm-empty', '建立记忆后，此处将列出每次改动。收发记录现在即可查看。')); parent.append(page); return; }
         page.append(row(button('补记新剧情', () => call(() => controller.maintain(), '补记完成'), { disabled: Boolean(view.activity) }),
             button('整理记忆', () => call(() => controller.compact()), { ghost: true, disabled: Boolean(view.activity) || view.settings?.memoryMode === 'worldbook' || Boolean(view.compactable && !view.compactable.entries && !view.compactable.summaryChars) }),
             h('span', 'dwm-muted dwm-hint', '改动记录仅供查看，不发送给模型')));
-        if (view.compactable) page.append(h('p', 'dwm-muted', view.settings?.memoryMode === 'worldbook' ? '仅世界书模式不整理新增资料与脉络。' : !view.compactable.entries && !view.compactable.summaryChars ? '暂无可整理的内容。整理范围为鱼忆新增资料与故事脉络；原书、外部来源及受保护条目不参与合并。' : `可整理 ${view.compactable.entries} 条鱼忆新增资料（其中事件 ${view.compactable.events} 条），约 ${countOf(view.compactable.entryChars)} 字符；故事脉络 ${countOf(view.compactable.summaryChars)} 字符。原书、外部来源及受保护条目不参与合并。`));
+        if (view.compactable) page.append(h('p', 'dwm-muted', view.settings?.memoryMode === 'worldbook' ? '仅世界书模式不整理新增资料与脉络。' : !view.compactable.entries && !view.compactable.summaryChars ? '暂无可整理的内容。整理范围为鱼忆新增资料与故事脉络。' : `可整理 ${view.compactable.entries} 条鱼忆新增资料（其中事件 ${view.compactable.events} 条），约 ${countOf(view.compactable.entryChars)} 字符；故事脉络 ${countOf(view.compactable.summaryChars)} 字符。重复的资料会自动合并；与原书条目重复时，只把新信息追加到原书条目末尾，原文不变。受保护条目不参与合并。`));
         if (view.compactable?.lastAt) page.append(h('p','dwm-muted',`上次整理：${timeOf(view.compactable.lastAt)}`));
         const records = [...(view.save?.audit ?? [])].filter(item => !['tier', 'tiers', 'tier-reset'].includes(item.reason)).reverse();
         if (!records.length) page.append(h('p', 'dwm-empty', '暂无改动记录。'));
@@ -1155,25 +1517,48 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         const batches = [];
         for (const record of records) {
             const last = batches.at(-1);
-            if (last && last.at === record.at && last.reason === record.reason) last.items.push(record);
-            else batches.push({ at: record.at, reason: record.reason, items: [record] });
+            const reason = rejected(record) ? 'rejected' : record.reason;
+            if (last && last.at === record.at && last.reason === reason) last.items.push(record);
+            else batches.push({ at: record.at, reason, items: [record] });
         }
         const list = h('ol', 'dwm-timeline');
         for (const batch of batches.slice(0, 50)) {
             const item = h('li'), body = h('div');
-            body.append(h('span', 'dwm-muted dwm-timeline-who', REASONS[batch.reason] ?? batch.reason ?? '资料更新'));
-            const line = h('p', '', `${batch.reason === 'extra-book' ? '加入' : '改了'} ${batch.items.length} 条：`);
-            batch.items.slice(0, 6).forEach((record, index) => {
+            body.append(h('span', 'dwm-muted dwm-timeline-who', reasonOf(batch.items[0])));
+            const verb = batch.reason === 'rejected' ? `${batch.items.length} 项改动未采用，原有内容保留：`
+                : `${({ 'extra-book': '加入', 'entry-delete': '删除', 'rollback-remove': '移除', 'automatic-merge': '合并', 'entry-merge': '合并', 'entry-condense': '精简' })[batch.reason] ?? '修改'} ${batch.items.length} 条：`;
+            const line = h('p', '', verb);
+            const link = record => {
+                if (record.kind === 'summary') return button(record.scopeId && record.scopeId !== 'global' ? `故事脉络（独立范围 · ${record.scopeId}）` : '故事脉络',
+                    () => { tab = 'library'; section = 'summary'; mobileDetail = false; render(); }, { navigation: true, ghost: true, className: 'dwm-link-button', key: `audit-link-${record.id}` });
                 const name = view.save?.data?.entries?.[record.entryId]?.title;
-                if (index) line.append('、');
-                line.append(name ? button(name, () => openEntry(record.entryId), { navigation: true, ghost: true, className: 'dwm-link-button', key: `audit-link-${record.id}` }) : h('span', 'dwm-muted', '已移除的条目'));
-            });
-            if (batch.items.length > 6) line.append(`等 ${batch.items.length} 条`);
+                return name ? button(name, () => openEntry(record.entryId), { navigation: true, ghost: true, className: 'dwm-link-button', key: `audit-link-${record.id}` })
+                    : h('span', 'dwm-muted', record.title ? `「${record.title}」${['entry-delete', 'rollback-remove'].includes(batch.reason) ? '' : '（已移除）'}` : '已移除的条目');
+            };
+            if (batch.reason === 'automatic-merge') {
+                // One clause per merge group: which entries went into which.
+                const groups = new Map();
+                for (const record of batch.items) if (record.merge) groups.set(record.merge.targetId, [...(groups.get(record.merge.targetId) ?? []), record]);
+                line.replaceChildren();
+                [...groups.values()].forEach((records, index) => {
+                    const merge = records[0].merge, target = records.find(r => r.entryId === merge.targetId);
+                    if (index) line.append('；');
+                    records.filter(r => r !== target).forEach(r => line.append(h('span', '', `「${r.title ?? '未命名条目'}」`)));
+                    line.append(merge.intoSource ? '并入原书条目' : '并入');
+                    if (target) line.append(link(target));
+                });
+                line.append('。');
+            } else if (batch.items.every(record => record.kind === 'summary')) {
+                line.replaceChildren(); batch.items.slice(0, 6).forEach((record, index) => { if (index) line.append('、'); line.append(link(record)); });
+            } else {
+                batch.items.slice(0, 6).forEach((record, index) => { if (index) line.append('、'); line.append(link(record)); });
+                if (batch.items.length > 6) line.append(`等 ${batch.items.length} 条`);
+            }
             body.append(line);
             // Tier and protection changes leave the text as it was; there is nothing to compare.
-            const changed = batch.items.filter(record => display(record.before) !== display(record.after));
+            const changed = batch.items.filter(record => rejected(record) || record.merge || display(record.before) !== display(record.after));
             if (changed.length) {
-                const diffs = details(batch.reason === 'extra-book' ? '查看加入内容' : '看改了什么', `audit-${batch.items[0].id ?? `${batch.at}-${batch.reason}`}`);
+                const diffs = details(batch.reason === 'rejected' ? '查看原因' : batch.reason === 'extra-book' ? '查看加入内容' : '查看改动内容', `audit-${batch.items[0].id ?? `${batch.at}-${batch.reason}`}`);
                 for (const record of changed.slice(0, 6)) diffs.append(auditRecord(record, view, true));
                 body.append(diffs);
             }
@@ -1190,9 +1575,24 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
     }
     function auditRecord(record, view, withName) {
         const wrap = h('div', 'dwm-audit');
-        const name = view.save?.data?.entries?.[record.entryId]?.title;
+        const name = record.kind === 'summary' ? (record.scopeId && record.scopeId !== 'global' ? `故事脉络（独立范围 · ${record.scopeId}）` : '故事脉络') : view.save?.data?.entries?.[record.entryId]?.title;
         if (withName && name) wrap.append(h('strong', '', name));
-        else if (!withName) wrap.append(h('span', 'dwm-muted dwm-hint', `${timeOf(record.at)} · ${REASONS[record.reason] ?? record.reason ?? '资料更新'}`));
+        else if (withName && record.title) wrap.append(h('strong', '', `${record.title}（${record.merge ? '已并入' : '已移除'}）`));
+        else if (!withName) wrap.append(h('span', 'dwm-muted dwm-hint', `${timeOf(record.at)} · ${reasonOf(record)}`));
+        if (rejected(record)) {
+            wrap.append(h('p', '', record.reason === 'duplicate-character' ? '后台试图再建一条同名的人物，已拒绝，原条目保持不变。'
+                : record.reason === 'summary-edited-content' ? '后台整理试图把你从故事脉络中删掉的内容加回来，已拒绝，脉络保持你的版本。'
+                : `${REJECTED[record.reason] ?? '这处修改不符合要求'}。这处修改没有采用，正文保持原样。`));
+            return wrap;
+        }
+        if (record.merge?.identityReason) wrap.append(h('p', 'dwm-muted dwm-hint', `合并依据：${record.merge.identityReason}`));
+        if (record.merge?.intoSource && record.entryId === record.merge.targetId) {
+            wrap.append(h('p', 'dwm-muted dwm-hint', '并入原书条目，原文不变，以下内容追加在末尾：'));
+            const added = h('div', 'dwm-prose dwm-inline-diff'); added.append(h('ins', '', record.merge.appended ?? ''));
+            wrap.append(added);
+            if ((record.merge.appendChars ?? 0) > (record.merge.appended ?? '').length) wrap.append(h('p', 'dwm-muted dwm-hint', `只显示前 ${(record.merge.appended ?? '').length.toLocaleString('zh-CN')} 字，共 ${record.merge.appendChars.toLocaleString('zh-CN')} 字。`));
+            return wrap;
+        }
         const diff = h('div', 'dwm-prose dwm-inline-diff');
         for (const part of diffText(display(record.before), display(record.after))) diff.append(h(part.type === 'remove' ? 'del' : part.type === 'add' ? 'ins' : 'span', '', part.text));
         wrap.append(diff);
@@ -1223,34 +1623,34 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
             toggle('鱼忆总开关', Boolean(current.enabled), '关闭后所有存档暂停，已有资料保留', value => call(() => controller.updateSettings({ enabled: value }))),
             view.save ? toggle('本存档启用记忆', view.saveEnabled !== false, '只影响当前存档', value => call(() => controller.setSaveEnabled(value))) : null));
         const worldbookOnly = current.memoryMode === 'worldbook';
+        const economy = current.economyMode === true;
         const savedEvery = current.maintenanceEvery ?? DEFAULT_SETTINGS.maintenanceEvery;
-        const cadenceMode = cadenceDraft?.mode ?? ([1, 3, 5].includes(Number(savedEvery)) ? String(savedEvery) : 'custom');
-        const saveCadence = value => call(async () => {
-            const every = Number(value);
-            if (!Number.isInteger(every) || every < 1 || every > MAINTENANCE_EVERY_MAX) throw new Error(`整理间隔请填写 1–${MAINTENANCE_EVERY_MAX} 的整数（按 AI 回复计数）。`);
-            await controller.updateSettings({ maintenanceEvery: every }); cadenceDraft = null;
-        }, `已改为每 ${value} 次 AI 回复整理一次`);
-        const cadenceControls = [segments([['1', '1'], ['3', '3'], ['5', '5'], ['custom', '自定义']], cadenceMode, id => {
-            if (id === 'custom') { cadenceDraft = { mode: 'custom', value: savedEvery }; render(); } else saveCadence(id);
-        }, { key: 'cadence', small: true, label: '整理间隔' })];
-        if (cadenceMode === 'custom') {
-            const custom = focusKey(h('input', 'dwm-number'), 'cadence-custom'); custom.type = 'number'; custom.min = '1'; custom.max = String(MAINTENANCE_EVERY_MAX); custom.value = cadenceDraft?.value ?? savedEvery;
-            custom.setAttribute('aria-label', '自定义间隔'); custom.addEventListener('input', () => { cadenceDraft = { mode: 'custom', value: custom.value }; });
-            cadenceControls.push(custom, button('保存', () => saveCadence(cadenceDraft?.value ?? custom.value)));
-        }
+        const savedKeep = current.maintenanceKeepRecent ?? 1, recentTurns = current.recentTurns ?? 12;
+        const cadenceControls = presetNumber({ key: 'cadence', value: savedEvery, presets: [['1', '1'], ['3', '3'], ['5', '5'], ['10', '10']], min: 1, max: MAINTENANCE_EVERY_MAX,
+            label: '整理间隔', unit: '（按 AI 回复计数）', save: every => saveBundled({ maintenanceEvery: every }, `已改为每 ${every} 次 AI 回复整理一次`) });
+        const keepControls = presetNumber({ key: 'keep', value: savedKeep, presets: [['0', '不暂缓'], ['1', '1 条'], ['2', '2 条']], min: 0, max: 20,
+            label: '暂缓条数', unit: '（按 AI 回复计数）', save: async count => { await controller.updateSettings({ maintenanceKeepRecent: count }); return { message: count ? `已改为暂缓最新 ${count} 条回复` : '已改为不暂缓，积累够条数即全部整理' }; } });
+        const overflow = current.windowEnabled !== false && !worldbookOnly && savedEvery + savedKeep > recentTurns;
         const keep = focusKey(h('input', 'dwm-number'), 'recent-turns'); keep.type = 'number'; keep.min = '1'; keep.max = '1000'; keep.value = recentTurnsDraft ?? current.recentTurns ?? 12;
         keep.setAttribute('aria-label', '保留最近几轮'); keep.addEventListener('input', () => { recentTurnsDraft = keep.value; });
         keep.addEventListener('change', () => call(async () => { await controller.updateSettings({ recentTurns: Number(keep.value) }); recentTurnsDraft = null; }, `已改为保留最近 ${keep.value} 轮`));
         const windowSwitch = toggle('省略已记忆的原文', Boolean(current.windowEnabled), '', value => call(() => controller.updateSettings({ windowEnabled: value }))).switchControl;
         page.append(group(
+            economySetting(view),
             setting('记忆范围', segments([['full', '完整记忆'], ['worldbook', '仅世界书']], worldbookOnly ? 'worldbook' : 'full',
                 value => call(() => controller.updateSettings({ memoryMode: value }), value === 'worldbook' ? '已切换为仅动态世界书' : '已切换为完整记忆'), { key: 'memory-mode', small: true }),
             { helpKey: 'scope', helpText: '“仅世界书”只更新已有条目并按需挑选，不写故事脉络、事件和物品，也不省略旧原文。已有资料保留，随时可以切回。' }),
-            setting('整理间隔', cadenceControls, { description: `每 ${savedEvery} 次 AI 回复`, helpKey: 'every',
-                helpText: '按 AI 回复计数，你的发言不算。间隔越大越省，记忆更新越晚；待整理的文字太多时会提前整理。发送前挑资料仍然每轮都做。' }),
+            setting('整理间隔', cadenceControls, { description: `${economy ? '由省钱模式设定 · ' : ''}每 ${savedEvery} 次 AI 回复`, helpKey: 'every',
+                helpText: `按 AI 回复计数，你的发言不算。间隔越大，调用越少，记忆更新越晚。${economy ? '开启省钱模式时修改此项，会关闭省钱模式，其他设置保持不变。' : ''}` }),
+            setting('暂缓最新回复', keepControls, { description: savedKeep ? `最新 ${savedKeep} 条回复先不写入记忆` : '不暂缓，积累够条数即全部整理', helpKey: 'keep',
+                helpText: '暂缓的回复照常发送给正文模型，下次整理时再写入记忆。这样重新生成最新回复时，不会为它重复整理。“立即整理”会连同暂缓的部分一起处理。' }),
+            overflow ? h('p', 'dwm-warning', `整理间隔与暂缓条数合计超过“保留最近 ${recentTurns} 轮”，较早的未整理原文会继续发送给正文模型，输入会变多。`) : null,
+            view.selectionReuse ? setting('重新生成时的资料', segments([['reuse', '沿用上次'], ['refresh', '每次重选'], ['ask', '每次询问']], ['refresh', 'ask'].includes(current.rerollSelection) ? current.rerollSelection : 'reuse',
+                value => call(() => controller.updateSettings({ rerollSelection: value }), { refresh: '已改为每次重新挑选资料', ask: '已改为每次重新生成前询问', reuse: '已改为沿用上次挑选的资料' }[value]), { key: 'reroll-selection', small: true }),
+                { helpKey: 'reroll', helpText: '同一轮重新生成或生成新回复时，如果输入、资料和连接都没有变化，“沿用上次”不再调用模型挑选资料；“每次询问”会先问你沿用还是重新挑选，资料已有变化时不询问，直接重新挑选。上次挑得不合适时，也可以在“本轮”页点“下次重新挑选”，只生效一次。' }) : null,
             worldbookOnly ? null : setting('故事脉络写法', segments([['append', '追加'], ['rewrite', '整段重写']], (current.summaryMode ?? DEFAULT_SETTINGS.summaryMode) === 'rewrite' ? 'rewrite' : 'append',
                 value => call(() => controller.updateSettings({ summaryMode: value }), value === 'rewrite' ? '已改为整段重写，从下一次整理生效' : '已改为追加，从下一次整理生效'), { key: 'summary-mode', small: true }),
-            { helpKey: 'summary', helpText: '追加：每次只写新增的一小段，更快更省，超过 8000 字时自动整理成连贯概述。整段重写：读起来始终连贯，但长聊天会明显变慢、更费 token。' }),
+            { helpKey: 'summary', helpText: '追加：每次只写新增的一小段，更快更省，达到故事脉络页顶部设定的长度时自动整理成连贯概述。整段重写：读起来始终连贯，但长聊天会明显变慢、更费 token。' }),
             setting('省略已记忆的原文', [keep, h('span', 'dwm-muted dwm-hint', '轮'), windowSwitch],
                 { description: `保留最近 ${current.recentTurns ?? 12} 轮完整对话${Number.isInteger(view.window?.omittedCount) ? ` · 上一轮省略了 ${view.window.omittedCount} 条` : ''}`, helpKey: 'window',
                     helpText: '只在发送时省掉已经整理进记忆的旧原文，聊天记录不删。和其他自动隐藏楼层的工具只开一个。' }),
@@ -1265,8 +1665,69 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
 
         }
     }
+    /* ---------- 省钱模式 ---------- */
+    // The bundle lives in the backend; the panel only shows it and notices when a manual edit switched it off.
+    async function saveBundled(patch, message) {
+        const result = await controller.updateSettings(patch);
+        return { message: result?.economyModeChange === 'manual-override' ? `${message}。省钱模式已关闭，其他设置保持不变。` : message };
+    }
+    function economyCopy(current) {
+        return current.economyMode === true
+            ? `已开启 · 挑选资料参考最近 ${current.selectionRecentTurns ?? 12} 轮，每 ${current.maintenanceEvery ?? DEFAULT_SETTINGS.maintenanceEvery} 次 AI 回复整理一次`
+            : '减少鱼忆辅助模型的输入和调用，资料挑选略粗';
+    }
+    function economySwitch(current, key) {
+        const on = current.economyMode === true;
+        const control = toggle('省钱模式', on, '', value => call(() => controller.setEconomyMode ? controller.setEconomyMode(value) : controller.updateSettings({ economyMode: value }),
+            value ? '已开启省钱模式。挑选资料只参考最近几轮，偶尔会漏掉较早的细节。' : '已关闭省钱模式，恢复开启前的设置')).switchControl;
+        control.dataset.focus = key; return control;
+    }
+    function economySetting(view) {
+        const current = view.settings ?? {};
+        return setting('省钱模式', economySwitch(current, 'economy-switch'), { description: economyCopy(current), helpKey: 'economy',
+            helpText: '开启后，挑选资料只参考最近几轮原文，更早的剧情靠故事脉络和资料目录了解；整理间隔变长，每次整理读得更多；每轮注入的资料略少。正文模型读到的剧情原文不变，偶尔会漏掉较早提到的细节，记忆也会晚几轮更新。具体数值在“高级”里，修改其中任何一项都会关闭省钱模式。关闭时恢复开启前的设置。' });
+    }
+    /** Presets plus 自定义 for one integer setting; `save` returns the notice. */
+    function presetNumber({ key, value, presets, min, max, label, unit = '', save }) {
+        const draft = numberDrafts.get(key);
+        const mode = draft?.mode ?? (presets.some(([id]) => Number(id) === Number(value)) ? String(value) : 'custom');
+        const commit = raw => call(async () => {
+            const number = Number(raw);
+            if (!Number.isInteger(number) || number < min || number > max) throw new Error(`${label}请填写 ${min}–${max} 的整数${unit}。`);
+            const result = await save(number); numberDrafts.delete(key); return result;
+        });
+        const controls = [segments([...presets, ['custom', '自定义']], mode, id => {
+            if (id === 'custom') { numberDrafts.set(key, { mode: 'custom', value }); render(); } else commit(id);
+        }, { key, small: true, label })];
+        if (mode === 'custom') {
+            const input = focusKey(h('input', 'dwm-number'), `${key}-custom`); input.type = 'number'; input.min = String(min); input.max = String(max); input.value = draft?.value ?? value;
+            input.setAttribute('aria-label', `自定义${label}`); input.addEventListener('input', () => { numberDrafts.set(key, { mode: 'custom', value: input.value }); });
+            controls.push(input, button('保存', () => commit(numberDrafts.get(key)?.value ?? input.value), { key: `${key}-save` }));
+        }
+        return controls;
+    }
+    function usageGroup(view) {
+        const current = view.settings ?? {}, economy = current.economyMode === true;
+        const turns = current.selectionRecentTurns ?? 12, limit = current.selectionLimit ?? DEFAULT_SETTINGS.selectionLimit, chars = current.selectionChars ?? DEFAULT_SETTINGS.selectionChars;
+        const batch = current.batchChars ?? DEFAULT_SETTINGS.batchChars, wan = n => `${Number((n / 10000).toFixed(1))} 万字`;
+        const injectPresets = [[12, 16000], [16, 24000], [24, 36000]], injectValue = `${limit}/${chars}`;
+        const injectKnown = injectPresets.some(([l, c]) => `${l}/${c}` === injectValue);
+        return group(
+            economy ? h('p', 'dwm-banner', '以下数值当前由省钱模式设定。修改任意一项会关闭省钱模式，其他数值保持不变。') : null,
+            setting('挑选资料参考最近几轮', presetNumber({ key: 'sel-turns', value: turns, presets: [['4', '4 轮'], ['8', '8 轮'], ['12', '12 轮']], min: 1, max: 1000, label: '参考轮数',
+                save: n => saveBundled({ selectionRecentTurns: n }, `已改为挑选资料时参考最近 ${n} 轮`) }), { description: `每次发送前读最近 ${turns} 轮原文`, helpKey: 'sel-turns',
+                helpText: '挑选资料时读取的剧情原文轮数，与“保留最近几轮”分开设置。轮数越少，挑选越快、越省，更早的剧情靠故事脉络和资料目录了解。尚未整理进记忆的剧情不受此限，总会读到。' }),
+            setting('每轮最多注入的资料', segments(injectPresets.map(([l, c]) => [`${l}/${c}`, `${l} 条 · ${wan(c)}`]), injectValue, id => {
+                const [l, c] = id.split('/').map(Number); call(() => saveBundled({ selectionLimit: l, selectionChars: c }, `已改为每轮最多 ${l} 条、${wan(c)}`));
+            }, { key: 'inject', small: true, label: '注入上限' }), { description: injectKnown ? '按需挑选的资料，常驻资料不占名额' : `当前：${limit} 条 · ${wan(chars)}`, helpKey: 'inject',
+                helpText: '每轮按需挑选的资料最多几条、合计多少字。常驻资料不占名额。上限越低，正文模型每轮读到的资料越少。' }),
+            setting('每次整理最多读多少字', segments([['18000', '1.8 万字'], ['40000', '4 万字']], String(batch), value => call(() => saveBundled({ batchChars: Number(value) }, `已改为每次整理最多读 ${wan(Number(value))}`)),
+                { key: 'batch', small: true, label: '整理批大小' }), { description: [18000, 40000].includes(batch) ? '超过时分成几次请求' : `当前：${wan(batch)}`, helpKey: 'batch',
+                helpText: '待整理的剧情超过这个字数时，分成几次请求。数值越大，请求次数越少，单次耗时越长。' }));
+    }
     function renderAdvanced(page, view) {
         const current = view.settings ?? {};
+        page.append(usageGroup(view));
         page.append(group(
             setting('扫描并发数', segments([['1', '1'], ['2', '2'], ['3', '3'], ['4', '4'], ['6', '6']], String(current.scanConcurrency ?? DEFAULT_SETTINGS.scanConcurrency),
                 value => call(() => controller.updateSettings({ scanConcurrency: Number(value) }), '扫描速度已保存'), { key: 'concurrency', small: true }), { description: '出现限流或超时时设为 1' }),
@@ -1304,6 +1765,19 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         const disabled = !view.save || Boolean(view.activity);
         page.append(heading('预设应用', h('span', 'dwm-muted', `${preset.name || '当前预设不可读取'} · 已应用 ${preset.stale ? 0 : preset.saved?.selectedIds?.length ?? 0} 条`)));
         page.append(h('p', 'dwm-muted', '挑几条预设内容，一起交给鱼忆的辅助请求，比如文风、术语。只影响本存档里鱼忆的请求，不改酒馆正文的预设。'), helpButton('preset'));
+        const choices = view.presetChoices ?? [];
+        if (choices.length) {
+            const currentName = choices.find(c => c.current)?.name ?? '';
+            const fixed = preset.followsCurrent ? '' : preset.sourceName ?? preset.name ?? '';
+            const options = [['', `正文当前使用的预设${currentName ? `（${currentName}）` : ''}`], ...choices.filter(c => !c.current || !preset.followsCurrent).map(c => [c.name, c.name])];
+            if (fixed && !options.some(([id]) => id === fixed)) options.push([fixed, `${fixed}（已不存在）`]);
+            const picker = selectField('读取的预设', fixed, options,
+                value => call(() => controller.setPresetSource(value || null), value ? `已改为读取「${value}」` : '已改为读取正文当前使用的预设'), 'preset-source');
+            picker.input.disabled = disabled;
+            if (preset.sourceMissing) page.append(h('p', 'dwm-warning', `固定读取的预设「${fixed}」已不存在或被改名，鱼忆的请求暂时不带预设条目。请重新选择一套。`));
+            page.append(group(setting('读取的预设', picker.input, { description: preset.followsCurrent ? '跟随正文当前使用的预设' : '只读取这套预设，不会切换正文正在用的预设', helpKey: 'preset-source',
+                helpText: '正文和鱼忆用的不是同一个模型时，可以给鱼忆选另一套预设，例如适合辅助模型的破限预设。换一套预设后，需要重新挑选并应用条目。' })));
+        }
         if (help.has('preset')) page.append(h('p', 'dwm-helptext', '“放前面”在鱼忆的任务之前，“放最后”在任务输入之后、整个请求的最后，默认沿用预设本身的位置。放最后的条目离输出最近，若要求写正文或改变输出格式，可能让辅助任务失败。条目越多，每次辅助请求越贵。'));
         if (preset.stale) page.append(h('p', 'dwm-warning', '原预设已变化，旧选择暂停应用。请重新检查并应用。'));
         if (!preset.saved && view.preset?.saved?.selected?.length) page.append(h('p', 'dwm-muted', '旧版已确认的语言偏好仍生效；应用这里的选择后会替换旧偏好。'));
@@ -1381,15 +1855,18 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         const draftKey = creating ? 'new' : JSON.stringify([live, view.connection?.endpoint, view.connection?.model, view.connection?.maxOutputTokens]);
         if (draftKey !== connectionDraftKey) {
             connectionDraftKey = draftKey;
-            Object.assign(connectionDraft, creating ? { endpoint: '', model: '', apiKey: '', maxOutputTokens: '' }
-                : { endpoint: view.connection?.endpoint ?? '', model: view.connection?.model ?? '', apiKey: '', maxOutputTokens: view.connection?.maxOutputTokens ?? '' });
+            Object.assign(connectionDraft, creating ? { endpoint: '', model: '', apiKey: '', maxOutputTokens: '', headers: [] }
+                : { endpoint: view.connection?.endpoint ?? '', model: view.connection?.model ?? '', apiKey: '', maxOutputTokens: view.connection?.maxOutputTokens ?? '',
+                    headers: (view.connection?.headers ?? []).map(header => ({ name: header.name, value: '', saved: true })) });
         }
         const form = h('div', 'dwm-group dwm-form');
         if (creating || choice === 'current') form.append(field('配置名称', profileNameDraft, value => { profileNameDraft = value; }, { placeholder: '例如：DS 便宜档', key: 'profile-name', hint: creating ? '保存名称后可直接切换。' : '填写名称以保存为配置，留空仅应用当前连接。' }).wrap);
         form.append(field('接口地址', connectionDraft.endpoint, value => { connectionDraft.endpoint = value; }, { placeholder: 'https://…/v1', hint: '请求路径自动追加 /chat/completions。' }).wrap,
             field('密钥', connectionDraft.apiKey, value => { connectionDraft.apiKey = value; }, { type: 'password', hint: !creating && view.connection?.hasApiKey ? '当前连接已配置密钥；同地址留空时沿用，更换地址需重新填写。' : '仅保存在当前浏览器。' }).wrap);
         const listed = view.modelList?.endpoint === connectionDraft.endpoint.trim().replace(/\/$/, '') ? view.modelList.models : [];
-        form.append(row(button('连接并获取模型', () => call(() => controller.fetchModels({ endpoint: connectionDraft.endpoint, apiKey: connectionDraft.apiKey })),
+        // A saved value is kept by name; a new header without a value is reported by the backend.
+        const draftHeaders = () => connectionDraft.headers.filter(header => header.name.trim()).map(header => header.value ? { name: header.name.trim(), value: header.value } : header.saved ? { name: header.name.trim(), keep: true } : { name: header.name.trim(), value: '' });
+        form.append(row(button('连接并获取模型', () => call(() => controller.fetchModels({ endpoint: connectionDraft.endpoint, apiKey: connectionDraft.apiKey, headers: draftHeaders() })),
             { ghost: true, key: 'fetch-models', disabled: running }),
             h('span', 'dwm-muted dwm-hint', '先填地址和密钥，再连接；只获取模型列表，不生成内容。')));
         const modelPicker = selectField('选择模型', listed.includes(connectionDraft.model) ? connectionDraft.model : '',
@@ -1403,10 +1880,24 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         model.input.addEventListener('input', () => { modelPicker.input.value = listed.includes(connectionDraft.model) ? connectionDraft.model : ''; });
         form.append(model.wrap);
         form.append(field('输出上限（可留空）', connectionDraft.maxOutputTokens, value => { connectionDraft.maxOutputTokens = value; }, { type: 'number', placeholder: '留空 = 服务商默认', hint: '思考型模型被截断时可以调大，比如 32768。更大的额度可能更贵。' }).wrap);
+        const headerBox = details(`自定义请求头${connectionDraft.headers?.length ? `（${connectionDraft.headers.length}）` : ''}`, 'connection-headers', 'dwm-disclosure dwm-inline-disclosure');
+        headerBox.append(h('p', 'dwm-muted', '部分渠道（例如 opencode）要求额外的请求头。请求头和密钥一样只保存在这个浏览器，不进存档、问题报告和收发记录。已保存的值不会显示，留空即沿用。'));
+        (connectionDraft.headers ??= []).forEach((header, index) => {
+            const line = h('div', 'dwm-header-row');
+            const name = field('名称', header.name, value => { header.name = value; }, { key: `header-name-${index}`, placeholder: '例如 X-Api-Key' });
+            const value = field('值', header.value, value => { header.value = value; }, { type: 'password', key: `header-value-${index}`, placeholder: header.saved ? '已保存，留空沿用' : '' });
+            line.append(name.wrap, value.wrap, button('移除', () => { connectionDraft.headers.splice(index, 1); render(); }, { ghost: true, navigation: true, key: `header-remove-${index}` }));
+            headerBox.append(line);
+        });
+        headerBox.append(button('添加请求头', () => { connectionDraft.headers.push({ name: '', value: '', saved: false }); headerBox.open = true; expanded.add('connection-headers'); pendingFocusKey = `header-name-${connectionDraft.headers.length - 1}`; render(); },
+            { ghost: true, navigation: true, key: 'header-add', disabled: connectionDraft.headers.length >= 20 }));
+        form.append(headerBox);
+        const savedHeaders = JSON.stringify((view.connection?.headers ?? []).map(header => header.name));
         const dirty = h('span', 'dwm-muted');
         const updateDirty = () => {
             const changed = connectionDraft.apiKey || connectionDraft.endpoint !== (view.connection?.endpoint ?? '') || connectionDraft.model !== (view.connection?.model ?? '')
-                || String(connectionDraft.maxOutputTokens ?? '') !== String(view.connection?.maxOutputTokens ?? '');
+                || String(connectionDraft.maxOutputTokens ?? '') !== String(view.connection?.maxOutputTokens ?? '')
+                || connectionDraft.headers.some(header => header.value) || JSON.stringify(connectionDraft.headers.map(header => header.name)) !== savedHeaders;
             dirty.textContent = changed ? '有未保存的修改' : '';
         };
         form.addEventListener('input', updateDirty); updateDirty(); form.append(dirty);
@@ -1417,7 +1908,9 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         }, { danger: true, ghost: true, key: `profile-delete-${editingName}` }));
         actions.append(button(creating ? '保存并使用' : '应用连接', () => call(async () => {
             const name = (editingName || profileNameDraft).trim();
-            await controller.updateConnection({ mode: 'compatible', endpoint: connectionDraft.endpoint.trim(), model: connectionDraft.model.trim(), apiKey: connectionDraft.apiKey, maxOutputTokens: connectionDraft.maxOutputTokens });
+            const headers = draftHeaders();
+            await controller.updateConnection({ mode: 'compatible', endpoint: connectionDraft.endpoint.trim(), model: connectionDraft.model.trim(), apiKey: connectionDraft.apiKey, maxOutputTokens: connectionDraft.maxOutputTokens, headers });
+            for (const header of connectionDraft.headers) header.value = '';
             connectionChoice = null; profileNameDraft = name;
             if (name) await controller.saveConnectionProfile(name);
             connectionDraft.apiKey = ''; connectionChoice = null; profileNameDraft = '';

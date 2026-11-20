@@ -230,3 +230,25 @@ for (const outcome of ['disconnected', 'stopped', 'idle-before-input', 'resumed-
         gate.resolve();await c.readinessChanged();assert.equal(c.store.state.initialized,true);
     }finally{gate.resolve();c.cancel();await c.setLazyMode(false);globalThis.EjsTemplate=previousTemplate;}
 }));
+
+test('native regenerate reuses the selection made before the player input was consumed',async()=>withHost(async(f,host)=>{
+    const previousTemplate=globalThis.EjsTemplate;let disk,selects=0;
+    globalThis.EjsTemplate={getFeatures:()=>({enabled:true})};
+    host.storage.read=async()=>structuredClone(disk);host.storage.write=async(_,v)=>{disk=structuredClone(v)};
+    const c=new Controller(host,{settings:{economyMode:true},model:{complete:async r=>{
+        if(r.purpose==='select'){selects++;return {ids:[]};}return {operations:[]};
+    }}});
+    host.bindController(c);
+    try{
+        await c.start();await c.initialize();await f.send();
+        f.live.chat.push({is_user:false,mes:'first candidate',swipe_id:0,swipes:['first candidate'],swipe_info:[{extra:{}}],extra:{}});
+        f.activate();await tick();
+        await beforeNative(f,'regenerate');
+        assert.equal(selects,1,'selected user turn matches its pre-send draft');
+        assert.equal(c.view().diagnostics.lastPlan.selectionSource,'reused');
+        f.activate();await tick();c.setNextSelectionRefresh(true);
+        await beforeNative(f,'regenerate');assert.equal(selects,2);
+        assert.equal(c.view().selectionReuse.forceNext,false);
+        assert.equal(f.live.chat.at(-1).mes,'first candidate','selection does not write narration');
+    }finally{globalThis.EjsTemplate=previousTemplate;}
+}));

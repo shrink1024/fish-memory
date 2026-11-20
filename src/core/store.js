@@ -1,7 +1,22 @@
+import { setScopeSummary, removedSummaryClauses, summaryEditPolicy, summaryUndoState } from './summary-edits.js';
 import { rememberEncodedSize } from './storage-codec.js';
-import { clone, invariant, SerialQueue, commonPrefix, isPrefix, uid, plainText } from './util.js';
-import { createSave, validateSave, createEntry, normalizeScopeId, GLOBAL_SCOPE, TIERS, splitSourceText } from './state.js';
-import { applyMaintenance, applyDataPatch, diffData, auditChanges } from './operations.js';
+import { applyEntryChange, activeRemovals, enforceRemovals } from './entry-changes.js';
+import { clone, invariant, SerialQueue, commonPrefix, isPrefix, uid, plainText, limitText } from './util.js';
+import { createSave, validateSave, createEntry, normalizeScopeId, scopeInventory, scopeSummary, normalizeInventoryItems, GLOBAL_SCOPE, TIERS, splitSourceText } from './state.js';
+import { applyMaintenance, applyDataPatch, diffData, auditChanges, entryAuditRecord, compactionMeasure } from './operations.js';
+
+const inventoryIssue = code => Object.assign(new Error(`inventory-edit:${code}`), {dwmInventoryEdit:code});
+const sameItems = (a,b) => JSON.stringify(a)===JSON.stringify(b);
+const setInventory = (data,scopeId,items) => { if(scopeId===GLOBAL_SCOPE)data.inventory=clone(items);else(data.scopeInventories??={})[scopeId]=clone(items); };
+const inventoryFromPatch = (patch,scopeId) => scopeId===GLOBAL_SCOPE?patch.inventory:patch.scopeChanges?.scopeInventories?.[scopeId];
+function forceInventoryPatch(patch,scopeId,items){
+    if(scopeId===GLOBAL_SCOPE)patch.inventory=clone(items);
+    else ((patch.scopeChanges??={}).scopeInventories??={})[scopeId]=clone(items);
+}
+function inventoryUndoTarget(state,scopeId){
+    const undone=new Set(state.journal.flatMap(c=>c.inventoryEdit?.undoOf?[c.inventoryEdit.undoOf]:[]));
+    return [...state.journal].reverse().find(c=>c.inventoryEdit?.scopeId===scopeId&&!c.inventoryEdit.undoOf&&!undone.has(c.id));
+}
 
 function anchor(sourceKeys) {
     return { anchorLength: sourceKeys.length, endKey: sourceKeys.length ? sourceKeys.at(-1) : null };
@@ -30,7 +45,7 @@ function reapplyManualField(previous, edited, current, conflict) {
 function reapplyManualEntry(previous, edited, current) {
     let needsReview = false;
     const conflict = () => { needsReview = true; };
-    for (const key of ['title', 'kind', 'intro', 'retrieveWhen', 'important', 'needsReview', 'enabled', 'tier']) {
+    for (const key of ['title', 'kind', 'intro', 'retrieveWhen', 'important', 'importanceIndependent', 'needsReview', 'enabled', 'tier']) {
         current[key] = reapplyManualField(previous[key], edited[key], current[key], conflict);
     }
     const ids = segments => segments.map(segment => segment.id).join('\0');
@@ -76,19 +91,56 @@ function validateInitializationCheckpoint(checkpoint, save) {
 function replayOnPath(state, sourceKeys) {
     const common = commonPrefix(state.storyKeys, sourceKeys);
     const next = clone(state);
+    const survivingSummaryEdits = new Set(state.journal.filter(c => c.summaryEdit && c.anchorLength <= common).map(c => c.id));
+    const undoneMerges=new Set(state.journal.map(c=>c.entryChange?.undoMergeId).filter(Boolean));
+    const uncovered = new Set();
     let data = clone(next.base), originalData = clone(next.base), processed = [], journal = [], inventoryDisabledAt = null;
     for (const commit of next.journal) {
         const originalNext = applyDataPatch(originalData, commit.patch);
+        if(commit.entryChange?.undoMergeId){
+            // The matching automatic merge is omitted below; replaying this
+            // snapshot would resurrect facts from a discarded reply.
+            journal.push({...commit,...anchor(sourceKeys.slice(0,Math.min(common,commit.anchorLength))),patch:{entries:{}}});
+            originalData=originalNext;continue;
+        }
+        let replayCommit=commit;
+        if(undoneMerges.has(commit.id)){
+            const ids=new Set((commit.merges??[]).flatMap(m=>[m.targetId,...m.sourceIds]));
+            replayCommit={...commit,patch:{...commit.patch,entries:Object.fromEntries(Object.entries(commit.patch.entries).filter(([id])=>!ids.has(id)))}};
+        }
+        if (commit.summaryBasis && !survivingSummaryEdits.has(commit.summaryBasis.id)) {
+            // This batch read a player edit anchored later than the floors it processed.
+            for (const key of commit.summaryBasis.readKeys ?? []) uncovered.add(key);
+            const scope = commit.summaryBasis.scopeId;
+            const patch = clone(replayCommit.patch);
+            if (scope === GLOBAL_SCOPE) delete patch.summary;
+            else if (patch.scopeChanges?.scopeSummaries) delete patch.scopeChanges.scopeSummaries[scope];
+            replayCommit = {...replayCommit, patch};
+        }
         if (commit.anchorLength <= common) {
-            data = applyDataPatch(data, commit.patch);
+            data = applyDataPatch(data, replayCommit.patch);
             if (commit.reason !== 'manual') processed = sourceKeys.slice(0, Math.max(processed.length, commit.anchorLength));
             inventoryDisabledAt = commit.inventoryDisabledAt;
-            journal.push(commit);
+            journal.push(replayCommit);
+        } else if (commit.summaryEdit) {
+            // A summary draft describes the story at the moment it was saved.
+            originalData = originalNext;
+            continue;
         } else if (commit.reason === 'manual') {
             // An explicit player correction is not generated narrative. Replay
             // only fields that player actually changed, on surviving entries;
             // never resurrect an NPC/event belonging to the discarded reply.
             const corrected = clone(data);
+            // A confirmed merge can replay only while all its inputs still
+            // match this branch. Otherwise retain the branch's own entries.
+            if (commit.entryChange?.kind === 'merge') {
+                const matches = commit.entryChange.sourceIds.every(id => JSON.stringify(data.entries[id]) === JSON.stringify(originalData.entries[id]));
+                if (matches) {
+                    data = applyDataPatch(data, commit.patch);
+                    journal.push({ ...commit, ...anchor(sourceKeys.slice(0,common)) });
+                }
+                originalData = originalNext; continue;
+            }
             for (const [id, value] of Object.entries(commit.patch.entries)) {
                 const current = corrected.entries[id], previous = originalData.entries[id];
                 if (!current && !previous && value?.kind === 'npc' && !value.source && value.lineage?.length
@@ -117,10 +169,17 @@ function replayOnPath(state, sourceKeys) {
                 if (corrected.entries[id] && target?.source) corrected.entries[id] = createEntry({ ...clone(target), version: corrected.entries[id].version + 1 });
             }
             if (Object.hasOwn(commit.patch, 'inventoryEnabled')) corrected.inventoryEnabled = commit.patch.inventoryEnabled;
+            let inventoryEdit;
+            if (commit.inventoryEdit) {
+                const scopeId = normalizeScopeId(commit.inventoryEdit.scopeId);
+                inventoryEdit = {...commit.inventoryEdit,before:clone(scopeInventory(data,scopeId))};
+                setInventory(corrected,scopeId,normalizeInventoryItems(inventoryFromPatch(commit.patch,scopeId)));
+            }
             const patch = diffData(data, corrected);
-            if (Object.keys(patch.entries).length || Object.hasOwn(patch, 'inventoryEnabled')) {
+            if (inventoryEdit) forceInventoryPatch(patch,inventoryEdit.scopeId,scopeInventory(corrected,inventoryEdit.scopeId));
+            if (Object.keys(patch.entries).length || Object.hasOwn(patch, 'inventoryEnabled') || inventoryEdit) {
                 inventoryDisabledAt = corrected.inventoryEnabled ? inventoryDisabledAt : Math.min(commit.inventoryDisabledAt ?? processed.length, processed.length);
-                journal.push({ ...commit, ...anchor(sourceKeys.slice(0, common)), patch, inventoryDisabledAt });
+                journal.push({ ...commit, ...anchor(sourceKeys.slice(0, common)), patch, inventoryDisabledAt, ...(inventoryEdit?{inventoryEdit}:{}) });
                 data = corrected;
             }
         }
@@ -140,21 +199,22 @@ function replayOnPath(state, sourceKeys) {
     next.data = data; next.processed = processed; next.journal = journal;
     if (Array.isArray(state.rememberedKeys)) {
         const retained = new Set(processed);
-        next.rememberedKeys = state.rememberedKeys.filter(key => retained.has(key));
+        next.rememberedKeys = state.rememberedKeys.filter(key => retained.has(key) && !uncovered.has(key));
     }
     let retainedLength = processed.length;
     for (const commit of journal) retainedLength = Math.max(retainedLength, commit.anchorLength);
     next.storyKeys = sourceKeys.slice(0, retainedLength);
     next.inventoryDisabledAt = inventoryDisabledAt;
     const manualReasons = new Set(['edit', 'reset', 'classify', 'promote', 'promote-from-pool', 'import-memory', 'extra-book', 'source-held-resolve']);
-    next.audit = state.audit.filter(item => manualReasons.has(item.reason) && data.entries[item.entryId]);
-    return next;
+    next.audit = state.audit.filter(item => survivingSummaryEdits.has(item.id) || item.reason === 'rollback-remove'
+        || (manualReasons.has(item.reason) && data.entries[item.entryId]));
+    return enforceRemovals(next);
 }
 
 /** Storage.write must reject on failure; serial execution is local, not cross-client CAS. */
 export class MemoryStore {
     #queue = new SerialQueue();
-    constructor(storage, { auditLimit = 100 } = {}) { this.storage = storage; this.auditLimit = auditLimit; this.state = null; }
+    constructor(storage, { auditLimit = 100 } = {}) { this.storage = storage; this.auditLimit = auditLimit; this.state = null; this.lastRollback=null; }
     snapshot() { invariant(this.state, '尚未载入存档'); return clone(this.state); }
     /** Read a prospective branch without discarding the saved candidate's journal. */
     project(sourceKeys) {
@@ -175,6 +235,7 @@ export class MemoryStore {
             }
             if (stored?.chatId === next.chatId) rememberEncodedSize(next, stored);
             this.state = next;
+            this.lastRollback=null;
             return this.snapshot();
         });
     }
@@ -241,10 +302,10 @@ export class MemoryStore {
                 return [entry.id, entry];
             })), strategy: plainText(strategy, '记忆策略', 10000), summary: '', inventory: [], inventoryEnabled: next.data.inventoryEnabled,
                 scopeSummaries: {}, scopeInventories: {}, scopeContext: clone(next.data.scopeContext ?? null), messageScopes: clone(next.data.messageScopes ?? {}) };
-            next.base = clone(next.data); delete next.sourceHeld;
+            next.base = clone(next.data); delete next.sourceHeld; delete next.entryChanges;
             for (const [id, entry] of Object.entries(baseEntries)) { invariant(next.data.entries[id], '复原基线缺少对应资料'); next.base.entries[id] = createEntry(entry); }
             next.processed = []; next.rememberedKeys = []; next.storyKeys = []; next.journal = []; next.audit = []; next.inventoryDisabledAt = null; next.initialized = true;
-            return this.#persist(next);
+            const saved=await this.#persist(next);this.lastRollback=null;return saved;
         });
     }
     async replaceFromDraft(draft, expectedRevision) {
@@ -256,38 +317,68 @@ export class MemoryStore {
             // The same atomic write confirms completion and clears a persisted
             // automatic-attempt marker. Failed drafts leave that marker intact.
             delete next.preferences.autoInitialization;
-            return this.#persist(next);
+            const saved=await this.#persist(next);this.lastRollback=null;return saved;
         });
     }
-    async commit(result, { expectedRevision, sourceKeys, allowedEvidence = sourceKeys, maxChars = {}, reason = 'maintenance', scopeId = GLOBAL_SCOPE }) {
+    async commit(result, { expectedRevision, sourceKeys, allowedEvidence = sourceKeys, maxChars = {}, reason = 'maintenance', scopeId = GLOBAL_SCOPE, automatic = false }) {
         return this.#queue.run(async () => {
             invariant(this.state.revision === expectedRevision, '存档已更新，拒绝提交旧结果');
             invariant(isPrefix(this.state.processed, sourceKeys), '当前剧情分支已变化');
             invariant(isPrefix(this.state.storyKeys, sourceKeys) || isPrefix(sourceKeys, this.state.storyKeys), '提交路径与当前剧情不符，请先同步分支');
             const currentKeys = new Set(sourceKeys);
             invariant(allowedEvidence.every(key => currentKeys.has(key)), '维护依据不属于当前剧情');
-            const { next: data } = applyMaintenance(this.state.data, result, { allowedEvidence, maxChars, scopeId });
+            const summaryOps = result.operations.filter(op => op.type === 'summary' || op.type === 'appendSummary');
+            const policy = summaryOps.length ? summaryEditPolicy(this.state.journal, scopeId) : null;
+            const removedClauses = policy ? [...policy.removed] : [];
+            const restoresDeletion = removedClauses.length && summaryOps.some(op =>
+                typeof op.text === 'string' && removedClauses.some(text => op.text.includes(text)));
+            if (restoresDeletion) result = {...result, operations: result.operations.filter(op => !summaryOps.includes(op))};
+            const { next: data, rejected, merges } = applyMaintenance(this.state.data, result, { allowedEvidence, maxChars, scopeId, removals: activeRemovals(this.state), requireEdits: true, allowAutomaticMerge:reason==='compact' });
+            if (restoresDeletion) rejected.push({code:'summary-edited-content', entryId:'$summary', scopeId, title:'', kind:'summary', evidence:allowedEvidence});
             data.messageScopes ??= {};
             if (reason === 'maintenance') for (const key of allowedEvidence) {
                 invariant(!data.messageScopes[key] || data.messageScopes[key] === scopeId, '本批正文混有其他范围的归属');
                 data.messageScopes[key] = normalizeScopeId(scopeId);
             }
-            return this.#commitData(data, sourceKeys, reason, reason === 'maintenance' ? allowedEvidence : []);
+            // Advance the attempted batch without paying to retry it, but do
+            // not certify rejected text changes as safely replaceable history.
+            const unresolved=new Set(rejected.filter(item=>item.code.startsWith('patch-')).flatMap(item=>item.evidence));
+            return this.#commitData(data, sourceKeys, reason, reason === 'maintenance' && !restoresDeletion ? allowedEvidence.filter(key=>!unresolved.has(key)) : [], {
+                ...(policy?.last ? {summaryBasis: {id: policy.last.id, scopeId, ...(reason === 'maintenance' ? {readKeys: allowedEvidence} : {})}} : {}),
+                ...(automatic?{automatic:true,readKeys:reason==='maintenance'?clone(allowedEvidence):[]}:{}),...(rejected.length?{rejected}: {}),...(merges.length?{merges}: {})});
         });
     }
-    async #commitData(data, sourceKeys, reason, rememberedKeys = []) {
+    async #commitData(data, sourceKeys, reason, rememberedKeys = [], provenance = {}) {
         const next = this.snapshot();
         const at = new Date().toISOString();
+        const commitId=uid('commit');
         const patch = diffData(next.data, data);
+        if(provenance.merges?.length){
+            const ids=[...new Set(provenance.merges.flatMap(item=>[item.targetId,...item.sourceIds]))];
+            next.entryChanges??={removed:{}};
+            delete next.entryChanges.undo;
+            delete next.entryChanges.summaryUndo;
+            next.entryChanges.automaticUndo={id:uid('entry-undo'),kind:'merge',automatic:true,commitId,
+                titles:[...new Set(provenance.merges.flatMap(m=>m.sourceIds).map(id=>next.data.entries[id]?.title).filter(Boolean))],
+                before:Object.fromEntries(ids.map(id=>[id,clone(next.data.entries[id]??null)])),
+                after:Object.fromEntries(ids.map(id=>[id,clone(data.entries[id]??null)])),removedBefore:{},storyKeys:clone(sourceKeys)};
+        }
         if (sourceKeys.length > next.storyKeys.length) next.storyKeys = clone(sourceKeys);
         if (reason === 'inventory-catchup') next.inventoryDisabledAt = null;
-        next.journal.push({ id: uid('commit'), ...anchor(sourceKeys), patch, reason, inventoryDisabledAt: next.inventoryDisabledAt });
-        next.audit.push(...auditChanges(next.data, data, reason, at));
+        next.journal.push({ id: commitId, ...anchor(sourceKeys), patch, reason, inventoryDisabledAt: next.inventoryDisabledAt, ...provenance });
+        next.audit.push(...auditChanges(next.data, data, reason, at).map(row=>{
+            const merge=provenance.merges?.find(m=>m.targetId===row.entryId||m.sourceIds.includes(row.entryId));
+            return merge?{...row,reason:'automatic-merge',merge:clone(merge)}:row;
+        }));
+        next.audit.push(...(provenance.rejected??[]).map(item=>({id:uid('audit'),entryId:item.entryId,scopeId:item.scopeId,at,
+            reason:item.code,outcome:'rejected',title:item.title,kind:item.kind,before:'',after:'',evidence:clone(item.evidence),
+            ...(item.editIndex!==undefined?{editIndex:item.editIndex,segmentId:item.segmentId}:{})})));
         next.audit = next.audit.slice(-this.auditLimit);
         next.data = data; next.processed = clone(sourceKeys);
         // Progress can cross externally hidden floors. Only messages actually
         // supplied to maintenance may be omitted after they become visible.
-        next.rememberedKeys = [...new Set([...(next.rememberedKeys ?? []), ...rememberedKeys])];
+        const unresolved=new Set(reason==='maintenance'?(provenance.rejected??[]).filter(item=>item.code.startsWith('patch-')).flatMap(item=>item.evidence):[]);
+        next.rememberedKeys = [...new Set([...(next.rememberedKeys ?? []), ...rememberedKeys])].filter(key=>!unresolved.has(key));
         return this.#persist(next);
     }
     /** Incremental source sync: replace changed baseline entries and record the
@@ -319,10 +410,38 @@ export class MemoryStore {
         return this.#queue.run(async () => {
             invariant(this.state?.initialized, '请先初始化');
             if (isPrefix(this.state.storyKeys, sourceKeys)) return { changed: false, pendingFrom: this.state.processed.length };
-            const next = replayOnPath(this.state, sourceKeys);
-            await this.#persist(next);
-            return { changed: true, pendingFrom: next.processed.length, sharedPrefix: commonPrefix(next.processed, sourceKeys) };
+            const previous=this.state,common=commonPrefix(previous.storyKeys,sourceKeys),remaining=new Set(sourceKeys);
+            const next = replayOnPath(previous, sourceKeys),patch=diffData(previous.data,next.data);
+            const discardedRanges=[];
+            previous.storyKeys.forEach((key,index)=>{if(remaining.has(key))return;const last=discardedRanges.at(-1);if(last?.to===index)last.to=index+1;else discardedRanges.push({from:index+1,to:index+1});});
+            const rollback={id:uid('rollback'),chatId:previous.chatId,at:new Date().toISOString(),
+                invalidatedRange:{from:common+1,to:previous.storyKeys.length},discardedRanges,
+                affectedEntries:Object.entries(patch.entries).map(([id,entry])=>({id,title:(entry??previous.data.entries[id]).title,kind:(entry??previous.data.entries[id]).kind,action:entry?'restored':'removed'})),
+                summaryChanged:Object.hasOwn(patch,'summary')||Object.hasOwn(patch.scopeChanges??{},'scopeSummaries'),
+                inventoryChanged:Object.hasOwn(patch,'inventory')||Object.hasOwn(patch.scopeChanges??{},'scopeInventories')};
+            for (const item of rollback.affectedEntries) {
+                if (item.action === 'removed') {
+                    next.audit.push(entryAuditRecord(previous.data.entries[item.id], 'rollback-remove', rollback.at));
+                }
+            }
+            next.audit = next.audit.slice(-this.auditLimit);
+            const reverted = previous.journal.filter(commit => commit.summaryEdit && commit.anchorLength > common);
+            if (reverted.length) rollback.revertedSummaryEdits = reverted.map(commit => ({
+                id: commit.id, scopeId: commit.summaryEdit.scopeId, action: commit.summaryEdit.undoOf ? 'undo' : 'edit'
+            }));
+            if (next.entryChanges?.summaryUndo && !summaryUndoState(next)) delete next.entryChanges.summaryUndo;
+            try{await this.#persist(next);}
+            catch(error){throw Object.assign(error instanceof Error?error:new Error(String(error)),{dwmRollbackFailed:true});}
+            this.lastRollback={...rollback,revision:this.state.revision};
+            return { changed: true, pendingFrom: next.processed.length, sharedPrefix: commonPrefix(next.processed, sourceKeys),rollback:clone(this.lastRollback) };
         });
+    }
+    inventoryEditState(scopeId = GLOBAL_SCOPE) {
+        scopeId=normalizeScopeId(scopeId);
+        const state=this.state,reason=!state?.initialized?'uninitialized':!state.data.inventoryEnabled?'disabled':state.inventoryDisabledAt!==null?'catch-up':null;
+        const target=state?inventoryUndoTarget(state,scopeId):null;
+        return {scopeId,saveId:state?.id??null,revision:state?.revision??null,canEdit:!reason,reason,undoCommitId:target?.id??null,
+            canUndo:!reason&&Boolean(target)&&sameItems(scopeInventory(state.data,scopeId),inventoryFromPatch(target.patch,scopeId))};
     }
     async manual(action, sourceKeys = this.state.processed) {
         return this.#queue.run(async () => {
@@ -330,6 +449,7 @@ export class MemoryStore {
             const baseline = isPrefix(this.state.storyKeys, sourceKeys) ? this.snapshot() : replayOnPath(this.state, sourceKeys);
             const data = clone(baseline.data);
             const entry = data.entries[action.id];
+            let inventoryEdit;
             if (action.type === 'audit-clear') {
                 invariant(entry && !entry.source, '仅鱼忆新增条目可单独清除记录');
                 invariant(action.confirmed === true, '清除记录需要确认');
@@ -383,6 +503,26 @@ export class MemoryStore {
                         scanBlocked: item.classified ? false : current.scanBlocked,
                         tier: action.tier, enabled: action.tier !== 'off', version: current.version + 1 });
                 }
+            } else if (['inventory-edit','inventory-edit-undo'].includes(action.type)) {
+                invariant(action.expectedSaveId === this.state.id, '存档已切换，本次处理已作废');
+                invariant(Number.isInteger(action.expectedRevision) && action.expectedRevision === this.state.revision, '资料已更新，请重新核对后保存');
+                if (!data.inventoryEnabled) throw inventoryIssue('disabled');
+                if (baseline.inventoryDisabledAt !== null) throw inventoryIssue('catch-up');
+                const scopeId=normalizeScopeId(action.scopeId),before=clone(scopeInventory(data,scopeId));
+                let items;
+                if (action.type==='inventory-edit-undo') {
+                    const target=inventoryUndoTarget(baseline,scopeId);
+                    if(!target||target.id!==action.commitId)throw inventoryIssue('no-undo');
+                    if(!sameItems(before,inventoryFromPatch(target.patch,scopeId)))throw inventoryIssue('changed');
+                    items=normalizeInventoryItems(target.inventoryEdit.before);
+                    inventoryEdit={scopeId,before,undoOf:target.id};
+                } else {
+                    items=normalizeInventoryItems(action.items);
+                    invariant(items.every(item=>item.name.trim()),'物品名称无效');
+                    if(sameItems(before,items))return this.#persist(baseline);
+                    inventoryEdit={scopeId,before};
+                }
+                setInventory(data,scopeId,items);
             } else if (action.type === 'inventory-toggle') {
                 data.inventoryEnabled = Boolean(action.enabled);
             } else if (action.type === 'scope-context') {
@@ -429,9 +569,9 @@ export class MemoryStore {
                 } else if (action.type === 'classify') {
                     data.entries[entry.id] = createEntry({ ...entry, kind: action.kind ?? entry.kind, segments: action.segments ?? entry.segments, needsReview: false });
                 } else if (action.type === 'promote') {
-                    invariant(entry.kind === 'npc', '只能晋升 NPC 条目'); entry.important = true;
-                    // The player's choice, so it counts as a player-set constant (an author gate yields to it).
-                    if (entry.enabled) entry.tier = 'constant';
+                    invariant(entry.kind === 'npc', '只能晋升 NPC 条目');
+                    if (!entry.important) entry.importanceIndependent = true;
+                    entry.important = true;
                 } else if (action.type === 'promote-from-pool') {
                     invariant(entry.kind === 'npc_pool' && entry.enabled && entry.segments.every(s => s.writable),
                         '只能从可维护的路人合集建立独立人物');
@@ -443,7 +583,7 @@ export class MemoryStore {
                     invariant(!Object.values(data.entries).some(other => other.kind === 'npc' && other.title === title
                         && (other.lineage ?? []).includes(entry.id)), '这个人物已从该合集独立建档');
                     const independent = createEntry({ id: uid('entry'), title, kind: 'npc', intro, text,
-                        retrieveWhen, scopeId: entry.scopeId, important: true, evidence: entry.evidence,
+                        retrieveWhen, scopeId: entry.scopeId, important: true, importanceIndependent: true, evidence: entry.evidence,
                         lineage: [...new Set([...(entry.lineage ?? []), entry.id])] });
                     data.entries[independent.id] = independent;
                 } else throw new Error('未知手动操作');
@@ -458,11 +598,63 @@ export class MemoryStore {
             else if (!['tier', 'tiers', 'tier-reset'].includes(action.type)) next.audit.push(...auditChanges(next.data, data, action.type, at));
             next.audit = next.audit.slice(-this.auditLimit);
             if (action.type === 'inventory-toggle' && !action.enabled && next.data.inventoryEnabled) next.inventoryDisabledAt = progress.length;
-            next.journal.push({ id: uid('commit'), ...anchor(sourceKeys), patch: diffData(next.data, data), reason: 'manual', inventoryDisabledAt: next.inventoryDisabledAt,
+            const patch = diffData(next.data, data);
+            if(inventoryEdit)forceInventoryPatch(patch,inventoryEdit.scopeId,scopeInventory(data,inventoryEdit.scopeId));
+            next.journal.push({ id: uid('commit'), ...anchor(sourceKeys), patch, reason: 'manual', inventoryDisabledAt: next.inventoryDisabledAt,
+                ...(inventoryEdit?{inventoryEdit}:{}),
                 ...(action.type==='restore-entry'?{restoreEntry:{id:action.id,withTier:Boolean(action.withTier)}}:{}),
                 ...(action.type==='source-held-resolve'?{sourceResolution:{id:action.id,choice:action.choice}}:{}) });
             next.data = data;
             return this.#persist(next, { preserveClassification: action.type === 'scope-context' });
+        });
+    }
+    async changeSummary(action, sourceKeys) {
+        return this.#queue.run(async () => {
+            const save = this.state;
+            invariant(save?.initialized && action.expectedSaveId === save.id && action.expectedRevision === save.revision
+                && isPrefix(save.storyKeys, sourceKeys), 'summary-edit:changed');
+            const undo = action.type === 'entry-change-undo';
+            const slot = undo ? summaryUndoState(save) : null;
+            if (undo) invariant(action.confirmed === true && slot?.canUndo && slot.id === action.undoId, 'summary-edit:undo-changed');
+            const scopeId = normalizeScopeId(undo ? slot.scopeId : action.scopeId);
+            const before = scopeSummary(save.data, scopeId);
+            const original = undo ? save.journal.find(commit => commit.id === slot.id).summaryEdit : null;
+            const text = undo ? original.before : plainText(action.text, '故事脉络', Math.max(100000, before.length));
+            if (before === text) return this.snapshot();
+            const next = this.snapshot();
+            setScopeSummary(next.data, scopeId, text);
+            const id = uid('summary-edit'), at = new Date().toISOString();
+            const reason = undo ? 'summary-edit-undo' : 'summary-edit';
+            next.journal.push({id, ...anchor(sourceKeys), reason: 'manual', inventoryDisabledAt: next.inventoryDisabledAt,
+                patch: diffData(save.data, next.data), summaryEdit: {scopeId, before,
+                    removed: undo ? [] : removedSummaryClauses(before, text), ...(undo ? {undoOf: slot.id} : {})}});
+            next.audit.push({id, at, reason, entryId: '$summary', scopeId, kind: 'summary', before: limitText(before), after: limitText(text), evidence: []});
+            next.audit = next.audit.slice(-this.auditLimit);
+            next.entryChanges ??= {removed: {}};
+            delete next.entryChanges.undo;
+            delete next.entryChanges.automaticUndo;
+            if (undo) delete next.entryChanges.summaryUndo;
+            else next.entryChanges.summaryUndo = id;
+            next.storyKeys = clone(sourceKeys);
+            return this.#persist(next);
+        });
+    }
+    async changeEntries(action, sourceKeys = this.state.storyKeys) {
+        return this.#queue.run(async () => {
+            invariant(this.state?.initialized, 'entry-change:uninitialized');
+            const { next, kind, sourceIds, undoMergeId } = applyEntryChange(this.state, action, sourceKeys);
+            const patch = diffData(this.state.data, next.data);
+            next.journal.push({ id: uid('commit'), ...anchor(sourceKeys), patch, reason: 'manual',
+                inventoryDisabledAt: next.inventoryDisabledAt, entryChange: { kind, sourceIds, ...(undoMergeId?{undoMergeId}:{}) } });
+            next.audit.push(...auditChanges(this.state.data,next.data,`entry-${kind}`,new Date().toISOString()));
+            next.audit=next.audit.slice(-this.auditLimit);
+            if(sourceKeys.length>next.storyKeys.length)next.storyKeys=clone(sourceKeys);
+            if(undoMergeId){
+                const scopes=new Set(sourceIds.flatMap(id=>next.data.entries[id]?[normalizeScopeId(next.data.entries[id].scopeId)]:[]));
+                for(const scopeId of scopes)(next.preferences.compaction??={})[scopeId]={...compactionMeasure(next,scopeId),
+                    ...anchor(next.processed),at:new Date().toISOString()};
+            }
+            return this.#persist(next);
         });
     }
     async commitInventoryCatchUp(inventories, expectedRevision) {

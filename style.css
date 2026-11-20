@@ -1,7 +1,4 @@
 @import url('./src/ui/style.css');
-.dwm-fallback { max-width: 560px; padding: 24px; border: 1px solid #666; border-radius: 12px; background: #20232a; color: #eee; }
-.dwm-fallback button { margin: 8px; padding: 8px 14px; cursor: pointer; }
-.dwm-fallback::backdrop { background: #0009; }
 
 /* One fixed, nonmodal layer. The surrounding conversation remains interactive. */
 .dwm-floating-root {
@@ -76,6 +73,10 @@
 .dwm-floating-root[data-bubble-size='compact'] .dwm-floating-bubble { width: 44px; height: 44px; min-width: 0; min-height: 0; padding: 0; justify-content: center; border-radius: 50%; }
 .dwm-floating-root[data-bubble-size='compact'] .dwm-bubble-copy { display: none; }
 .dwm-floating-root[data-bubble-size='compact'] .dwm-bubble-fish { flex-basis: 24px; width: 24px; height: 24px; }
+.dwm-bubble-close { display: none; flex: 0 0 22px; width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; pointer-events: none; }
+.dwm-floating-bubble[data-open='true'] .dwm-bubble-fish { display: none; }
+.dwm-floating-bubble[data-open='true'] .dwm-bubble-close { display: block; }
+.dwm-floating-bubble[data-open='true'] { cursor: pointer; }
 .dwm-floating-root[data-bubble-size='compact'] .dwm-floating-bubble[data-state='busy']::after,
 .dwm-floating-root[data-bubble-size='compact'] .dwm-floating-bubble[data-state='attention']::after { content: ''; position: absolute; top: 3px; right: 3px; width: 9px; height: 9px; border-radius: 50%; background: var(--dwm-float-accent); box-shadow: 0 0 0 2px var(--dwm-float-bg); }
 

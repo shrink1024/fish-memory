@@ -36,7 +36,7 @@ async function fixture(){
  const model={complete:async r=>{calls.push(r);const value=await handle(r);if(value!==undefined)return value;
   if(r.purpose==='initialize')return {strategy:'s',entries:r.input.entries.map(e=>({id:e.id,kind:'fact',intro:'i',segments:[{id:'body',writable:true}]}))};
   return {operations:[]};}};
- const make=()=>new Controller(host,{model,settings:{lazyMode:true,maintenanceEvery:1},lazyClock:{setTimer:()=>1,clearTimer(){}}});
+ const make=()=>new Controller(host,{model,settings:{lazyMode:true,maintenanceKeepRecent:0,maintenanceEvery:1},lazyClock:{setTimer:()=>1,clearTimer(){}}});
  return {live,host,book,calls,make,handle:fn=>{handle=fn},failSave:value=>{failSave=value}};
 }
 test('stopping initialization remains explicitly stopped across reload and resumes only on manual retry',async()=>{

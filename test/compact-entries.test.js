@@ -25,7 +25,13 @@ test('automatic merged NPC importance remains gated and future promotion is effe
   assert.equal(merged.entries.a.tier,undefined);assert.equal(merged.entries.a.important,important);
   assert.equal(gatedTier(merged.entries.a),'onDemand');
   const promoted=applyMaintenance(merged,{operations:[{type:'promote',id:'a',evidence:['m']}]},{allowedEvidence:['m']}).next;
-  assert.equal(entryTier(promoted.entries.a),'constant');assert.equal(gatedTier(promoted.entries.a),'onDemand');
+  assert.equal(entryTier(promoted.entries.a),important?'constant':'onDemand');assert.equal(gatedTier(promoted.entries.a),'onDemand');
  }
 });
 import {entryTier,gatedTier} from '../src/core/state.js';
+test('automatic compaction does not reintroduce constant tier for new important NPCs',()=>{
+ const save=createSave('c','main');for(const id of ['a','b'])save.data.entries[id]=createEntry({id,title:id,kind:'npc',text:id,important:true,importanceIndependent:true});
+ const operation={type:'mergeEntries',sources:[{id:'a',expectedVersion:1},{id:'b',expectedVersion:1}],targetId:'a',title:'人物',text:'合并',intro:'i',evidence:['m']};
+ const merged=applyMaintenance(save.data,{operations:[operation]},{allowedEvidence:['m']}).next;
+ assert.equal(entryTier(merged.entries.a),'onDemand');assert.equal(merged.entries.a.important,true);
+});

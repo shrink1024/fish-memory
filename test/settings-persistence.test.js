@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createSettingsPersistence } from '../src/adapters/settings.js';
+import { Controller } from '../src/runtime/controller.js';
 
 function fixture({ mode = 'success', read = 'success' } = {}) {
     const previous = { enabled: true, recentTurns: 12 }, next = { enabled: false, recentTurns: 6 };
@@ -75,4 +76,20 @@ test('a native thrown failure retains the previous settings and avoids readback'
     await assert.rejects(f.persist(f.next), /native failure/);
     assert.strictEqual(f.extensionSettings.dwm, f.previous);
     assert.equal(f.reads.length, 0);
+});
+
+test('overlapping native settings saves complete in order without false readback failures',async()=>{
+ let disk,release;const gate=new Promise(resolve=>{release=resolve}),extensionSettings={dwm:{maintenanceEvery:3,lazyMode:false}};let writes=0;
+ const persist=createSettingsPersistence({extensionSettings,getRequestHeaders:()=>({}),saveSettings:async()=>{if(++writes===1)await gate;disk=structuredClone(extensionSettings.dwm)},
+  fetch:async()=>({ok:true,json:async()=>({settings:JSON.stringify({extension_settings:{dwm:disk}})})})});
+ const one=persist({maintenanceEvery:5,lazyMode:false}),two=persist({maintenanceEvery:5,lazyMode:true});
+ const result=Promise.allSettled([one,two]);release();
+ assert.deepEqual((await result).map(r=>r.status),['fulfilled','fulfilled']);assert.equal(disk.lazyMode,true);
+});
+
+test('overlapping controller patches keep both saved choices and switch mode without reloading',async()=>{
+ const c=new Controller({snapshot:()=>({chatId:'test',messages:[]}),clearPlan(){}},{settings:{enabled:false},persistSettings:async()=>new Promise(resolve=>setImmediate(resolve))});
+ await Promise.all([c.updateSettings({maintenanceEvery:5}),c.updateSettings({lazyMode:true})]);
+ assert.equal(c.settings.maintenanceEvery,5);assert.equal(c.view().settings.lazyMode,true);
+ await c.updateSettings({lazyMode:false});assert.equal(c.view().settings.lazyMode,false);
 });

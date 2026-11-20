@@ -91,11 +91,13 @@ test('multi-select ticks rows in the list, extends with Shift and applies one ba
     assert.ok(f.find(n => n.tagName === 'BUTTON' && n.textContent === '多选'), 'the list leaves select mode after applying');
 });
 
-test('the more menu opens the export and import dialogs', async t => {
+test('export is a visible button and the more menu opens the import dialog', async t => {
     const f = fixture({ exportMemory: () => ({ entries: {} }), supplementaryBooks: () => [] }); t.after(() => f.panel.destroy());
     f.focus('more-menu').click();
-    f.focus('more-导出为世界书').click();
-    assert.match(f.root.textContent, /导出为世界书把鱼忆改过的世界书存成一本新的酒馆世界书/);
+    assert.ok(!f.find(n => n.dataset.focus === 'more-导出为世界书'), 'export is no longer hidden in the menu');
+    f.focus('more-menu').click();
+    f.focus('export-book').click();
+    assert.match(f.root.textContent, /导出世界书将鱼忆维护后的世界书另存为一本酒馆世界书/);
     f.button('取消').click();
     f.focus('more-menu').click(); f.focus('more-导入旧总结').click();
     assert.match(f.root.textContent, /导入旧总结/);

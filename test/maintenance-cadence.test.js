@@ -13,7 +13,7 @@ function fixture({ settings = {}, handler } = {}) {
         storage: { read: async id => structuredClone(saves.get(id) ?? null), write: async (id, save) => saves.set(id, structuredClone(save)) },
         clearPlan() {}, setPlan() {}, eligible: () => true, applyWindow: async actions => windows.push(...actions),
     };
-    const options = { settings, persistSettings: async value => { settingsWrites.push(structuredClone(value)); options.settings = structuredClone(value); },
+    const options = { settings: {maintenanceKeepRecent:0,...settings}, persistSettings: async value => { settingsWrites.push(structuredClone(value)); options.settings = structuredClone(value); },
         model: { complete: async request => { calls.push(request); return await handler?.(request) ?? (request.purpose === 'select' ? { ids: [] } : { operations: [] }); } } };
     let controller = new Controller(host, options);
     const start = async () => { await controller.start(); await controller.initialize(); };
@@ -25,7 +25,7 @@ function fixture({ settings = {}, handler } = {}) {
         reload: async () => { controller = new Controller(host, options); await controller.start(); } };
 }
 
-test('default cadence accumulates three replies without hiding or omitting pending story', async () => {
+test('three-reply cadence with retention disabled accumulates three replies without hiding or omitting pending story', async () => {
     const f = fixture({ settings: { recentTurns: 1 } }); await f.start();
     await f.reply(1); await f.reply(2);
     assert.equal(f.calls.filter(r => r.purpose === 'maintain').length, 0);
@@ -50,10 +50,10 @@ test('manual catch-up and the every-reply setting stay immediate', async () => {
     await assert.rejects(f.controller.updateSettings({ maintenanceEvery: 0 }), /维护|范围/);
 });
 
-test('pending text reaching the batch size is processed before the reply threshold', async () => {
+test('batch size does not override the automatic reply interval', async () => {
     const f = fixture({ settings: { maintenanceEvery: 21, batchChars: 100 } }); await f.start(); await f.reply(1, '长'.repeat(100));
-    assert.equal(f.controller.store.state.processed.length, 2);
-    assert.ok(f.calls.some(r => r.purpose === 'maintain'));
+    assert.equal(f.controller.store.state.processed.length, 0);
+    assert.equal(f.calls.some(r => r.purpose === 'maintain'), false);
 });
 
 test('a custom interval above twenty persists and counts AI replies across a reload', async () => {

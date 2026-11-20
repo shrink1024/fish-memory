@@ -53,7 +53,7 @@ async function fixture(t, { scoped = false, singleBatch = false, selectFailure =
             if (text.includes(BASE)) {
                 const entry = request.input.memory.entries.find(e => e.id === 'source:main:1');
                 operations.push({ type: 'update', id: entry.id, expectedVersion: entry.version,
-                    segments: [{ id: 'body', text: DYNAMIC }], evidence: request.input.messages.map(m => m.key) });
+                    edits: [{ segmentId: 'body', oldText: entry.segments[0].text, newText: DYNAMIC }], evidence: request.input.messages.map(m => m.key) });
             }
             if (text.includes(OLD)) operations.push({ type: 'create', kind: 'event', title: 'Old outcome', intro: OLD, text: OLD,
                 evidence: request.input.messages.filter(m => m.content.includes(OLD)).map(m => m.key) });
@@ -61,7 +61,7 @@ async function fixture(t, { scoped = false, singleBatch = false, selectFailure =
         }
         return { operations: [] };
     } };
-    const c = new Controller(host, { model, settings: { enabled: true, maintenanceEvery: 1, recentTurns: 1, windowEnabled: true, batchChars: 100000, compactEvery: 100000 } });
+    const c = new Controller(host, { model, settings: { enabled: true, maintenanceKeepRecent: 0, maintenanceEvery: 1, recentTurns: 1, windowEnabled: true, batchChars: 100000, compactEvery: 100000 } });
     if (singleBatch) live.chat.push(message('a2', OLD));
     await c.start(); await c.initialize();
     if (scoped) { await c.setContext({ owner: 'card', activeScopeId: 'A' }); await c.whenIdle(); }

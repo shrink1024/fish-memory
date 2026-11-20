@@ -147,6 +147,7 @@ export function decodeSave(stored) {
     // Legacy data follows the same bounded plain-data path. This also returns a
     // detached object when storage is an in-memory test adapter.
     if (schema === 2) return decodeSave(encodeSave(stored));
+    if(schema===STORAGE_SCHEMA && dataProperty(stored,'encoding')==='fish-memory-pool-v2')throw Object.assign(new Error('不支持的持久化存档格式，请勿覆盖现有数据'),{kind:'storage-version',dwmStorageFormat:'reverted-dev2-source-layers'});
     invariant(schema === STORAGE_SCHEMA && dataProperty(stored, 'encoding') === STORAGE_ENCODING,
         '不支持的持久化存档格式，请勿覆盖现有数据');
     const pool = denseArray(dataProperty(stored, 'pool')), root = dataProperty(stored, 'root');

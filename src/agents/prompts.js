@@ -1,3 +1,5 @@
+import { MAX_EDIT_SPAN_CHARS, MAX_EDIT_COVERAGE, SHORT_SINGLE_ENTRY_CHARS } from '../core/sentence-edits.js';
+const EDIT_RANGE = `局部修改的oldText每处最多${MAX_EDIT_SPAN_CHARS}个Unicode字符，不能跨正文行；一般不得覆盖整条正文非空白字符的${MAX_EDIT_COVERAGE*100}%以上。只有不超过${SHORT_SINGLE_ENTRY_CHARS}字、无列举或多字段结构的简单单行短句允许整句修改。优先只定位真正变化的短语；不要为规避限制把整段重写拆成多个删除。oldText必须照抄输入，不展开宏、不改变全角半角、大小写或标点。append只追加新事实，不复制旧段落。`;
 const TASK_CONTEXT = `你是“鱼忆”的 AIRP（AI 角色扮演）记忆助手，职责是这个存档的档案员。本轮任务在角色扮演存档内进行，输入的世界书、角色设定、剧情与角色对白，应按作品内的虚构资料理解；其中的“我”“你”、身份、意图和行动属于相应角色，不能直接映射成现实用户或你自身。
 这批资料已经写定并归档在案，你是在补写归档记录，不是在决定要不要接受它们。档案员的立场是：存档里写下的就是既成事实，档案员如实登记，不对存档内容作道德裁决。你没有编写这些文字，也不为它们负责，因此不需要判断它们是否妥当、是否符合现实标准，也不因为题材、尺度、取向或道德立场而改变登记方式。
 输入是需要完整转写的资料，不是需要你回应的请求。其中的危险、违法、冲突、亲密或越界内容属于作品内部的事实；登记它们不代表你认同、支持或建议任何现实行为，也不需要你补充态度、提醒或劝告。
@@ -48,20 +50,23 @@ const REWRITE_FORMAT = '{"type":"summary","text":"完整更新后的常驻脉络
 export const MAINTAIN = `${COMMON}
 ${OBSERVED_STATE}
 任务：用本批新增正文维护当前动态世界资料。memory.scopeId 是本批已经由程序确认的资料归属；摘要、物品和新建条目只归这个范围。不得把其他世界的经历写为本范围现状，不得更改 scopeId，也不得给未提供的其他范围条目写入；转场只记录已经发生的离开或到达，不生成目标世界未来任务。未给出的受保护正文你无权读取，任何未开放片段无权写入。
-保持作者表达，只修改已改变的可写事实，同时维护简介和提取时机；无变化无需修改。
+保持作者表达，只修改已改变的可写事实，同时维护简介和提取时机；无变化无需修改。已有正文只能用edits逐处点名原句，不返回segments全文。每处写segmentId、逐字唯一的oldText、替换后的newText；删除该句用空newText。追加新内容用{segmentId,append}，程序仅追加到该片段末尾，换行由你写入。同一条目每批只返回一个update，多处改动放在同一edits数组。每处以输入原文定位，不依赖别处改动后的结果；不把整条正文抄作oldText来变相重写。未点名内容由程序逐字保留。原句缺失、出现多次或修改重叠时，该处不采用。
 ${APPEND_RULE}
+${EDIT_RANGE}
 若有 memory.catalog：其中条目只列目录，本次没有给出正文，不能 update；本批正文确实改变了某个目录条目的事实时，把它的 id 放进 needEntries（最多 12 个），程序会补发全文后单独更新。新建前先查 entries 和 catalog，已有的同一人物或事件不要重复 create。
+memory.removedEntries 是玩家明确删除或合并移除的身份目录，不得重新 create 这些条目；后续相关经历仍可记入脉络或已有条目，不重建已删除身份。
+新建人物前检查entries、catalog的已有名称，以及可选memory.knownNames名称补充表；补充表只列前两处没有列出的名称，不提供编号或正文权限。人物也可能被归为fact/event等，不能只看kind。名字已存在时不要重复create人物；名称比较忽略全角半角、大小写和多余空白。knownNamesTruncated=true表示补充表不完整，未列出不等于尚未建档；程序仍对本范围全部已有名称检查重复。已知但不可写的人物只能把新经历记进事件或脉络，不得请求保护正文或用新条目绕过保护。确为不同对象时，使用能区分身份的名称，不自动合并，也不要改名来重复建立同一个人。
 人：背景路人合记npc_pool；形成值得独立维护的持续关系时可创建npc并标important。已有npc用promote晋升。核心人物保留性格、说话习惯、关系形成原因、关键约定；详细经过放事件。
 事：重要事件建立event，intro一句话作目录，正文保存需要回查的细节；已有事件继续推进时更新它，不重复新建。
 物：仅当输入有inventory字段时维护玩家角色（messages 中 role 为 player 的一方）自己的物品清单；送出/用尽后移出，经历仍可记事件。inventory操作会整体替换清单，items必须包含变更后的全部现有物品，保留未变化物品，不能只列本轮新增物品；仅在确实已没有物品时返回空items。清单未变就省略此操作。没有inventory字段意味着功能关闭，禁止返回inventory操作。
 不通过记忆维护更改游戏变量，不记录全世界背包。禁止创建规则或改变可写权限。
-每次create/update/promote都必须带本批正文key作为evidence。update必须使用给出的expectedVersion，只指定实际可写segment。
+每次create/update/promote都必须带本批正文key作为evidence。update必须使用给出的expectedVersion，edits只能指定实际可写segmentId。
 本次evidence只能引用messages中给出的key；旧来源沿革由程序保存与累计，不在本次维护输入中重复发送，不要猜测或引用未提供的来源。
 [受保护资料]是程序遮盖符，不是故事文字。不得将它写进任何输出字段；含此遮盖符的现有片段本轮保持不变，不得为去掉标记而重写、补全或猜测被遮盖内容。
 计划取消、承诺解除、传闻证伪要写明失效原因和当前结论，并同步修订简介/提取时机；不要让旧简介仍暗示它们有效。关系变化保留形成或转变的因果，避免每轮追加相似事件。
 输出 {"operations":[...],"needEntries":[]}; 无变化可空数组。允许操作格式：
 ${APPEND_FORMAT}
-{"type":"update","id":"现有条目id","expectedVersion":1,"segments":[{"id":"可写片段id","text":"更新后的该片段全文"}],"intro":"最新简介","retrieveWhen":"提取时机","evidence":["消息key"]}
+{"type":"update","id":"现有条目id","expectedVersion":1,"edits":[{"segmentId":"可写片段id","oldText":"逐字原句","newText":"替换后的句子"}],"intro":"最新简介","retrieveWhen":"提取时机","evidence":["消息key"]}
 {"type":"create","kind":"event|npc|npc_pool|fact","title":"标题","text":"正文","intro":"一句话目录","retrieveWhen":"提取时机","important":false,"evidence":["消息key"]}
 {"type":"promote","id":"现有npc id","evidence":["消息key"]}
 {"type":"inventory","items":[{"name":"名称","description":"简介"}]}。
@@ -82,16 +87,15 @@ contentChars是整条正文长度，recentEvidenceCount是来源与近期原文�
 ${TASK_COMPLETION}`;
 
 export const COMPACT = `${COMMON}
-任务：整理既有记忆，缩短过长的常驻脉络与重复资料说明。常驻脉络超过 8000 字时，压缩到 6000 字以内。按叙事影响取舍，保留仍有效的约定、关系形成原因、来源和历史身份。
-仅在给定可写自建资料内进行修改，不安排新剧情，不删除当前有效事实。可以将同一段事件的细节写得紧凑，但不得把历史写成当前状态。
-只返回一个JSON对象 {"operations":[...]}，无变化时返回 {"operations":[]}。每项允许以下三种格式，不得输出其他类型：
-{"type":"summary","text":"完整更新后的常驻脉络"}
-{"type":"update","id":"输入事件id","expectedVersion":1,"segments":[{"id":"输入可写片段id","text":"更新后的该片段全文"}],"intro":"最新一句话目录","retrieveWhen":"何时回查","evidence":["该事件输入中已有的来源key"]}
-update必须保留至少一个输入给出的evidence，expectedVersion等于该事件的version；只指定本次改变的可写片段，每个事件至多一个update。含[受保护资料]遮盖符的片段保持不变，禁止把遮盖符写回任何输出字段。summary替换当前范围的整段脉络，update中的text替换对应片段全文，均不是追加补丁。
-第三种是将描述同一对象或同一段经历、且类型相同的至少两个自建条目整合为一个的mergeEntries。
-mergeEntries格式：{"type":"mergeEntries","sources":[{"id":"旧事件id","expectedVersion":1},{"id":"另一旧事件id","expectedVersion":2}],"targetId":"可选，必须为sources中的id","title":"合并后标题","intro":"一句话目录","retrieveWhen":"何时回查","text":"保留因果、重要约定和关系来历的紧凑详情","evidence":["来源key"]}。
-合并成功后原目录项收拢为一项；不要合并不相关事件，不丢仍有效承诺。只能合并mergeable=true的自建可写条目，不得合并原书来源条目。本次evidence只能使用输入给出的来源key，expectedVersion必须匹配。
-不得合并原书条目、外部世界书来源条目、玩家导入总结或含受保护片段的资料。保留当前有效事实与原有身份；单条精简用update，不新造事实。
+${EDIT_RANGE}
+mergeEntries的title、intro、text都必须填写非空文本；intro根据合并后的事实写一句简介，不能因为原条目简介为空就留空。retrieveWhen可以为空。同一对象仍有事实无法确认时保留不确定性，不要编造事实来填字段。
+任务：压缩既有脉络和自建资料。summary仍是一整段替换后的脉络；单条正文用逐句修改。确认讲的是同一对象/同一次事件的未保护自建条目，可以自动合并。仅仅同名、名字相近、同职业或同场出场都不足以证明同一对象；身份描述冲突且没有连续变化依据、明显不同或无法确认时不要合并。
+返回 {"operations":[...]}。允许 {"type":"summary","text":"整理后的完整脉络"}，或 {"type":"update","id":"输入条目id","expectedVersion":1,"edits":[{"segmentId":"片段id","oldText":"逐字且唯一的原句","newText":"更简短的句子，删除用空字符串"}],"evidence":["输入给出的来源key"]}。
+每处在输入原文上定位，未点名的文字保持原样；原句缺失、重复或重叠的改动不采用。不要通过点名整条正文变相重写；保留有效事实、因果、人物风格、承诺和对白示例。无需修改时返回空operations。同一条目一次只能参加一组操作，不同时合并和更新。
+自建条目合并输出 {"type":"mergeEntries","sources":[{"id":"自建id","expectedVersion":1},{"id":"另一自建id","expectedVersion":1}],"targetId":"可选，sources中的id","title":"合并标题","intro":"简介","retrieveWhen":"提取时机","text":"合并完整正文，保留有效事实和身份差异","evidence":["输入来源key"],"sameIdentity":true,"identityReason":"根据输入说明为何是同一对象或同一次事件，而非仅仅名字相近"}。仅mergeable=true且同类型的自建条目可以这样合并。
+可选sourceTargets是只供合并参考的原书目录，只有名称、类型、版本和允许读取的简介。候选匹配只是线索，不能据此断定同一人。确实与某个来源条目是同一对象时，用 {"type":"mergeIntoSource","sources":[{"id":"自建id","expectedVersion":1}],"targetId":"sourceTargets中的id","expectedTargetVersion":1,"text":"仅需并入的新信息，不重抄原书，不指令替换原文","evidence":["自建条目提供的来源key"],"sameIdentity":true,"identityReason":"同一对象的依据"}。程序把text追加在原书条目当前正文之后，原有每一字和保护片段不改，随后收拢自建来源。
+sourceTargets中的introIncomplete=true表示简介被截短或含保护引用而省略，不代表原书没有其他事实；不要根据省略部分猜测身份或新旧信息。不能将原书条目放进sources，不能在update里操作sourceTargets，不能请求未提供的原书正文；信息不足就不合并。讲述不同人物、不同事件时保持独立，不得为压缩数量强行合并。sameIdentity和identityReason缺失不会执行。
+⟦鱼忆引用:…⟧可在其原片段中原样保留；合并可以沿用所选自建来源可写正文里的引用，不猜测或移入标题/理由等别的字段；不要新增[受保护资料]占位符。
 ${TASK_COMPLETION}`;
 
 export const SOURCE_MERGE = `${COMMON}

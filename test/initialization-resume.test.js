@@ -8,7 +8,10 @@ const clone = value => structuredClone(value);
 const gate = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 const tick = () => new Promise(resolve => setImmediate(resolve));
 async function until(predicate) {
-    for (let count = 0; count < 60; count++) { if (predicate()) return; await tick(); }
+    // A fixed number of immediate callbacks can elapse before async hashing
+    // gets CPU time under the full parallel suite. Bound time, not spin count.
+    const deadline=performance.now()+5000;
+    while(performance.now()<deadline){if(predicate())return;await new Promise(resolve=>setTimeout(resolve,1));}
     assert.fail('Initialization did not reach expected phase');
 }
 function fixture({ handler, writeHandler, settings = {} } = {}) {

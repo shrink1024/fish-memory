@@ -117,7 +117,7 @@ test('large memories send a catalog; requested entries get one targeted follow-u
         }
         assert.match(request.system, new RegExp(FOLLOW_UP_NOTE.slice(0, 10)));
         assert.deepEqual(memory.entries.map(e => e.title), ['密室']);
-        return { operations: [{ type: 'update', id: vault.id, expectedVersion: vault.version, segments: [{ id: 'body', text: '密室在地下，已经坍塌。' }], evidence: ['a1'] },
+        return { operations: [{ type: 'update', id: vault.id, expectedVersion: vault.version, edits: [{ segmentId: 'body', oldText: vault.segments[0].text, newText: '密室在地下，已经坍塌。' }], evidence: ['a1'] },
             { type: 'appendSummary', text: '不应写入' }] };
     } });
     await f.controller.start(); await f.controller.initialize();

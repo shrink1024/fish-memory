@@ -1,4 +1,5 @@
 import { timeoutSignal } from '../platform/abort.js';
+import { SerialQueue } from '../core/util.js';
 
 function canonical(value) {
     if (Array.isArray(value)) return value.map(canonical);
@@ -11,8 +12,9 @@ function canonical(value) {
  * complete settings document or alter temporary generation parameters here.
  */
 export function createSettingsPersistence({ extensionSettings, saveSettings, getRequestHeaders, fetch: request = globalThis.fetch }) {
-    return async value => {
-        const previous = extensionSettings.dwm, target = structuredClone(value);
+    const queue=new SerialQueue();
+    const persist=async target => {
+        const previous = extensionSettings.dwm;
         extensionSettings.dwm = target;
         try {
             await saveSettings();
@@ -38,6 +40,10 @@ export function createSettingsPersistence({ extensionSettings, saveSettings, get
             if (extensionSettings.dwm === target) extensionSettings.dwm = previous;
             throw error;
         }
+    };
+    return value => {
+        const target=structuredClone(value);
+        return queue.run(()=>persist(target));
     };
 }
 

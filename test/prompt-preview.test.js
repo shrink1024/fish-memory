@@ -23,7 +23,7 @@ const inputAndSystem = value => ({ system: value.system, input: value.input });
 
 test('preview batches and conditional stages retain the three explicit Fish Agent responsibilities', () => {
     const f = fixture();
-    f.settings.batchChars = 5;
+    f.settings.batchChars = 5; f.settings.sourceBatchChars = 5;
     f.rawEntries = [{ uid: 1, content: '第一批资料' }, { uid: 2, content: '第二批资料' }];
     f.snapshot.messages = [{ key: 'a', role: 'assistant', content: '第一条剧情' }, { key: 'b', role: 'assistant', content: '第二条剧情' }];
     const preview = buildPromptPreview(f), byAgent = {};
@@ -71,7 +71,7 @@ test('executing all five tasks uses the same projections as the request factorie
 test('current preview matches real task inputs while preserving backlog and unsent draft boundaries', async () => {
     const f = fixture();
     f.snapshot.messages = Array.from({ length: 8 }, (_, i) => ({ key: `m${i}`, role: i % 2 ? 'assistant' : 'user', content: `消息${i}` }));
-    f.save.processed = ['m0', 'm1']; f.snapshot.userInput = '继续去渡口'; f.settings.recentTurns = 1;
+    f.save.processed = ['m0', 'm1']; f.snapshot.userInput = '继续去渡口'; f.settings.recentTurns = 1; f.settings.selectionRecentTurns = 1;
     const expectedRecent = [...f.snapshot.messages.slice(2), { key: 'current-input', role: 'user', content: '继续去渡口' }];
     // Auxiliary inputs label story text as archival material rather than a live turn.
     const asMaterial = messages => messages.map(({ key, role, content }) => ({ key, role: sourceRole(role), content, source: '存档正文' }));
@@ -90,7 +90,7 @@ test('current preview matches real task inputs while preserving backlog and unse
 
 test('initialization preserves the actual batch limit, excludes config, and leaves strategy outputs unknown', () => {
     const f = fixture(); f.save.initialized = false;
-    f.settings.batchChars = 5;
+    f.settings.batchChars = 5; f.settings.sourceBatchChars = 5;
     f.rawEntries = [{ uid: 1, content: '第一条四字' }, { uid: 2, content: '第二条四字' },
         { uid: 3, comment: '[DWM Rules]', content: JSON.stringify({ format: 'dwm-rules', version: 1, naturalLanguage: '只记事实', script: '' }) }];
     const preview = buildPromptPreview(f), scans = preview.stages.filter(stage => stage.id.startsWith('initialize-'));

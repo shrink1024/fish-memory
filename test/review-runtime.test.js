@@ -83,7 +83,7 @@ test('readiness events after a rebind preserve the warning and the active rescan
     const originalStore = f.c.store;
     await f.c.readinessChanged();
     assert.equal(f.c.store, originalStore);
-    assert.match(f.c.view().initialization.message, /绑定已改变/);
+    assert.match(f.c.view().initialization.message, /主世界书已更换/);
     f.gates.initialize = deferred(); const scan = f.c.initialize(); scan.catch(() => {}); await settle();
     await f.c.readinessChanged(); await f.c.chatChanged();
     assert.equal(f.calls.findLast(call => call.purpose === 'initialize').signal.aborted, false);
@@ -228,7 +228,7 @@ for (const mixed of [false, true]) test(`manual corrections do not carry discard
         : [{ id: 'appearance', text: '黑发', writable: true }, { id: 'location', text: '住港口', writable: true }];
     await store.initialize([createEntry({ id: 'npc', kind: 'npc', segments })], 's');
     await store.commit({ operations: [{ type: 'update', id: 'npc', expectedVersion: 1,
-        segments: [{ id: mixed ? 'body' : 'location', text: mixed ? '黑发，住王都。' : '住王都' }], evidence: ['old'] }] }, { expectedRevision: store.state.revision, sourceKeys: ['u', 'old'] });
+        edits: [{ segmentId: mixed ? 'body' : 'location', oldText: '住港口', newText: '住王都' }], evidence: ['old'] }] }, { expectedRevision: store.state.revision, sourceKeys: ['u', 'old'] });
     const edited = structuredClone(store.state.data.entries.npc.segments);
     edited[0].text = edited[0].text.replace('黑发', '白发');
     await store.manual({ type: 'edit', id: 'npc', segments: edited }, ['u', 'old']);
@@ -240,7 +240,7 @@ for (const mixed of [false, true]) test(`manual corrections do not carry discard
 test('overlapping manual and branch text changes preserve the branch and request review', async () => {
     const store = new MemoryStore({ read: async () => null, write: async () => {} });
     await store.load('c', 'b'); await store.initialize([createEntry({ id: 'npc', text: '住港口' })], 's');
-    await store.commit({ operations: [{ type: 'update', id: 'npc', expectedVersion: 1, segments: [{ id: 'body', text: '住王都' }], evidence: ['old'] }] }, { expectedRevision: store.state.revision, sourceKeys: ['u', 'old'] });
+    await store.commit({ operations: [{ type: 'update', id: 'npc', expectedVersion: 1, edits: [{ segmentId: 'body', oldText: '住港口', newText: '住王都' }], evidence: ['old'] }] }, { expectedRevision: store.state.revision, sourceKeys: ['u', 'old'] });
     await store.manual({ type: 'edit', id: 'npc', segments: [{ id: 'body', text: '住北城', writable: true }] }, ['u', 'old']);
     await store.reconcile(['u', 'new']);
     assert.equal(entryText(store.state.data.entries.npc), '住港口');

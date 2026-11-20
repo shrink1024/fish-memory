@@ -9,7 +9,7 @@ async function fixture(){
  const live={chatId:'c',bookName:'b',templateEnabled:true,generating:false,messages:[{key:'m1',role:'user',content:'合成开场'},{key:'m2',role:'assistant',content:'合成回复'}]};
  const host={snapshot:()=>structuredClone(live),generationSnapshot:()=>structuredClone(live),loadWorldbook:async()=>[{uid:1,comment:'人物',content:'合成人物资料'}],storage:{read:async()=>structuredClone(disk),write:async(_,v)=>{disk=structuredClone(v)}},clearPlan(){plan=null},setPlan:p=>{plan=p},applyWindow:async()=>{}};
  const model={complete:async r=>{calls.push(r);if(handler){const result=await handler(r);if(result!==undefined)return result}if(r.purpose==='initialize')return {strategy:'s',entries:r.input.entries.map(e=>({id:e.id,kind:'npc',intro:'i',retrieveWhen:'w',segments:[{id:'body',writable:true}]}))};if(r.purpose==='select')return {ids:r.input.catalog.map(e=>e.id)};return {operations:[]}}};
- const make=(lazyMode=false)=>new Controller(host,{model,settings:{lazyMode,enabled:true,maintenanceEvery:1},lazyClock:{setTimer:()=>1,clearTimer(){}}});
+ const make=(lazyMode=false)=>new Controller(host,{model,settings:{lazyMode,enabled:true,maintenanceKeepRecent:0,maintenanceEvery:1},lazyClock:{setTimer:()=>1,clearTimer(){}}});
  const c=make();await c.start();await c.initialize();return {c,host,live,calls,make,plan:()=>plan,handle:fn=>{handler=fn}};
 }
 test('enabling lazy mode returns after settings are saved without waiting for a model task',async()=>{

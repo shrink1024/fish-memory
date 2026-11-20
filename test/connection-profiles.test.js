@@ -24,7 +24,7 @@ test('FM-025: named connections are saved with their keys, switched and deleted'
     assert.doesNotMatch(JSON.stringify(c.view()), /key-[ab]/, 'keys never reach the view');
 
     await c.useConnectionProfile('便宜档');
-    assert.deepEqual(c.view().connection, { mode: 'compatible', endpoint: 'https://a.example/v1', model: 'cheap', maxOutputTokens: 8192, hasApiKey: true });
+    assert.deepEqual(c.view().connection, { mode: 'compatible', endpoint: 'https://a.example/v1', model: 'cheap', maxOutputTokens: 8192, hasApiKey: true, headers: [] });
     assert.equal(store.data.current.apiKey, 'key-a', 'the switched connection is what reloads next time');
     assert.deepEqual(c.view().connectionProfiles.map(p => p.active), [true, false]);
 

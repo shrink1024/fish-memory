@@ -25,7 +25,14 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
     const bubbleCopy = make('span', 'dwm-bubble-copy');
     const status = make('span', 'dwm-bubble-status', '点开管理');
     bubbleCopy.append(make('strong', 'dwm-bubble-name', '鱼忆'), status);
-    bubble.append(icon('M4 12C7 5 15 5 19 12C15 19 7 19 4 12Zm0 0L1 8v8l3-4Zm11-1h.01M9 7l2-3 3 3M9 17l2 3 3-3', 'dwm-bubble-fish'), bubbleCopy);
+    bubble.append(icon('M4 12C7 5 15 5 19 12C15 19 7 19 4 12Zm0 0L1 8v8l3-4Zm11-1h.01M9 7l2-3 3 3M9 17l2 3 3-3', 'dwm-bubble-fish'), icon('M7 7l10 10M17 7L7 17', 'dwm-bubble-close'), bubbleCopy);
+    // While the window is open the bubble stays as a second way out: card themes can cover the title bar.
+    let bubbleText = '点开管理';
+    const labelBubble = () => {
+        status.textContent = opened ? '收起窗口' : bubbleText;
+        bubble.setAttribute('aria-label', opened ? '收起鱼忆管理窗口' : `打开鱼忆管理窗口，${bubbleText}。可拖动气泡调整位置`);
+        bubble.title = opened ? '鱼忆 · 收起窗口' : `鱼忆 · ${bubbleText}；点开管理，拖动可换位置`;
+    };
     const panel = make('section', 'dwm-management'); panel.id = 'dwm-management-dialog'; panel.hidden = true;
     if (ttHost) {
         element.dataset.ttMobileSurface = 'none';
@@ -160,7 +167,7 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
             entry.classList.toggle('openIcon', opened); entry.classList.toggle('closedIcon', !opened);
         }
         bubble.setAttribute('aria-expanded', String(opened));
-        panel.hidden = !opened; bubble.hidden = opened || !dock.visible;
+        panel.hidden = !opened; bubble.hidden = !dock.visible; bubble.dataset.open = String(opened); labelBubble();
     };
     function open(source) {
         if (destroyed || opened) return;
@@ -186,7 +193,8 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
     bubble.setAttribute('aria-haspopup', 'dialog'); bubble.setAttribute('aria-controls', panel.id); bubble.setAttribute('aria-expanded', 'false');
     listen(bubble, 'click', event => {
         if (suppressClick && event.detail !== 0) { suppressClick = false; event.preventDefault(); return; }
-        suppressClick = false; open(event);
+        suppressClick = false;
+        if (opened) close(); else open(event);
     });
     listen(closeButton, 'click', () => close());
     listen(doc, 'keydown', event => {
@@ -283,11 +291,9 @@ export function createFloatingManager(doc, { window: win = doc.defaultView, stor
         else if (view.error) { text = '需要处理'; state = 'attention'; }
         else if (!view.initialized) { text = '建立记忆'; state = 'attention'; }
         else if (Number(view.pendingCount) > 0) { text = `${Math.min(999, Math.floor(view.pendingCount))}${view.pendingCount > 999 ? '+' : ''} 条待补记`; state = 'pending'; }
-        status.textContent = text; bubble.dataset.state = state;
+        bubbleText = text; bubble.dataset.state = state;
         for (const entry of entries) entry.setAttribute('aria-label', attention ? `打开鱼忆管理窗口：${lazyShortStatus(view)}` : '打开鱼忆管理窗口');
-        bubble.setAttribute('aria-label', `打开鱼忆管理窗口，${text}。可拖动气泡调整位置`);
-        bubble.title = `鱼忆 · ${text}；点开管理，拖动可换位置`;
-        layout();
+        labelBubble(); layout();
     };
     setExpanded(); render({ initialized: true });
     if (ttHost) {

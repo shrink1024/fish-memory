@@ -1,3 +1,4 @@
+import { redactDiagnosticSecrets } from './secrets.js';
 const SENSITIVE_KEYS = new Set(['headers', 'header', 'authorization', 'proxyauthorization', 'apikey', 'accesskey', 'secretkey', 'key', 'auth', 'bearer', 'session', 'token', 'accesstoken', 'refreshtoken', 'password', 'passwd', 'secret', 'clientsecret', 'cookie', 'setcookie', 'credentials', 'customincludebody', 'customexcludebody']);
 const ADDRESS_KEYS = new Set(['url', 'uri', 'endpoint', 'baseurl', 'apiurl', 'apiserver', 'serverurl', 'reverseproxy', 'proxy']);
 const CONTENT_KEYS = new Set(['content', 'text', 'input', 'system', 'prompt', 'arguments', 'responseraw', 'responsebody']);
@@ -37,7 +38,7 @@ function boundedString(value, budget) {
 
 /** Copy only data properties. Prompt bodies are opaque data, not configuration. */
 function capture(value, budget, { content = false, depth = 0, ancestors = new Set() } = {}) {
-    if (typeof value === 'string') return boundedString(value, budget);
+    if (typeof value === 'string') return boundedString(redactDiagnosticSecrets(value), budget);
     if (value === null || typeof value === 'boolean' || typeof value === 'number') {
         const safe = typeof value === 'number' && !Number.isFinite(value) ? null : value;
         const size = String(safe).length;

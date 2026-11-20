@@ -254,3 +254,15 @@ test('native toolbar remains reachable above the manager window and compact surf
  Object.assign(f.win.visualViewport,{width:375,height:812});f.win.visualViewport.fire('resize');
  assert.equal(f.ui.panel.dataset.layout,'compact');assert.equal(f.ui.element.style['--dwm-toolbar-bottom'],'43px');
 });
+
+test('while the window is open the bubble stays as a close control, so a themed card cannot trap the player', () => {
+    const f = fixture();
+    f.ui.bubble.fire('click');
+    assert.equal(f.ui.panel.hidden, false); assert.equal(f.ui.bubble.hidden, false);
+    assert.equal(f.ui.bubble.dataset.open, 'true'); assert.equal(f.get('dwm-bubble-status').textContent, '收起窗口');
+    assert.equal(f.ui.bubble.getAttribute('aria-label'), '收起鱼忆管理窗口');
+    f.ui.render({ initialized: true, pendingCount: 3 }); assert.equal(f.get('dwm-bubble-status').textContent, '收起窗口');
+    f.ui.bubble.fire('click');
+    assert.equal(f.ui.panel.hidden, true); assert.equal(f.ui.bubble.dataset.open, 'false');
+    assert.equal(f.get('dwm-bubble-status').textContent, '3 条待补记'); assert.equal(f.doc.activeElement, f.ui.bubble);
+});

@@ -64,7 +64,7 @@ test('selection never sees a gated entry without its keyword, and an author alwa
     assert.deepEqual(c.diagnostics.lastPlan.gatedIds, []);
 });
 
-test('the panel shows a gated entry the scan judged important as on demand, and a player promotion still counts', async () => {
+test('the panel shows a gated entry the scan judged important as on demand, and only an explicit player tier overrides the gate', async () => {
     const book = [{ uid: 1, comment: '事件·渡口夜袭', content: '渡口夜里遇袭。', key: ['渡口'] },
         rulesEntry('when title contains "事件" => gate;')];
     const state = { chatId: 'c', bookName: 'main', templateEnabled: true, generating: false, messages: [msg('m0', 'assistant', '开场')], userInput: '' };
@@ -87,9 +87,12 @@ test('the panel shows a gated entry the scan judged important as on demand, and 
     assert.deepEqual(c.diagnostics.lastPlan.gatedIds, [id], 'not sent every turn just because the scan judged it important');
     assert.ok(!c.diagnostics.lastPlan.selectedIds.includes(id));
     await c.manual({ type: 'promote', id });
+    assert.equal(c.store.state.data.entries[id].tier, undefined);
+    assert.equal(gatedTier(c.store.state.data.entries[id]), 'onDemand');
+    await c.manual({ type: 'tier', id, tier: 'constant' });
     assert.equal(c.store.state.data.entries[id].tier, 'constant');
     await c.generationBefore({ type: 'normal' });
-    assert.deepEqual(c.diagnostics.lastPlan.gatedIds, [], 'a player promotion is a player-set constant');
+    assert.deepEqual(c.diagnostics.lastPlan.gatedIds, [], 'a player-set constant overrides the gate');
     assert.ok(c.diagnostics.lastPlan.selectedIds.includes(id));
 });
 
@@ -115,8 +118,8 @@ test('review 10-29: once its keyword appears, a gated entry the scan judged impo
     const catalog = selectionCatalog(calls.findLast(x => x.purpose === 'select').input);
     assert.equal(catalog.find(e => e.id === ferry).constant, false, 'offered as on demand, the tier the panel shows');
     assert.ok(!c.diagnostics.lastPlan.mandatoryIds.includes(ferry) && !c.diagnostics.lastPlan.selectedIds.includes(ferry), 'the model did not pick it, so it is not sent');
-    assert.equal(catalog.find(e => e.id === boatman).constant, true, 'an important entry without a gate keeps its meaning');
-    assert.ok(c.diagnostics.lastPlan.mandatoryIds.includes(boatman));
+    assert.equal(catalog.find(e => e.id === boatman).constant, false, 'new important entries stay on demand even without a gate');
+    assert.ok(!c.diagnostics.lastPlan.mandatoryIds.includes(boatman));
     assert.equal(c.store.state.data.entries[ferry].tier, undefined, 'the save itself is unchanged');
     // The preview reads the same gate: held back without the keyword, on demand with it.
     const stage = (result, id) => result.stages.find(s => s.id === id);

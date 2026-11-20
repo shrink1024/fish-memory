@@ -100,7 +100,7 @@ test('pooled storage preserves real journal replay, selected replies and reload 
     await store.initialize([createEntry({ id: 'npc', kind: 'npc', title: '甲', text: '住城南' })], '关系');
     for (let i = 1; i <= 20; i++) {
         await store.commit({ operations: [{ type: 'update', id: 'npc', expectedVersion: i,
-            segments: [{ id: 'body', text: `第${i}天住城北` }], evidence: [`key-${i}`] }, { type: 'summary', text: `第${i}天进展` }] },
+            edits: [{ segmentId: 'body', oldText: store.state.data.entries.npc.segments[0].text, newText: `第${i}天住城北` }], evidence: [`key-${i}`] }, { type: 'summary', text: `第${i}天进展` }] },
         { expectedRevision: store.state.revision, sourceKeys: Array.from({ length: i }, (_, j) => `key-${j + 1}`), allowedEvidence: [`key-${i}`] });
     }
     const expected = store.snapshot();

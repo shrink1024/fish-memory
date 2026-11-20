@@ -56,10 +56,10 @@ test('FM-001: the separate connection, key included, is saved and restored', asy
     const host = { snapshot: () => ({ chatId: null, messages: [] }), rawGenerate: async () => '{}' };
     const first = new Controller(host, { connectionStore: store });
     await first.updateConnection({ mode: 'compatible', endpoint: 'https://aux.example/v1/', model: 'cheap', apiKey: 'secret', maxOutputTokens: 32768 });
-    assert.deepEqual(stored, { mode: 'compatible', endpoint: 'https://aux.example/v1', model: 'cheap', apiKey: 'secret', maxOutputTokens: 32768 });
+    assert.deepEqual(stored, { mode: 'compatible', endpoint: 'https://aux.example/v1', model: 'cheap', apiKey: 'secret', maxOutputTokens: 32768, headers: [] });
     const reloaded = new Controller(host, { connectionStore: store });
     assert.equal(reloaded.connectionMode, 'compatible');
-    assert.deepEqual(reloaded.view().connection, { mode: 'compatible', endpoint: 'https://aux.example/v1', model: 'cheap', maxOutputTokens: 32768, hasApiKey: true });
+    assert.deepEqual(reloaded.view().connection, { mode: 'compatible', endpoint: 'https://aux.example/v1', model: 'cheap', maxOutputTokens: 32768, hasApiKey: true, headers: [] });
     assert.doesNotMatch(JSON.stringify(reloaded.view()), /secret/, 'the key never appears in views or exports');
     await assert.rejects(reloaded.updateConnection({ mode: 'compatible', endpoint: 'https://aux.example/v1', model: 'cheap', maxOutputTokens: -1 }), /输出/);
     assert.equal(reloaded.view().connection.maxOutputTokens, 32768);
@@ -98,7 +98,7 @@ test('FM-004: worldbook-only mode keeps entries and selection but no summary, ev
 
     const f = fixture({ book: [{ uid: 1, comment: '城', content: '城门开着' }], settings: { memoryMode: 'worldbook' }, handler: request => request.purpose === 'maintain'
         ? { operations: [{ type: 'summary', text: '不该保存' }, { type: 'create', kind: 'event', title: '事件', text: '不该保存', intro: 'x', retrieveWhen: 'x', evidence: [request.input.messages[0].key] },
-            { type: 'update', id: request.input.memory.entries[0].id, expectedVersion: request.input.memory.entries[0].version, evidence: [request.input.messages[0].key], segments: [{ id: 'body', text: '城门关了' }] }] } : undefined });
+            { type: 'update', id: request.input.memory.entries[0].id, expectedVersion: request.input.memory.entries[0].version, evidence: [request.input.messages[0].key], edits: [{ segmentId: 'body', oldText: request.input.memory.entries[0].segments[0].text, newText: '城门关了' }] }] } : undefined });
     await f.controller.start(); await f.controller.initialize();
     f.state.messages.push(msg('u1', 'user'), msg('a1'));
     await f.controller.maintain();
@@ -136,7 +136,7 @@ test('FM-002: only changed source entries are synced; story-changed ones are mer
     const f = fixture({ book, handler: request => {
         if (request.purpose === 'maintain' && request.input.messages.some(m => m.key === 'a1')) {
             const target = request.input.memory.entries.find(entry => entry.title === '剧情改过');
-            return { operations: [{ type: 'update', id: target.id, expectedVersion: target.version, evidence: ['a1'], segments: [{ id: 'body', text: '旧B，后来被烧毁' }] }] };
+            return { operations: [{ type: 'update', id: target.id, expectedVersion: target.version, evidence: ['a1'], edits: [{ segmentId: 'body', oldText: target.segments[0].text, newText: '旧B，后来被烧毁' }] }] };
         }
         if (request.purpose === 'sourceMerge') {
             merged = request.input;

@@ -80,7 +80,7 @@ test('the connection card fetches models and fills the model name from the list'
     find(node => node.tagName === 'BUTTON' && node.textContent === '辅助模型').click();
     assert.equal(find(node => node.dataset.focus === 'model-list').disabled, true, 'the model picker is visible before connecting');
     find(node => node.tagName === 'BUTTON' && node.textContent === '连接并获取模型').click(); await tick();
-    assert.deepEqual(requests, [{ endpoint: 'https://aux.example/v1', apiKey: '' }]);
+    assert.deepEqual(requests, [{ endpoint: 'https://aux.example/v1', apiKey: '', headers: [] }]);
     const list = find(node => node.tagName === 'SELECT' && node.dataset.focus === 'model-list');
     assert.ok(list, 'the fetched list is offered');
     assert.equal(list.disabled, false, 'connecting enables selection without a model ID first');

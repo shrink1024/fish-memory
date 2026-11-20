@@ -22,7 +22,7 @@ async function setup() {
     return { store, persistence };
 }
 const update = (version, text, key) => ({ operations: [{ type: 'update', id: 'home', expectedVersion: version,
-    segments: [{ id: 'body', text }], intro: text, evidence: [key] }, { type: 'summary', text: `进展：${text}` }] });
+    edits: [{ segmentId: 'body', oldText: version === 1 ? '住港口' : '住北城', newText: text }], intro: text, evidence: [key] }, { type: 'summary', text: `进展：${text}` }] });
 
 test('保存成功才推进，持久化失败保持完整旧版本', async () => {
     const { store, persistence } = await setup();
@@ -62,8 +62,10 @@ test('受保护正文和审计不进入后置，写权限由程序拒绝', async
     assert.ok(!view.includes('SECRET'));
     assert.ok(!view.includes('journal') && !view.includes('audit') && !view.includes('original'));
     const result = { operations: [{ type: 'update', id: 'mixed', expectedVersion: 1,
-        segments: [{ id: 'rule', text: 'bad' }], evidence: ['a'] }] };
-    await assert.rejects(store.commit(result, { expectedRevision: store.state.revision, sourceKeys: ['a'] }), /受保护/);
+        edits: [{ segmentId: 'rule', oldText: 'MIXED_SECRET', newText: 'bad' }], evidence: ['a'] }] };
+    await store.commit(result, { expectedRevision: store.state.revision, sourceKeys: ['a'] });
+    assert.equal(store.state.audit.at(-1).reason, 'patch-protected');
+    assert.equal(store.state.data.entries.mixed.segments[0].text, 'MIXED_SECRET');
     assert.equal(frontRead(store.snapshot(), ['rules'])[0].content, 'RULE_SECRET');
 });
 test('分支回到分叉进度，不继承未来事实；事后文本变化不属于key对账', async () => {
@@ -194,7 +196,7 @@ test('stored rule entry cannot regain write access by malformed metadata', async
     assert.throws(() => validateSave(malformed), /规则条目不可写/);
 });
 
-test('mergeEvents atomically shortens the event directory and keeps evidence lineage', async () => {
+test('automatic merge requires the separate player-confirmed proposal and preserves existing entries', async () => {
     const persistence = storage(), store = new MemoryStore(persistence);
     await store.load('merge-chat', 'world');
     await store.initialize([
@@ -212,10 +214,10 @@ test('mergeEvents atomically shortens the event directory and keeps evidence lin
         sourceKeys: ['m1', 'm2'], allowedEvidence: ['m1', 'm2'] });
     const after = store.snapshot();
     const events = Object.values(after.data.entries).filter(e => e.kind === 'event');
-    assert.equal(events.length, 1);
-    assert.deepEqual(events[0].lineage, ['event-1', 'event-2']);
-    assert.deepEqual(events[0].evidence, ['m1', 'm2']);
-    assert.equal(events[0].intro, '相遇并约好次日再见');
+    assert.equal(events.length, 2);
+    assert.deepEqual(after.data.entries['event-1'], before.data.entries['event-1']);
+    assert.deepEqual(after.data.entries['event-2'], before.data.entries['event-2']);
+    assert.equal(after.audit.at(-1).reason, 'patch-merge-needs-confirmation');
     assert.deepEqual(after.data.entries.world, before.data.entries.world);
     assert.deepEqual(after.data.entries.npc, before.data.entries.npc);
     assert.deepEqual(after.data.inventory, before.data.inventory);
