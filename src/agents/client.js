@@ -188,6 +188,7 @@ export function boundedResponseLength(requested, configured, metadata) {
 
 export function assertCompleteModelResponse(payload) {
     const reason = String(payload?.choices?.[0]?.finish_reason ?? payload?.stop_reason ?? payload?.candidates?.[0]?.finishReason ?? '').toLowerCase();
+    if (payload?.choices?.[0]?.error || reason === 'error') throw modelApiError({ error: payload?.choices?.[0]?.error });
     if (['length', 'max_tokens', 'max_output_tokens'].includes(reason) || payload?.stopped_limit === true) {
         throw Object.assign(new Error('辅助模型达到输出长度上限，返回结果已截断或未生成正文，本次未采用。请提高输出上限、调低思考强度、减少每批扫描量或改用支持更长输出的辅助模型后重试。'), { name: 'OutputLimitError', dwmStreamFault: 'length' });
     }
@@ -333,29 +334,33 @@ export function requestMessages({ system, input, head = [], tail = [], recovery 
  * thought, and thinking tokens dominate scan time, so default to low. */
 export const REASONING_EFFORTS = Object.freeze(['inherit', 'auto', 'min', 'low', 'medium', 'high', 'max']);
 const WIRE_EFFORT = { min: 'low', low: 'low', medium: 'medium', high: 'high', max: 'high' };
+const OPENROUTER_EFFORT = { min: 'minimal', low: 'low', medium: 'medium', high: 'high', max: 'max' };
 
-function connectionUrl(endpoint) {
+function connectionUrl(endpoint, path) {
     const url = new URL(endpoint);
     invariant(['https:', 'http:'].includes(url.protocol), '模型连接必须使用 HTTP(S)');
     invariant(url.protocol === 'https:' || ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname), '非本地连接必须使用 HTTPS');
+    url.pathname = url.pathname.replace(/\/+$/, '') + '/' + path;
+    url.hash = '';
     return url;
 }
 
 /** Model ids an OpenAI-compatible endpoint advertises at GET /models. Only a
  * convenience for filling the model name; manual entry always remains. */
 export async function listModels({ endpoint, apiKey = '', headers = [], fetchImpl = globalThis.fetch, signal } = {}) {
-    const url = connectionUrl(endpoint);
+    const url = connectionUrl(endpoint, 'models');
     let response;
     try {
-        response = await fetchImpl(url.href.replace(/\/$/, '') + '/models', { method: 'GET', headers: requestHeaders(apiKey, headers), signal });
+        response = await fetchImpl(url.href, { method: 'GET', headers: requestHeaders(apiKey, headers), signal });
     } catch {
         throwIfAborted(signal);
         throw new Error('无法连接该接口获取模型列表：地址可能有误，或该接口不允许网页直接访问。请检查地址后重试，或直接手动填写模型名称。');
     }
     throwIfAborted(signal);
-    if ([401, 403].includes(response.status)) throw modelApiError(null, response.status);
+    if ([401, 402, 403, 429].includes(response.status)) throw modelApiError(null, response.status);
     let payload = null;
     try { payload = await response.json(); } catch { /* handled below */ }
+    throwIfAborted(signal);
     const list = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload?.models) ? payload.models : Array.isArray(payload) ? payload : null;
     if (!response.ok || !list) throw new Error(`该接口没有提供模型列表${response.ok ? '' : `（HTTP ${response.status}）`}，请手动填写模型名称。`);
     const ids = [...new Set(list.map(item => typeof item === 'string' ? item : item?.id ?? item?.name)
@@ -366,10 +371,11 @@ export async function listModels({ endpoint, apiKey = '', headers = [], fetchImp
 
 /** Optional separate connection; credentials are supplied at runtime, never in save data. */
 export function compatibleConnection({ endpoint, model, apiKey = '', headers = [], fetchImpl = fetch, tokenParameter = 'auto', maxOutputTokens }) {
-    const url = connectionUrl(endpoint);
+    const url = connectionUrl(endpoint, 'chat/completions');
+    const openrouter = url.origin === 'https://openrouter.ai';
     invariant(['auto', 'max_tokens', 'max_completion_tokens'].includes(tokenParameter), '不支持的辅助输出长度参数');
     const openaiReasoning = /(?:^|\/)(?:gpt-[56](?:[.\-]|$)|o[134](?:-|$))/i.test(model);
-    const lengthParameter = tokenParameter === 'auto' ? openaiReasoning ? 'max_completion_tokens' : 'max_tokens' : tokenParameter;
+    const lengthParameter = tokenParameter === 'auto' ? openrouter || openaiReasoning ? 'max_completion_tokens' : 'max_tokens' : tokenParameter;
     // Unknown gateway aliases can reason too. Never infer their output budget from a name.
     const explicitLength = maxOutputTokens !== undefined && maxOutputTokens !== null && maxOutputTokens !== '';
     invariant(!explicitLength || (Number.isSafeInteger(Number(maxOutputTokens)) && Number(maxOutputTokens) > 0), '辅助输出额度必须是正整数，或留空沿用服务端默认值');
@@ -378,16 +384,16 @@ export function compatibleConnection({ endpoint, model, apiKey = '', headers = [
     // request is resent once without it and the parameter is dropped afterwards.
     let effortRejected = false;
     return async ({ purpose, system, input, head, tail, recovery, reasoningEffort, stream = false, onProgress, signal, responseLength = auxiliaryResponseLength(purpose) }) => {
-        const send = effort => fetchImpl(url.href.replace(/\/$/, '') + '/chat/completions', {
+        const send = effort => fetchImpl(url.href, {
             method: 'POST', headers: requestHeaders(apiKey, headers, true),
             body: JSON.stringify({ model, messages: requestMessages({ system, input, head, tail, recovery }), stream,
                 ...(omitLength ? {} : { [lengthParameter]: explicitLength ? Number(maxOutputTokens) : responseLength }),
-                ...(effort ? { reasoning_effort: effort } : {}) }), signal,
+                ...(effort ? openrouter ? { reasoning: { effort } } : { reasoning_effort: effort } : {}) }), signal,
         });
-        const effort = effortRejected ? null : WIRE_EFFORT[reasoningEffort] ?? null;
+        const effort = effortRejected ? null : (openrouter ? OPENROUTER_EFFORT : WIRE_EFFORT)[reasoningEffort] ?? null;
         let response = await send(effort);
         throwIfAborted(signal);
-        if (effort && response.status === 400) {
+        if (!openrouter && effort && response.status === 400) {
             const text = await response.clone().text().catch(() => '');
             throwIfAborted(signal);
             if (/reasoning[_ ]effort/i.test(text)) { effortRejected = true; response = await send(null); throwIfAborted(signal); }

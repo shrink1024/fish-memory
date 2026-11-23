@@ -1436,6 +1436,20 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
             const result = await controller.previewPlan(); localPreview = { ...result, at: new Date().toISOString(), mode: 'preview' };
         }, '试选已完成'), { title: '会调用一次模型，只看结果，不发送正文', disabled: Boolean(view.activity) }), queue)));
         if (canQueue && reuse.forceNext) { const queued = h('p', 'dwm-banner', '已安排：下一次发送或重新生成时重新挑选资料，只生效一次。刷新页面或切换聊天后取消。'); queued.setAttribute('role', 'status'); page.append(queued); }
+        const preparation = view.diagnostics?.lastPreparation;
+        if (preparation) {
+            const outcome = ({preparing:'正在准备', success:'资料已就绪', failed:'准备失败', cancelled:'准备已停止', native:'使用原生资料'})[preparation.outcome] ?? '准备记录';
+            const reasons = {'exact':'本轮选材可沿用', 'maintenance':'整理后仍可沿用本轮选材', 'no-cache':'尚无可沿用的选材', 'forced':'已指定重新挑选', 'refresh':'按设置重新挑选',
+                'turn-changed':'对话轮次已变化', 'history-changed':'参考剧情已变化', 'memory-changed':'记忆已变化', 'eligibility-changed':'可用资料已变化', 'inputs-changed':'选材条件已变化'};
+            const report = details(`最近一次准备 · ${outcome}`, 'last-preparation');
+            if (preparation.selectionReason) report.append(h('p', 'dwm-muted', reasons[preparation.selectionReason] ?? '已核对选材条件'));
+            const stages = {storeWait:'等待保存', sources:'核对来源', reconcile:'核对剧情', projection:'准备记忆', mvu:'读取协作状态', fingerprints:'核对输入', reuseCheck:'核对选材', choice:'等待选择', auxiliary:'模型选材', assembly:'组装资料', historyWindow:'历史窗口', total:'准备总计'};
+            for (const [key, label] of Object.entries(stages)) {
+                const ms = preparation.timingsMs?.[key];
+                if (Number.isFinite(ms)) report.append(h('p', 'dwm-muted', `${label}：${Math.round(ms)} ms`));
+            }
+            page.append(report);
+        }
         if (!plan) page.append(h('p', 'dwm-empty', '还没有发送记录。发一条消息后，这里会列出鱼忆这一轮挑了哪些资料。'));
         else renderPlan(page, plan, view, false);
         const preview = view.diagnostics?.lastPreview ?? localPreview;
@@ -1449,7 +1463,7 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         const source = !preview && ({ reused: '沿用上次挑选', fresh: '重新挑选' })[plan.selectionSource];
         if (source) facts.push(source);
         parent.append(h('p', 'dwm-muted', `${preview ? '试选，没有发送 · ' : ''}${facts.join(' · ')}`));
-        if (source && plan.selectionSource === 'reused') parent.append(h('p', 'dwm-muted', '同一轮重新发送，输入和资料都没有变化，沿用了上次挑选的结果，没有再调用模型挑选。挑得不合适时，可点“下次重新挑选”。'));
+        if (source && plan.selectionSource === 'reused') parent.append(h('p', 'dwm-muted', '沿用了本轮已挑选的资料，没有再调用模型挑选；资料正文仍按当前有效记忆准备。挑得不合适时，可点“下次重新挑选”。'));
         if (Number(plan.pendingCount) > 0) parent.append(h('p', 'dwm-warning', `当时有 ${plan.pendingCount} 条消息待整理，它们的原文照常发送。`));
         const mandatory = new Set(plan.mandatoryIds ?? (plan.entries ?? []).filter(e => e.constant || e.important).map(e => e.id));
         const triggered = new Set((plan.triggeredIds ?? []).filter(id => !mandatory.has(id)));
@@ -1814,7 +1828,7 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         const choice = connectionChoice ?? live;
         const running = Boolean(view.activity);
         const options = [['raw', '沿用酒馆连接'], ...(live === 'current' ? [['current', `单独接口 · ${view.connectionPersist?.pendingName ?? view.connection?.model ?? '未命名'}${view.connectionPersist?.state === 'failed' ? '（未保存）' : ''}`]] : []),
-            ...profiles.map(p => [`profile:${p.name}`, `${p.name} · ${p.model}`]), ['new', '＋ 新建单独接口…']];
+            ...profiles.map(p => [`profile:${p.name}`, `${p.name} · ${p.model}`]), ['openrouter', '＋ 新建 OpenRouter 接口…'], ['new', '＋ 新建单独接口…']];
         const picker = selectField('当前连接', choice, options, value => {
             profileNameDraft = '';
             if (value === 'raw') { connectionChoice = null; call(() => controller.updateConnection({ mode: 'raw' }), '已改为沿用酒馆连接'); return; }
@@ -1848,20 +1862,22 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         page.append(status);
         if (choice === 'raw') { page.append(h('p', 'dwm-muted', '沿用酒馆当前连接。需要独立配置时，选择“新建单独接口”。')); return; }
         const editingName = choice.startsWith('profile:') ? choice.slice(8) : '';
-        const creating = choice === 'new';
+        const creating = choice === 'new' || choice === 'openrouter';
         // Refill the form whenever the connection it shows changes, never while typing
         // or on a background refresh. The profile name tells apart two profiles
         // with the same address and model, so one's unsaved key never reaches the other.
-        const draftKey = creating ? 'new' : JSON.stringify([live, view.connection?.endpoint, view.connection?.model, view.connection?.maxOutputTokens]);
+        const draftKey = creating ? choice : JSON.stringify([live, view.connection?.endpoint, view.connection?.model, view.connection?.maxOutputTokens]);
         if (draftKey !== connectionDraftKey) {
             connectionDraftKey = draftKey;
-            Object.assign(connectionDraft, creating ? { endpoint: '', model: '', apiKey: '', maxOutputTokens: '', headers: [] }
+            Object.assign(connectionDraft, creating ? { endpoint: choice === 'openrouter' ? 'https://openrouter.ai/api/v1' : '', model: '', apiKey: '', maxOutputTokens: '', headers: [] }
                 : { endpoint: view.connection?.endpoint ?? '', model: view.connection?.model ?? '', apiKey: '', maxOutputTokens: view.connection?.maxOutputTokens ?? '',
                     headers: (view.connection?.headers ?? []).map(header => ({ name: header.name, value: '', saved: true })) });
         }
         const form = h('div', 'dwm-group dwm-form');
+        if (connectionDraft.endpoint.trim().replace(/\/$/, '') === 'https://openrouter.ai/api/v1') form.append(h('p', 'dwm-muted', '填写 OpenRouter API 密钥后获取模型列表；模型 ID 使用完整的“供应商/模型名”。获取列表不代表密钥已通过生成鉴权，保存后下一次辅助任务才会调用模型。'));
         if (creating || choice === 'current') form.append(field('配置名称', profileNameDraft, value => { profileNameDraft = value; }, { placeholder: '例如：DS 便宜档', key: 'profile-name', hint: creating ? '保存名称后可直接切换。' : '填写名称以保存为配置，留空仅应用当前连接。' }).wrap);
-        form.append(field('接口地址', connectionDraft.endpoint, value => { connectionDraft.endpoint = value; }, { placeholder: 'https://…/v1', hint: '请求路径自动追加 /chat/completions。' }).wrap,
+        const address = field('接口地址', connectionDraft.endpoint, value => { connectionDraft.endpoint = value; }, { placeholder: 'https://…/v1', hint: '请求路径自动追加 /chat/completions。' });
+        form.append(address.wrap,
             field('密钥', connectionDraft.apiKey, value => { connectionDraft.apiKey = value; }, { type: 'password', hint: !creating && view.connection?.hasApiKey ? '当前连接已配置密钥；同地址留空时沿用，更换地址需重新填写。' : '仅保存在当前浏览器。' }).wrap);
         const listed = view.modelList?.endpoint === connectionDraft.endpoint.trim().replace(/\/$/, '') ? view.modelList.models : [];
         // A saved value is kept by name; a new header without a value is reported by the backend.
@@ -1872,7 +1888,8 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         const modelPicker = selectField('选择模型', listed.includes(connectionDraft.model) ? connectionDraft.model : '',
             [['', listed.length ? `已获取 ${listed.length} 个模型，请选择` : '连接后在这里选择模型'], ...listed.map(id => [id, id])],
             value => { if (value) { connectionDraft.model = value; render(); } }, 'model-list');
-        modelPicker.input.disabled = !listed.length || busy || running;
+        const updateModelAvailability = () => { modelPicker.input.disabled = !listed.length || busy || running || view.modelList?.endpoint !== connectionDraft.endpoint.trim().replace(/\/$/, ''); };
+        address.input.addEventListener('input', updateModelAvailability); updateModelAvailability();
         form.append(modelPicker.wrap);
         const model = field('模型 ID（也可手动填写）', connectionDraft.model, value => { connectionDraft.model = value; },
             { key: 'model-name', hint: '下拉选择后自动填入；接口不提供列表或模型未列出时，可直接手动填写。选好后保存才生效。' });

@@ -2,7 +2,7 @@ import { resolveHeaders, headerIdentity } from '../agents/connection-headers.js'
 import { entryChangeIssue, selectedEntries, entryUndoState, activeRemovals, entryChangePlan, completeEntryProposal, entryChangeWire, canDeleteEntry, canChangeEntry } from '../core/entry-changes.js';
 import { registerDiagnosticSecrets, redactDiagnosticSecrets } from '../diagnostics/secrets.js';
 import { normalizeUsageSettings, updateUsageSettings, ECONOMY_BUNDLE } from '../core/usage-settings.js';
-import { SelectionReuse, selectionReuseKey, selectionFrame } from './selection-reuse.js';
+import { SelectionReuse, selectionReuseKeys } from './selection-reuse.js';
 import { maintenanceSchedule, maintenanceBatches } from './maintenance-policy.js';
 import { LazyAutomation } from './lazy-mode.js';
 import { savedCapacityPercent } from '../core/storage-codec.js';
@@ -10,7 +10,7 @@ import { assertSourceCapacity } from '../core/capacity.js';
 import { classificationPieces, joinClassifications } from '../agents/classification-pieces.js';
 import { exportMemoryWorldbook, parseSupplementaryMemory } from '../core/transfer.js';
 import { applicationSnapshot, APPLICATION_SCAN, validateApplicationSelection, validateApplicationPositions, selectedApplicationEntries, applyPresetApplication } from '../agents/preset-application.js';
-import { throwIfAborted, combineSignals } from '../platform/abort.js';
+import { throwIfAborted, combineSignals, timeoutSignal } from '../platform/abort.js';
 import { sourceBookChanges, nativeSwitchOverlay, sourceMatches } from '../core/source-book.js';
 import { presetSnapshot, PREFERENCE_SCAN, validatePreferenceCandidates, selectedPreferences, applyAuxiliaryPreferences } from '../agents/preset-preferences.js';
 import { MemoryStore } from '../core/store.js';
@@ -32,6 +32,16 @@ import { selectionMessages, requestBatches, INITIALIZATION_BATCH_ITEMS, isReadab
 import { assemblePromptPlan, previewNarration } from './prompt-plan.js';
 
 export const batches = requestBatches;
+
+const preparationNow = () => globalThis.performance?.now?.() ?? Date.now();
+function preparationTime(preparation, stage, start) {
+    if (preparation) preparation.timingsMs[stage] = (preparation.timingsMs[stage] ?? 0) + Math.max(0, preparationNow() - start);
+}
+async function timePreparation(preparation, stage, operation) {
+    const start = preparationNow();
+    try { return await operation(); }
+    finally { preparationTime(preparation, stage, start); }
+}
 
 async function initializationFingerprint(value) {
     return sha256Fingerprint(JSON.stringify(value));
@@ -114,6 +124,8 @@ export class Controller {
     // The main book as last read; its live switches steer selection (see nativeSwitchOverlay).
     #extraBooks = {};
     #nativeRaw = null;
+    #sourceInput = '';
+    #sourceCheck = null;
     #storyRevision = 0;
     #maintenancePrefix = null;
     #storyDirty = false;
@@ -129,7 +141,7 @@ export class Controller {
         this.rules = { naturalLanguage: '', script: '', configEntryUids: [] };
         this.compiledRules = compileRules(''); this.constraints = {};
         this.connectionMode = model ? 'test' : 'raw';
-        this.diagnostics = { lastPlan: null, lastPreview: null, requests: [] };
+        this.diagnostics = { lastPlan: null, lastPreview: null, lastPreparation: null, requests: [] };
         this.mvu = { enabled: false, available: false, status: 'disabled', fields: [], reason: '未启用只读协作' };
         this.client = model ? this.#instrument(model) : this.#client(request => host.rawGenerate(request));
         // The player chose to keep the separate connection (key included) in
@@ -163,7 +175,8 @@ export class Controller {
     }
     #applyConnection(mode, { endpoint, model, apiKey = '', maxOutputTokens, headers = [] } = {}) {
         const config = { headers: resolveHeaders(headers), endpoint: String(endpoint ?? '').trim().replace(/\/$/, ''), model: String(model ?? '').trim(), apiKey: String(apiKey ?? ''), maxOutputTokens: maxOutputTokens === '' || maxOutputTokens == null ? undefined : Number(maxOutputTokens) };
-        registerDiagnosticSecrets(config.headers.map(item => item.value));
+        invariant(['raw', 'tavern'].includes(mode) || config.model, '请先选择或填写辅助模型 ID');
+        registerDiagnosticSecrets([config.apiKey, ...config.headers.map(item => item.value)]);
         const client = this.#client(['raw', 'tavern'].includes(mode) ? request => this.host.rawGenerate(request) : compatibleConnection(config));
         this.#connectionConfig = ['raw', 'tavern'].includes(mode) ? null : config;
         this.connectionMode = mode; this.client = client;
@@ -359,11 +372,11 @@ export class Controller {
         try {
             // Keep already requested model work. Background commits wait for
             // this immutable selection snapshot, while the send stays prompt.
-            await untilAborted(this.store?.idle() ?? Promise.resolve(), activity?.signal ?? this.#abort.signal);
+            await timePreparation(activity?.preparation, 'storeWait', () => untilAborted(this.store?.idle() ?? Promise.resolve(), activity?.signal ?? this.#abort.signal));
             this.#assertCurrent(lease.epoch, chatId);
             if (activity) {
                 this.#assertActivity(activity);
-                this.#updateActivity(activity, { label: activity.kind === 'preview' ? '正在试选本轮资料' : '前置正在选择本轮资料',
+                this.#updateActivity(activity, { label: activity.kind === 'preview' ? '正在试选本轮资料' : '前置正在准备本轮资料',
                     hint: activity.kind === 'select' ? '停止将结束本轮发送；已有记忆保留。' : this.#backgroundHint() });
             }
             return await untilAborted(task(), activity?.signal ?? this.#abort.signal);
@@ -1049,8 +1062,8 @@ export class Controller {
         this.#epoch++; this.#streamTask = null; this.scanStages = null; this.sourceSync = null; this.#extraBooks = {}; this.store = null; this.#maintenance = null; this.#initializing = false;
         this.#autoPostPaused = false;
         this.#pausedPostKeys.clear();
-        this.#selectionReuse.clear(); this.#storyTask = null;
-        this.diagnostics = { lastPlan: null, lastPreview: null, requests: [] }; this.#compactMarks.clear(); this.#compactAttempts.clear();
+        this.#selectionReuse.clear(); this.#sourceCheck = null; this.#sourceInput = ''; this.#storyTask = null;
+        this.diagnostics = { lastPlan: null, lastPreview: null, lastPreparation: null, requests: [] }; this.#compactMarks.clear(); this.#compactAttempts.clear();
         this.mvu = { enabled: this.settings.mvuEnabled, available: false, status: 'unchecked', fields: [], reason: '尚未读取当前聊天' };
         if (this.host.restoreLegacyWindow) await this.host.restoreLegacyWindow();
         await this.#restoreWindow();
@@ -1097,15 +1110,23 @@ export class Controller {
         const raw = await untilAborted(this.host.loadWorldbook(), signal);
         this.#assertCurrent(epoch, chatId);
         throwIfAborted(signal);
-        this.rules = discoverRules(raw);
-        this.compiledRules = compileRules(this.rules.script);
+        const rules = discoverRules(raw);
+        if (rules.script !== this.rules.script) this.compiledRules = compileRules(rules.script);
+        this.rules = rules;
         const sources = [...Object.values(this.store?.state?.base.entries ?? {}), ...Object.values(this.store?.state?.data.entries ?? {})];
         const names = [...new Set(sources.map(e => e.source?.book).filter(book => book && book !== this.store.state.bookName))];
         const external = await Promise.all(names.map(async book => {
             try { return [book, await untilAborted(this.host.loadWorldbook(book), signal)]; } catch { throwIfAborted(signal); return [book, null]; }
         }));
         this.#assertCurrent(epoch, chatId); this.#extraBooks = Object.fromEntries(external);
-        this.sourceChanges = sourceBookChanges(this.store?.state, raw, this.rules.configEntryUids, this.#extraBooks);
+        this.#sourceInput = JSON.stringify([raw, this.#extraBooks]);
+        const save = this.store?.state;
+        // Compare every live input; object identity/revision alone misses card edits.
+        const key = JSON.stringify([this.#sourceInput, save?.initialized, save?.bookName, this.rules.configEntryUids,
+            Object.values(save?.base.entries ?? {}).filter(e=>e.source).map(e=>e.source),
+            Object.values(save?.data.entries ?? {}).filter(e=>e.source).map(({id,source,title,tier,status,scanBlocked})=>({id,source,title,tier,status,scanBlocked})), save?.sourceHeld]);
+        if (this.#sourceCheck?.key !== key) this.#sourceCheck = {key, changes:sourceBookChanges(save, raw, this.rules.configEntryUids, this.#extraBooks)};
+        this.sourceChanges = clone(this.#sourceCheck.changes);
         this.#nativeRaw = raw;
         this.sourceChanges = this.#sourceChangesView();
         return raw;
@@ -1160,11 +1181,17 @@ export class Controller {
         invariant(normalized, '请先填写接口基础地址');
         const key = apiKey || (normalized === this.#connectionConfig?.endpoint ? this.#connectionConfig.apiKey : '');
         const resolved = resolveHeaders(headers, normalized === this.#connectionConfig?.endpoint ? this.#connectionConfig.headers : []);
-        registerDiagnosticSecrets(resolved.map(item => item.value));
-        const models = await listModels({ endpoint: normalized, apiKey: key, headers: resolved });
-        this.#modelList = { endpoint: normalized, models };
-        this.#notify();
-        return { executed: true, message: `已获取 ${models.length} 个模型，可在“选择模型”下拉框里挑选` };
+        registerDiagnosticSecrets([key, ...resolved.map(item => item.value)]);
+        const deadline = timeoutSignal(15000);
+        try {
+            const models = await untilAborted(listModels({ endpoint: normalized, apiKey: key, headers: resolved, signal: deadline.signal }), deadline.signal);
+            this.#modelList = { endpoint: normalized, models };
+            this.#notify();
+            return { executed: true, message: `已获取 ${models.length} 个模型，可在“选择模型”下拉框里挑选` };
+        } catch (error) {
+            if (deadline.signal?.aborted) throw new Error('获取模型列表已超过 15 秒，本次已停止。请检查连接后重试，或手动填写模型 ID。');
+            throw error;
+        } finally { deadline.dispose(); }
     }
     async updateConnection({ mode = 'raw', endpoint, model, apiKey, maxOutputTokens, headers }) {
         invariant(!this.view().activity, '请先停止或等待当前任务完成，再应用连接；当前任务继续运行。');
@@ -1938,7 +1965,7 @@ export class Controller {
     }
     #recordPlan(plan, mode) {
         const record = { requestId: plan.requestId, at: new Date().toISOString(), mode,
-            ...(plan.selectionSource ? {selectionSource:plan.selectionSource} : {}), selectedIds: clone(plan.selectedIds), mandatoryIds: clone(plan.mandatoryIds ?? []), triggeredIds: clone(plan.triggeredIds ?? []), gatedIds: clone(plan.gatedIds ?? []), summary: plan.summary, inventory: plan.inventory, details: plan.details,
+            ...(plan.selectionSource ? {selectionSource:plan.selectionSource, selectionReason:plan.selectionReason, preparationSource:plan.preparationSource} : {}), selectedIds: clone(plan.selectedIds), mandatoryIds: clone(plan.mandatoryIds ?? []), triggeredIds: clone(plan.triggeredIds ?? []), gatedIds: clone(plan.gatedIds ?? []), summary: plan.summary, inventory: plan.inventory, details: plan.details,
             entries: plan.entries.filter(e => plan.selectedIds.includes(e.id)).map(e => ({ id: e.id, title: e.title, kind: e.kind,
                 constant: e.constant, important: e.important, version: e.version, contentChars: entryText(e).length })),
             mvu: clone(plan.mvu),
@@ -1953,9 +1980,13 @@ export class Controller {
         plan.observedIds = clone(observedIds); plan.status = status; this.#notify();
     }
     async #buildPlan(activity, { readSnapshot = () => this.host.snapshot(), project = false, reuseSelection = false, generationType = 'normal', reroll } = {}) {
+        const preparation = activity.preparation;
+        let start = preparationNow();
         invariant(this.store?.state.initialized, '请先完成初始化');
         this.#assertActivity(activity);
         invariant(!this.sourceChanges.changed, this.sourceChanges.rebound ? '主世界书已更换，本轮可以按原世界书发送。请先导出本聊天备份，再在“设置 → 高级”中重新扫描整个存档。' : '原书已变化：请先在“资料”页同步变化的条目，或选择本轮按原世界书发送。');
+        const sourceInput = this.#sourceInput;
+        const settingsSignature = JSON.stringify(this.settings);
         const snapshot = readSnapshot(), stored = nativeSwitchOverlay(project ? this.store.project(snapshot.messages.map(m => m.key)) : this.store.snapshot(), this.#nativeRaw, this.#extraBooks);
         const rules = entry => evaluateRules(this.compiledRules, entry), readable = snapshot.messages.filter(isReadableMessage);
         // Gated entries never reach the catalog, so selection spends no slot on
@@ -1964,14 +1995,17 @@ export class Controller {
         const scopes = readableScopes(save.data.scopeContext);
         const eligible = entry => scopes.has(entryScope(entry)) && (this.host.eligible ? this.host.eligible(entry, snapshot) : entry.enabled);
         const recent = selectionMessages(snapshot, save, this.settings.selectionRecentTurns);
-        const projection = this.settings.mvuEnabled ? await untilAborted(this.refreshMvu(), activity.signal) : null;
+        preparationTime(preparation, 'projection', start);
+        const projection = this.settings.mvuEnabled ? await timePreparation(preparation, 'mvu', () => untilAborted(this.refreshMvu(), activity.signal)) : null;
         this.#assertActivity(activity);
+        if (settingsSignature !== JSON.stringify(this.settings)) return this.#buildPlan(activity, {readSnapshot, project, reuseSelection, generationType, reroll});
         const observedState = this.#observedState(projection, snapshot, recent);
         const forced = triggeredIds(save, readable, snapshot.userInput, { eligible, rules });
         const selectable = entry => eligible(entry) && !gated.has(entry.id);
         const forceSerial = this.#selectionReuse.serial;
+        start = preparationNow();
         const reuseMaterial = {
-            type: ['normal','regenerate','swipe'].includes(generationType) ? 'reply' : generationType,
+            saveId: save.id, type: ['normal','regenerate','swipe'].includes(generationType) ? 'reply' : generationType,
             memoryMode: this.settings.memoryMode, rules: this.rules, raw: this.#nativeRaw, external: this.#extraBooks,
             forced, observedState,
             selectionLimit: this.settings.selectionLimit, selectionChars: this.settings.selectionChars,
@@ -1982,39 +2016,70 @@ export class Controller {
             selectionRecentTurns:this.settings.selectionRecentTurns,
         };
         const allowed = new Set(Object.values(save.data.entries).filter(selectable).map(e=>e.id));
-        const reuseKey = reuseSelection ? await selectionReuseKey(snapshot,recent,{...reuseMaterial,data:save.data,eligibleIds:[...allowed]}) : null;
+        const keys = reuseSelection ? await selectionReuseKeys(snapshot,recent,reuseMaterial,save.data,[...allowed]) : null;
+        const reuseKey = keys?.key ?? null;
         const reuseContext = reuseSelection ? {
-            stableKey:await selectionReuseKey(snapshot,[],reuseMaterial),memory:stored.data,journal:stored.journal,eligibleIds:[...allowed],
-            frame:selectionFrame(snapshot,[...snapshot.messages,...(snapshot.userInput?[{key:'current-input',role:'user',content:snapshot.userInput}]:[])]),
-            readMessages:selectionFrame(snapshot,recent).messages,
+            ...keys,memory:stored.data,journal:stored.journal,eligibleIds:[...allowed],inventoryDisabledAt:save.inventoryDisabledAt,
         } : null;
+        preparationTime(preparation, 'fingerprints', start);
         this.#assertActivity(activity);
         const mode = this.settings.rerollSelection;
         const mayReuse = reuseSelection && mode !== 'refresh' && !this.#selectionReuse.forced && reroll?.choice !== 'refresh';
-        const cached = mayReuse ? this.#selectionReuse.resolve(reuseKey, reuseContext, allowed) : null;
+        start = preparationNow();
+        const decision = mayReuse ? this.#selectionReuse.resolve(reuseKey, reuseContext, allowed)
+            : {reason: !reuseSelection ? 'preview' : this.#selectionReuse.forced ? 'forced' : 'refresh'};
+        const cached = decision.ids ? decision : null;
+        preparationTime(preparation, 'reuseCheck', start);
+        if (preparation) Object.assign(preparation, {selectionSource:cached ? 'reused' : 'fresh', selectionReason:decision.reason});
         if (cached && mode === 'ask' && !this.settings.lazyMode && reroll?.player && !reroll.choice &&
             this.#rerollPresenter && ['regenerate','swipe'].includes(generationType)) {
             const entries = cached.ids.map(id => ({id, title:save.data.entries[id].title}));
-            reroll.choice = await this.#chooseReroll(activity, generationType, entries);
+            reroll.choice = await timePreparation(preparation, 'choice', () => this.#chooseReroll(activity, generationType, entries));
             this.#assertActivity(activity);
             if (!this.#enabled()) return null;
             // A human can leave the dialog open while settings, eligibility or
             // story input changes. Recheck the ordinary cache and rules once.
-            await this.#loadRules(activity.epoch, activity.chatId, activity.signal);
+            await timePreparation(preparation, 'sources', () => this.#loadRules(activity.epoch, activity.chatId, activity.signal));
             return this.#buildPlan(activity, {readSnapshot, project, reuseSelection, generationType, reroll});
         }
-        const picked = cached?.ids ?? await select(this.client, this.#taskView(save), recent, { eligible: selectable, selectionLimit: this.settings.selectionLimit,
-            selectionChars: this.settings.selectionChars, observedState, forced, authorGuidance: this.rules.naturalLanguage, messageCount: snapshot.messages.length, signal: activity.signal });
+        this.#updateActivity(activity, {label: cached ? '正在沿用本轮资料' : '前置正在选择本轮资料'});
+        const picked = cached?.ids ?? await timePreparation(preparation, 'auxiliary', () => select(this.client, this.#taskView(save), recent, { eligible: selectable, selectionLimit: this.settings.selectionLimit,
+            selectionChars: this.settings.selectionChars, observedState, forced, authorGuidance: this.rules.naturalLanguage, messageCount: snapshot.messages.length, signal: activity.signal }));
         const ids = [...new Set([...forced, ...picked])];
         this.#assertActivity(activity);
-        await this.#assertSourceCurrent(activity);
+        await timePreparation(preparation, 'sources', () => this.#assertSourceCurrent(activity));
+        invariant(sourceInput === this.#sourceInput, '选材期间来源或规则变化，请重试本轮');
+        if (!this.#enabled()) return null;
+        const nativeConnection = await this.host.selectionContextSignature?.({includeConnection:['raw','tavern','test'].includes(this.connectionMode)});
+        this.#assertActivity(activity);
+        if (!this.#enabled()) return null;
         invariant(save.revision === this.store.state.revision, '选材期间资料更新，请重试本轮');
+        invariant(settingsSignature === JSON.stringify(this.settings) && forceSerial === this.#selectionReuse.serial
+            && reuseMaterial.connection === this.#connectionToken
+            && JSON.stringify([reuseMaterial.preferences,reuseMaterial.application,reuseMaterial.regex]) === JSON.stringify([this.#auxiliaryPreferences(),this.#applicationEntries(),this.host.promptRegexSignature?.()])
+            && reuseMaterial.nativeConnection === nativeConnection, '选材期间设置或连接变化，请重试本轮');
         // The plan itself carries the live switches too, so injection agrees with selection.
-        invariant(JSON.stringify(snapshot.messages.map(m => m.key)) === JSON.stringify(readSnapshot().messages.map(m => m.key)), '选材期间剧情候选已变化，请重试本轮');
+        const latest = readSnapshot();
+        invariant(JSON.stringify(snapshot.messages) === JSON.stringify(latest.messages) && snapshot.userInput === latest.userInput, '选材期间剧情候选已变化或输入被修改，请重试本轮');
+        // Window updates may await the host; validate the accepted inputs again before publishing.
+        const inputIdentity = at => JSON.stringify([at.messages.map(({key,role,content})=>({key,role,content})),at.userInput]);
+        const acceptedInput = inputIdentity(snapshot);
+        activity.assertPreparedPlan = () => {
+            this.#assertActivity(activity);
+            invariant(save.revision === this.store.state.revision, '选材期间资料更新，请重试本轮');
+            invariant(settingsSignature === JSON.stringify(this.settings) && forceSerial === this.#selectionReuse.serial
+                && reuseMaterial.connection === this.#connectionToken, '选材期间设置或连接变化，请重试本轮');
+            invariant(acceptedInput === inputIdentity(readSnapshot()), '选材期间剧情候选已变化或输入被修改，请重试本轮');
+        };
+        start = preparationNow();
+        // Copy entries separately: one large structured-clone traversal is slower on large books.
+        const payload = cached?.payload ? {...clone({...cached.payload, entries:[]}), entries:cached.payload.entries.map(entry=>clone(entry))}
+            : assemblePromptPlan(this.#taskView(save), ids, { eligible: selectable, compiledRules: this.compiledRules, configEntryUids: this.rules.configEntryUids });
         const plan = { requestId: uid('request'), chatId: snapshot.chatId, mvu: observedState, triggeredIds: forced, gatedIds: [...gated],
-            ...(reuseSelection ? {selectionSource:cached===null?'fresh':'reused'} : {}),
-            ...assemblePromptPlan(this.#taskView(save), ids, { eligible: selectable, compiledRules: this.compiledRules, configEntryUids: this.rules.configEntryUids }) };
-        if (reuseSelection) this.#selectionReuse.stage(plan, reuseKey, picked, forceSerial, {...reuseContext,readMessages:cached?.readMessages??reuseContext.readMessages});
+            ...(reuseSelection ? {selectionSource:cached===null?'fresh':'reused', selectionReason:decision.reason, preparationSource:cached?.payload?'reused':'assembled'} : {}), ...payload };
+        preparationTime(preparation, 'assembly', start);
+        if (preparation) Object.assign(preparation, {requestId:plan.requestId, preparationSource:plan.preparationSource});
+        if (reuseSelection) this.#selectionReuse.stage(plan, reuseKey, picked, forceSerial, {...reuseContext,payload:cached?.payload??payload,readMessages:cached?.readMessages??reuseContext.readMessages});
         return plan;
     }
 
@@ -2026,8 +2091,20 @@ export class Controller {
         // which changes the source baseline uses native sending until it ends.
         return [...this.#activities.values()].some(activity=>!['maintain','compact','inventory','select'].includes(activity.kind));
     }
-    generationBefore(input = {}) {
-        return this.#generationBefore(input, {player:input.playerReroll === true && !input.options?.automatic_trigger});
+    async generationBefore(input = {}) {
+        if (input.dryRun || input.isCurrent?.() === false || ['quiet', 'impersonate'].includes(input.type)) return;
+        const preparation = {id:uid('preparation'), chatId:this.host.snapshot().chatId, at:new Date().toISOString(), outcome:'preparing', timingsMs:{}};
+        this.diagnostics.lastPreparation = preparation;
+        const start = preparationNow();
+        try {
+            const result = await this.#generationBefore(input, {player:input.playerReroll === true && !input.options?.automatic_trigger, preparation});
+            if (preparation.outcome === 'preparing') preparation.outcome = result?.cancel || input.signal?.aborted || input.isCurrent?.() === false ? 'cancelled' : this.#nativeBypass ? 'native' : 'success';
+            return result;
+        } catch (error) { preparation.outcome = 'failed'; throw error; }
+        finally {
+            preparationTime(preparation, 'total', start);
+            if (this.diagnostics.lastPreparation === preparation && this.host.snapshot().chatId === preparation.chatId) this.#notify();
+        }
     }
     async #generationBefore({ type, dryRun, isCurrent = () => true, signal }, reroll) {
         if (dryRun || !isCurrent() || ['quiet', 'impersonate'].includes(type)) return;
@@ -2046,20 +2123,21 @@ export class Controller {
         if (!this.#enabled() || !this.store?.state.initialized || this.#lazyNeedsNativeFallback()) { this.#nativeBypass = true; await this.#restoreWindow(); return; }
         const epoch = this.#epoch, chatId = this.host.snapshot().chatId;
         const activity = this.#beginActivity('select', '前置正在读取记忆规则', { isCurrent, signal });
+        activity.preparation = reroll.preparation;
         activity.storyKeys=this.host.snapshot().messages.map(message=>message.key);
         try {
             await this.#withSelection(async () => {
                 if (!isCurrent()) return;
-                await this.#loadRules(epoch, chatId, activity.signal);
+                await timePreparation(activity.preparation, 'sources', () => this.#loadRules(epoch, chatId, activity.signal));
                 if (!isCurrent()) return;
                 const replacing = Boolean(this.host.pendingReplacement?.());
                 const readSnapshot = () => this.host.generationSnapshot?.({ type }) ?? this.host.snapshot();
-                if (!replacing) await this.#saveActivity(activity, () => this.store.reconcile(this.host.snapshot().messages.map(m => m.key)));
+                if (!replacing) await timePreparation(activity.preparation, 'reconcile', () => this.#saveActivity(activity, () => this.store.reconcile(this.host.snapshot().messages.map(m => m.key))));
                 if (!isCurrent()) return;
                 const plan = await this.#buildPlan(activity, { readSnapshot, project: replacing, reuseSelection: true, generationType: type, reroll });
                 if (!isCurrent()) return;
                 if (!plan || !this.#enabled()) { this.#nativeBypass = true; await this.#restoreWindow(); return; }
-                {
+                await timePreparation(activity.preparation, 'historyWindow', async () => {
                     const snapshot = readSnapshot(), projected = this.store.project(snapshot.messages.map(m => m.key));
                     const remembered = new Set(projected.rememberedKeys ?? []);
                     // A rolled-back batch may also contain older valid text.
@@ -2071,23 +2149,33 @@ export class Controller {
                     });
                     if (actions.length) await this.#saveActivity(activity, () => this.host.applyWindow(actions));
                     this.#assertActivity(activity);
-                }
+                });
+                if (!this.#enabled()) { this.#nativeBypass = true; await this.#restoreWindow(); return; }
+                activity.assertPreparedPlan();
                 this.host.setPlan(plan); this.#selectionReuse.commit(plan); this.#recordPlan(plan, 'send');
+                if (activity.preparation) activity.preparation.outcome = 'success';
                 // A successful retry must not keep displaying the previous
                 // selection failure while the native request is ready to run.
                 this.#state('本轮资料已就绪');
             }, activity);
         } catch (error) {
-            if (activity.signal.aborted || !isCurrent() || epoch !== this.#epoch || this.host.snapshot().chatId !== chatId) return { cancel: true };
+            if (activity.signal.aborted || !isCurrent() || epoch !== this.#epoch || this.host.snapshot().chatId !== chatId) {
+                if (activity.preparation) activity.preparation.outcome = 'cancelled';
+                return { cancel: true };
+            }
+            if (activity.preparation) activity.preparation.outcome = 'failed';
             this.host.clearPlan(); this.#state('前置选材失败', error);
             this.#updateActivity(activity, { label: '选材未完成，等待你的处理', hint: '可重新选材、按原世界书发送，或停止本轮。' });
             const choice = await untilAborted(this.settings.lazyMode ? Promise.resolve('original') : this.chooseFallback(error, { signal: activity.signal }), activity.signal).catch(error => {
                 if (activity.signal.aborted) return 'cancel';
                 throw error;
             });
-            if (activity.signal.aborted || !isCurrent() || epoch !== this.#epoch || this.host.snapshot().chatId !== chatId) return { cancel: true };
-            if (choice === 'retry') return this.#generationBefore({ type, dryRun, isCurrent, signal }, reroll);
-            if (choice === 'original') { this.#nativeBypass = true; await this.#restoreWindow(); return; }
+            if (activity.signal.aborted || !isCurrent() || epoch !== this.#epoch || this.host.snapshot().chatId !== chatId) {
+                if (activity.preparation) activity.preparation.outcome = 'cancelled';
+                return { cancel: true };
+            }
+            if (choice === 'retry') { if (activity.preparation) activity.preparation.outcome = 'preparing'; return this.#generationBefore({ type, dryRun, isCurrent, signal }, reroll); }
+            if (choice === 'original') { if (activity.preparation) activity.preparation.outcome = 'native'; this.#nativeBypass = true; await this.#restoreWindow(); return; }
             await this.host.stopGeneration?.();
             return { cancel: true };
         } finally { this.#endActivity(activity); }
@@ -2164,7 +2252,12 @@ export class Controller {
                 .finally(()=>{if(this.#storyTask===work)this.#storyTask=null;});
         }
     }
-    messageSwiped() { this.#selectionReuse.invalidate(); this.#storyChanged(); }
+    messageSwiped({index} = {}) {
+        const snapshot = this.host.snapshot();
+        const sameTurn = Number.isInteger(index) && index === snapshot.messages.length - 1 && snapshot.messages[index]?.role === 'assistant'
+            && this.#selectionReuse.sameTurn({...snapshot,messages:snapshot.messages.slice(0,index),userInput:''});
+        this.#selectionReuse.invalidate(sameTurn); this.#storyChanged();
+    }
     messageDeleted() { this.#selectionReuse.invalidate(); this.#storyChanged(); }
     messageSwipeDeleted() { this.#selectionReuse.invalidate(); this.#storyChanged(); }
     /** Bring changed source entries into this save without a full rescan.

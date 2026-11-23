@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { Controller } from '../src/runtime/controller.js';
 import { mountPanel } from '../src/ui/panel.js';
 import { DEFAULT_SETTINGS } from '../src/core/state.js';
+import { createTraceStore } from '../src/diagnostics/trace-store.js';
 
 const host = () => ({ snapshot: () => ({ chatId: null, messages: [] }), rawGenerate: async () => '{}' });
 const memoryStore = () => {
@@ -107,6 +108,36 @@ class Node {
 const walk = node => [node, ...node.children.flatMap(walk)];
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
+test('an incomplete connection cannot replace the working saved connection', async () => {
+    const store = memoryStore(), c = new Controller(host(), {connectionStore:store});
+    await c.updateConnection({mode:'compatible',endpoint:'https://aux.example/v1',model:'working',apiKey:'saved-key'});
+    const saved = structuredClone(store.data.current);
+    await assert.rejects(c.updateConnection({mode:'compatible',endpoint:'https://openrouter.ai/api/v1',model:'   ',apiKey:'draft-key'}), /模型/);
+    assert.deepEqual(store.data.current, saved);
+    assert.equal(c.view().connection.model, 'working');
+});
+
+test('OpenRouter profiles persist without exposing keys in views or echoed diagnostics', async t => {
+    const store = memoryStore(), c = new Controller(host(), { connectionStore: store });
+    const apiKey = 'sk-or-v1-synthetic-profile-secret', endpoint = 'https://openrouter.ai/api/v1';
+    await c.updateConnection({mode:'compatible', endpoint, model:'vendor/test-model', apiKey});
+    await c.saveConnectionProfile('OpenRouter test');
+    const restored = new Controller(host(), { connectionStore: store });
+    assert.equal(restored.view().connection.endpoint, endpoint);
+    assert.equal(restored.view().connectionProfiles[0].active, true);
+    const originalFetch = globalThis.fetch; t.after(() => { globalThis.fetch = originalFetch; });
+    const sent = [];
+    globalThis.fetch = async (url, init) => { sent.push([url, init.headers.Authorization]); return new Response('{"data":[{"id":"vendor/test-model"}]}'); };
+    await restored.fetchModels({endpoint, apiKey:''});
+    assert.deepEqual(sent, [[endpoint + '/models', `Bearer ${apiKey}`]]);
+    const draftKey = 'sk-or-v1-synthetic-unsaved-secret';
+    await restored.fetchModels({endpoint, apiKey:draftKey});
+    const trace = createTraceStore();
+    const id = trace.start({responseRaw:`provider echoed ${apiKey} and ${draftKey}`}); trace.finish(id);
+    assert.doesNotMatch(JSON.stringify([restored.view(), restored.connectionDiagnostics(), trace.exportData()]), /sk-or-v1-synthetic/);
+    assert.match(trace.snapshot().records[0].responseRaw, /REDACTED/);
+});
+
 test('FM-025: the connection picker switches profiles and saves a new one by name', async t => {
     const doc = { createElement(tag) { return new Node(tag, this); }, defaultView: {} };
     const root = new Node('main', doc), used = [], saved = [], applied = [];
@@ -126,7 +157,7 @@ test('FM-025: the connection picker switches profiles and saves a new one by nam
     const picker = () => find(node => node.dataset.focus === 'connection-choice');
     button('设置').click(); button('辅助模型').click();
     assert.equal(picker().value, 'profile:便宜档', 'the live profile is the current choice');
-    assert.deepEqual(picker().children.map(option => option.value), ['raw', 'profile:便宜档', 'profile:聪明档', 'new']);
+    assert.deepEqual(picker().children.map(option => option.value), ['raw', 'profile:便宜档', 'profile:聪明档', 'openrouter', 'new']);
     assert.ok(button('删除这套'), 'the live profile can be edited or deleted');
     picker().value = 'profile:聪明档'; picker().dispatch('change'); await tick();
     assert.deepEqual(used, ['聪明档']);

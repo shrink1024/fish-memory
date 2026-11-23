@@ -5,7 +5,8 @@ import { Controller } from '../src/runtime/controller.js';
 const gate = () => { let resolve; const promise = new Promise(yes => { resolve = yes; }); return { promise, resolve }; };
 const tick = () => new Promise(resolve => setImmediate(resolve));
 async function until(predicate) {
-    for (let count = 0; count < 30; count++) { if (predicate()) return; await tick(); }
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline) { if (predicate()) return; await new Promise(resolve => setTimeout(resolve, 1)); }
     assert.fail('Task did not reach expected phase');
 }
 const message = (key, role = 'assistant') => ({ key, role, content: `正文-${key}`, hidden: false, hiddenBy: null });
@@ -126,6 +127,7 @@ test('preflight wait and selection are observable; stop ends this native generat
     const selectedId = f.controller.view().activity.id;
     await f.controller.requestStop(selectedId);
     assert.deepEqual(await selecting, { cancel: true });
+    assert.equal(f.controller.diagnostics.lastPreparation.outcome, 'cancelled');
     assert.equal(f.stops, 1);
     assert.deepEqual(await f.controller.requestStop(selectedId), { stopped: false, reason: '该任务已结束' });
     assert.equal(f.calls.some(call => call.purpose === 'select'), false);
@@ -147,7 +149,17 @@ test('stale foreground activity cannot stop a new generation or replace its acti
     oldResponse.resolve({ ids: [] }); await tick();
     assert.equal(f.controller.view().activity.id, currentId);
     newResponse.resolve({ ids: [] }); await current;
+    assert.equal(f.controller.diagnostics.lastPreparation.outcome, 'success');
     assert.equal(f.plans.filter(Boolean).length, 1); assert.equal(f.controller.view().activity, null);
+});
+
+test('reused preparation is labelled without claiming a new selector call', async () => {
+    const f = await ready(); await f.controller.generationBefore();
+    const labels = []; const off = f.controller.subscribe(view => { if(view.activity) labels.push(view.activity.label); });
+    await f.controller.generationBefore(); off();
+    assert.ok(labels.includes('前置正在准备本轮资料'));
+    assert.ok(labels.includes('正在沿用本轮资料'));
+    assert.ok(!labels.includes('前置正在选择本轮资料'));
 });
 
 test('stopped paid trial selection never injects and cannot clear a later trial', async () => {

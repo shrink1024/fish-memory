@@ -65,6 +65,21 @@ class Node {
 const walk = node => [node, ...node.children.flatMap(walk)];
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
+test('a stalled model-list request times out without publishing its late result', async t => {
+    const deadline = new AbortController(), originalTimeout = AbortSignal.timeout, originalFetch = globalThis.fetch;
+    t.after(() => { AbortSignal.timeout = originalTimeout; globalThis.fetch = originalFetch; });
+    AbortSignal.timeout = ms => { assert.equal(ms,15000); return deadline.signal; };
+    let release, sentSignal;
+    globalThis.fetch = (_url, options) => { sentSignal=options.signal; return new Promise(resolve=>{release=resolve;}); };
+    const c = new Controller({snapshot:()=>({chatId:null,messages:[]}),rawGenerate:async()=>'{}'});
+    const pending = c.fetchModels({endpoint:'https://openrouter.ai/api/v1'});
+    const rejected = assert.rejects(pending, /15 秒.*手动填写/);
+    assert.equal(sentSignal,deadline.signal);
+    deadline.abort(new DOMException('expired','TimeoutError')); await rejected;
+    release(new Response('{"data":[{"id":"late/model"}]}')); await tick();
+    assert.equal(c.view().modelList,null);
+});
+
 test('the connection card fetches models and fills the model name from the list', async t => {
     const doc = { createElement(tag) { return new Node(tag, this); }, defaultView: {} };
     const root = new Node('main', doc), listeners = new Set(), requests = [];
@@ -88,4 +103,37 @@ test('the connection card fetches models and fills the model name from the list'
     list.value = 'beta'; list.dispatch('change');
     const label = find(node => node.tagName === 'LABEL' && node.textContent.startsWith('模型 ID'));
     assert.equal(label.children.find(node => node.tagName === 'INPUT').value, 'beta');
+    const address = find(node => node.dataset.focus === '接口地址');
+    address.value = 'https://other.example/v1'; address.dispatch('input');
+    assert.equal(find(node => node.dataset.focus === 'model-list').disabled, true, 'a changed endpoint cannot offer the old provider model list');
+});
+
+test('OpenRouter preset starts clean, fetches model IDs and saves through the compatible connection', async t => {
+    const doc = { createElement(tag) { return new Node(tag, this); }, defaultView: {} };
+    const root = new Node('main', doc), fetched = [], applied = [], saved = [];
+    const endpoint = 'https://openrouter.ai/api/v1';
+    const view = { chatId:'c', enabled:true, status:'', settings:{...DEFAULT_SETTINGS}, save:{id:'s',initialized:false,processedCount:0},
+        sourceBook:'main', readiness:{chat:true,book:true,template:true,single:true}, diagnostics:{pendingCount:0}, presetApplication:{entries:[]},
+        connectionMode:'compatible', connection:{endpoint:'https://other.example/v1',model:'old',hasApiKey:true,headers:[{name:'X-Api-Key'}]} };
+    const controller = {view:()=>view, subscribe:()=>()=>{},
+        fetchModels:async input=>{ fetched.push(input); view.modelList={endpoint,models:['vendor/test-model']}; },
+        updateConnection:async input=>{applied.push(input);}, saveConnectionProfile:async name=>{saved.push(name);} };
+    const panel = mountPanel(root, controller); t.after(()=>panel.destroy());
+    const find = predicate=>walk(root).find(predicate), focused = key=>find(node=>node.dataset.focus===key);
+    const button = label=>find(node=>node.tagName==='BUTTON'&&node.textContent===label);
+    const input = (key,value)=>{ const node=focused(key); node.value=value; node.dispatch('input'); };
+    button('设置').click(); button('辅助模型').click();
+    input('密钥','another-provider-draft-key');
+    focused('connection-choice').value='openrouter'; focused('connection-choice').dispatch('change');
+    assert.equal(focused('接口地址').value,endpoint); assert.equal(focused('密钥').value,''); assert.equal(focused('model-name').value,'');
+    assert.equal(applied.length,0,'choosing a preset does not change the active connection');
+    input('密钥','fake-openrouter-key'); input('profile-name','Router test');
+    button('连接并获取模型').click(); await tick();
+    assert.deepEqual(fetched,[{endpoint,apiKey:'fake-openrouter-key',headers:[]}]);
+    const models=focused('model-list'); assert.equal(models.disabled,false);
+    models.value='vendor/test-model'; models.dispatch('change');
+    assert.equal(focused('密钥').value,'fake-openrouter-key','model selection preserves the entered key');
+    button('保存并使用').click(); await tick();
+    assert.deepEqual(applied,[{mode:'compatible',endpoint,model:'vendor/test-model',apiKey:'fake-openrouter-key',maxOutputTokens:'',headers:[]}]);
+    assert.deepEqual(saved,['Router test']);
 });

@@ -124,6 +124,7 @@ test('本轮 queues a one-shot reselection without calling the model, and shows 
     const f = fixture({ plan }); t.after(() => f.panel.destroy());
     f.button('本轮').click(); await tick();
     assert.match(f.root.textContent, /沿用上次挑选/);
+    assert.doesNotMatch(f.root.textContent, /输入和资料都没有变化/);
     f.button('下次重新挑选').click(); await tick();
     assert.deepEqual(f.calls, [['force', true]]);
     assert.match(f.root.textContent, /已安排：下一次发送或重新生成时重新挑选资料，只生效一次/);
@@ -134,6 +135,13 @@ test('本轮 queues a one-shot reselection without calling the model, and shows 
     refresh.button('本轮').click(); await tick();
     assert.equal(refresh.find(n => n.tagName === 'BUTTON' && n.textContent === '下次重新挑选'), undefined);
     assert.match(refresh.root.textContent, /重新挑选/);
+});
+
+test('current-turn diagnostics show a failed attempt separately from the prior plan', async t => {
+    const f = fixture({extra:{diagnostics:{lastPlan:{selectionSource:'reused',selectedIds:[]},lastPreparation:{outcome:'failed',selectionReason:'forced',timingsMs:{total:25,auxiliary:20}}}}});
+    t.after(()=>f.panel.destroy());f.button('本轮').click();await tick();
+    assert.match(f.root.textContent,/最近一次准备 · 准备失败/);
+    assert.match(f.root.textContent,/已指定重新挑选/);assert.match(f.root.textContent,/准备总计：25 ms/);
 });
 
 test('a rebound main book asks for a backup and rescan, never a partial sync', async t => {

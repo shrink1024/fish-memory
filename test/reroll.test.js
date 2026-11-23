@@ -113,6 +113,27 @@ for (const type of ['regenerate', 'swipe']) for (const scoped of [false, true]) 
         assert.deepEqual(f.c.store.state.processed, f.host.snapshot().messages.map(m => m.key));
     });
 }
+
+test('native latest-candidate browsing retains selection while rolling back discarded facts',async t=>{
+    const f=await fixture(t);await f.c.updateSettings({maintenanceKeepRecent:1,compactEvery:20});
+    await f.start('regenerate');
+    const first=f.c.diagnostics.lastPlan.requestId;
+    const maintenanceCount=f.calls.filter(c=>c.purpose==='maintain').length;
+    await f.emit('GENERATION_STOPPED');f.setGenerating(false);
+    const tail=f.live.chat.at(-1);
+    tail.swipes.push(NEW);tail.swipe_info.push({extra:{}});
+    for(const index of [1,0,1]){
+        tail.swipe_id=index;tail.mes=tail.swipes[index];tail.extra=structuredClone(tail.swipe_info[index].extra??{});
+        await f.emit('MESSAGE_SWIPED',f.live.chat.length-1);await f.c.whenIdle();
+    }
+    await f.start('regenerate');
+    assert.equal(f.calls.filter(c=>c.purpose==='select').length,1);
+    assert.equal(f.calls.filter(c=>c.purpose==='maintain').length,maintenanceCount,'the newest reply stays deferred while browsing');
+    assert.equal(f.c.diagnostics.lastPlan.selectionSource,'reused');assert.notEqual(f.c.diagnostics.lastPlan.requestId,first);
+    assert.ok(f.slots.get('dwm:summary').includes(BASE));
+    assert.doesNotMatch(f.slots.get('dwm:summary'),/discarded old reply|replacement reply/);
+    assert.equal(JSON.stringify(f.c.diagnostics.lastPlan).includes('Old outcome'),false);
+});
 for (const type of ['regenerate', 'swipe']) for (const failure of ['stop', 'preflight failure']) {
     test(`${type}: ${failure} and original candidate restoration preserve valid remembered history`, async t => {
         const f = await fixture(t, { scoped: true, selectFailure: failure === 'preflight failure' });

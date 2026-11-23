@@ -82,18 +82,30 @@ test('missing or mismatched sources fail before replacing a previous usable buil
     assert.equal(await readFile(path.join(first.target, 'keep-on-failure'), 'utf8'), 'prior build');
 });
 
-test('build rejects a host target or symbolic-link parent and does not follow source links', async t => {
+test('build rejects a host target or symbolic-link parent', async t => {
     const root = await fixture(t);
     const foreign = await mkdtemp(path.join(os.tmpdir(), 'dwm-protected-'));
     t.after(() => rm(foreign, { recursive: true, force: true }));
     await writeFile(path.join(foreign, 'preserved'), 'host data');
     await assert.rejects(stageDistribution({ root, target: foreign, check: false }), /inside this project/);
     await mkdir(path.join(root, '.local'));
-    await symlink(foreign, path.join(root, '.local/build'), 'dir');
+    await symlink(foreign, path.join(root, '.local/build'), process.platform === 'win32' ? 'junction' : 'dir');
     await assert.rejects(stageDistribution({ root, check: false }), /symbolic link/);
-    await rm(path.join(root, '.local/build'));
+    assert.equal(await readFile(path.join(foreign, 'preserved'), 'utf8'), 'host data');
+});
+
+test('build does not follow source file links', async t => {
+    const root = await fixture(t);
+    const foreign = await mkdtemp(path.join(os.tmpdir(), 'dwm-protected-'));
+    t.after(() => rm(foreign, { recursive: true, force: true }));
+    await writeFile(path.join(foreign, 'preserved'), 'host data');
     await rm(path.join(root, 'index.js'));
-    await symlink(path.join(foreign, 'preserved'), path.join(root, 'index.js'));
+    try { await symlink(path.join(foreign, 'preserved'), path.join(root, 'index.js'), 'file'); }
+    catch (error) {
+        if (process.platform !== 'win32' || error.code !== 'EPERM') throw error;
+        t.skip('Windows file symlinks require Developer Mode or elevated privileges');
+        return;
+    }
     await assert.rejects(stageDistribution({ root, check: false }), /regular project file|symbolic link/);
     assert.equal(await readFile(path.join(foreign, 'preserved'), 'utf8'), 'host data');
 });

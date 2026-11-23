@@ -76,6 +76,7 @@ export function createProblemExporter({ controller, context = () => ({}), timers
                     window: view.window, warnings: view.warnings,
                     lazy: view.lazy, lazyTrigger: controller.diagnostics?.lazy,
                     lastPlan: currentStore ? controller.diagnostics?.lastPlan : null,
+                    lastPreparation: controller.diagnostics?.lastPreparation?.chatId === current.memoryChatId ? controller.diagnostics.lastPreparation : null,
                 }, sources: attached }); filter.finish(id);
                 const captured = filter.snapshot().records[0];
                 if (!captured) throw new Error('诊断资料超过导出容量，请先导出较小范围的收发记录。');

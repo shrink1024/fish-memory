@@ -41,6 +41,7 @@ export async function readStreamResponse(response, { signal, onProgress, allowJs
         }
         const choice = value.choices?.find(item => (item.index ?? 0) === 0);
         if (!choice) { onProgress?.({phase:'recv',chars:content.length}); return; }
+        if (choice.error) throw Object.assign(mapError({ error: choice.error }), {dwmStreamFault:'api'});
         const delta=choice.delta?.content ?? choice.message?.content ?? choice.text;
         if (typeof delta === 'string') content += delta;
         else if (Array.isArray(delta)) content += delta.filter(part=>typeof part.text==='string').map(part=>part.text).join('');
