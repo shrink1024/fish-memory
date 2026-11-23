@@ -1,4 +1,5 @@
 import { parseSupplementaryMemory } from '../core/transfer.js';
+import { isOpenRouterEndpoint } from '../agents/client.js';
 import { buildRuleDocument, compileRules, formToScript } from '../rules/index.js';
 import { diffText } from './diff.js';
 import { createTraceViewer } from './trace-viewer.js';
@@ -101,7 +102,7 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
     let applicationSelection = new Set(), applicationPositions = {}, applicationKey = null;
     let connectionChoice = null, profileNameDraft = '', connectionDraftKey = null;
     const entryDrafts = new Map(), poolDrafts = new Map(), expanded = new Set(), scrollPositions = new Map();
-    const connectionDraft = { endpoint: '', model: '', apiKey: '', maxOutputTokens: undefined, headers: [] };
+    const connectionDraft = { endpoint: '', model: '', apiKey: '', maxOutputTokens: undefined, headers: [], openrouterProvider:'' };
     const storage = (() => { try { return doc.defaultView?.localStorage ?? null; } catch { return null; } })();
     let listWidth = (() => { try { return Number(storage?.getItem('dwm.list-width.v1')) || null; } catch { return null; } })();
     // 超级懒人模式: the upgrade note is per browser; switching to 高级模式 on purpose also dismisses it.
@@ -1866,17 +1867,20 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         // Refill the form whenever the connection it shows changes, never while typing
         // or on a background refresh. The profile name tells apart two profiles
         // with the same address and model, so one's unsaved key never reaches the other.
-        const draftKey = creating ? choice : JSON.stringify([live, view.connection?.endpoint, view.connection?.model, view.connection?.maxOutputTokens]);
+        const draftKey = creating ? choice : JSON.stringify([live, view.connection?.endpoint, view.connection?.model, view.connection?.maxOutputTokens, view.connection?.openrouterProvider]);
         if (draftKey !== connectionDraftKey) {
             connectionDraftKey = draftKey;
-            Object.assign(connectionDraft, creating ? { endpoint: choice === 'openrouter' ? 'https://openrouter.ai/api/v1' : '', model: '', apiKey: '', maxOutputTokens: '', headers: [] }
-                : { endpoint: view.connection?.endpoint ?? '', model: view.connection?.model ?? '', apiKey: '', maxOutputTokens: view.connection?.maxOutputTokens ?? '',
+            Object.assign(connectionDraft, creating ? { endpoint: choice === 'openrouter' ? 'https://openrouter.ai/api/v1' : '', model: '', apiKey: '', maxOutputTokens: '', headers: [], openrouterProvider:'' }
+                : { endpoint: view.connection?.endpoint ?? '', model: view.connection?.model ?? '', apiKey: '', maxOutputTokens: view.connection?.maxOutputTokens ?? '', openrouterProvider:view.connection?.openrouterProvider ?? '',
                     headers: (view.connection?.headers ?? []).map(header => ({ name: header.name, value: '', saved: true })) });
         }
         const form = h('div', 'dwm-group dwm-form');
         if (connectionDraft.endpoint.trim().replace(/\/$/, '') === 'https://openrouter.ai/api/v1') form.append(h('p', 'dwm-muted', '填写 OpenRouter API 密钥后获取模型列表；模型 ID 使用完整的“供应商/模型名”。获取列表不代表密钥已通过生成鉴权，保存后下一次辅助任务才会调用模型。'));
         if (creating || choice === 'current') form.append(field('配置名称', profileNameDraft, value => { profileNameDraft = value; }, { placeholder: '例如：DS 便宜档', key: 'profile-name', hint: creating ? '保存名称后可直接切换。' : '填写名称以保存为配置，留空仅应用当前连接。' }).wrap);
-        const address = field('接口地址', connectionDraft.endpoint, value => { connectionDraft.endpoint = value; }, { placeholder: 'https://…/v1', hint: '请求路径自动追加 /chat/completions。' });
+        const address = field('接口地址', connectionDraft.endpoint, value => {
+            if (value.trim().replace(/\/$/, '') !== connectionDraft.endpoint.trim().replace(/\/$/, '')) connectionDraft.openrouterProvider = '';
+            connectionDraft.endpoint = value;
+        }, { placeholder: 'https://…/v1', hint: '请求路径自动追加 /chat/completions。' });
         form.append(address.wrap,
             field('密钥', connectionDraft.apiKey, value => { connectionDraft.apiKey = value; }, { type: 'password', hint: !creating && view.connection?.hasApiKey ? '当前连接已配置密钥；同地址留空时沿用，更换地址需重新填写。' : '仅保存在当前浏览器。' }).wrap);
         const listed = view.modelList?.endpoint === connectionDraft.endpoint.trim().replace(/\/$/, '') ? view.modelList.models : [];
@@ -1887,15 +1891,37 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
             h('span', 'dwm-muted dwm-hint', '先填地址和密钥，再连接；只获取模型列表，不生成内容。')));
         const modelPicker = selectField('选择模型', listed.includes(connectionDraft.model) ? connectionDraft.model : '',
             [['', listed.length ? `已获取 ${listed.length} 个模型，请选择` : '连接后在这里选择模型'], ...listed.map(id => [id, id])],
-            value => { if (value) { connectionDraft.model = value; render(); } }, 'model-list');
+            value => { if (value) { if(value !== connectionDraft.model)connectionDraft.openrouterProvider=''; connectionDraft.model = value; render(); } }, 'model-list');
         const updateModelAvailability = () => { modelPicker.input.disabled = !listed.length || busy || running || view.modelList?.endpoint !== connectionDraft.endpoint.trim().replace(/\/$/, ''); };
         address.input.addEventListener('input', updateModelAvailability); updateModelAvailability();
         form.append(modelPicker.wrap);
-        const model = field('模型 ID（也可手动填写）', connectionDraft.model, value => { connectionDraft.model = value; },
+        const model = field('模型 ID（也可手动填写）', connectionDraft.model, value => {
+            if(value.trim() !== connectionDraft.model.trim())connectionDraft.openrouterProvider=''; connectionDraft.model = value;
+        },
             { key: 'model-name', hint: '下拉选择后自动填入；接口不提供列表或模型未列出时，可直接手动填写。选好后保存才生效。' });
         // Keep the dropdown in sync when a model ID is entered manually.
         model.input.addEventListener('input', () => { modelPicker.input.value = listed.includes(connectionDraft.model) ? connectionDraft.model : ''; });
         form.append(model.wrap);
+        const providerBox = h('div');
+        const matchingProviders = () => view.providerList?.endpoint === connectionDraft.endpoint.trim().replace(/\/$/, '') && view.providerList?.model === connectionDraft.model.trim();
+        const providerPicker = selectField('服务提供商', connectionDraft.openrouterProvider, [], value=>{connectionDraft.openrouterProvider=value;render();}, 'provider-list');
+        const providerFetch = button('获取服务提供商', () => call(() => controller.fetchProviders({endpoint:connectionDraft.endpoint,model:connectionDraft.model,apiKey:connectionDraft.apiKey,headers:draftHeaders()})), {ghost:true,key:'fetch-providers'});
+        providerBox.append(providerPicker.wrap, row(providerFetch), h('p','dwm-muted','指定后只使用该提供商；不可用时会报错，不会自动换商。改选模型或接口后恢复自动，保存连接才生效。'));
+        const providerManual = details('手动填写提供商标识', 'provider-manual', 'dwm-disclosure dwm-inline-disclosure');
+        const providerId = field('提供商标识', connectionDraft.openrouterProvider, value=>{connectionDraft.openrouterProvider=value.trim();}, {key:'provider-id',hint:'可从 OpenRouter 模型页复制提供商标识（含区域或版本后缀）；留空使用自动路由。'});
+        providerManual.append(providerId.wrap); providerBox.append(providerManual); form.append(providerBox);
+        const updateProviderAvailability = () => {
+            const enabled = isOpenRouterEndpoint(connectionDraft.endpoint); providerBox.hidden = !enabled;
+            const providers = matchingProviders() ? view.providerList.providers : [];
+            const options = [['', '自动（OpenRouter 路由）'], ...providers.map(item=>[item.id,`${item.name} · ${item.id}`])];
+            if(connectionDraft.openrouterProvider && !providers.some(item=>item.id===connectionDraft.openrouterProvider))options.push([connectionDraft.openrouterProvider,`${connectionDraft.openrouterProvider}（已指定）`]);
+            providerPicker.input.replaceChildren(...options.map(([id,name])=>{const option=h('option','',name);option.value=id;return option;}));
+            providerFetch.disabled = busy || running || !enabled || !connectionDraft.model.trim();
+            providerPicker.input.disabled = busy || running || !enabled || !connectionDraft.model.trim() || (!matchingProviders() && !connectionDraft.openrouterProvider);
+            providerPicker.input.value = connectionDraft.openrouterProvider; providerId.input.value = connectionDraft.openrouterProvider;
+        };
+        for(const input of [address.input,model.input,providerId.input])input.addEventListener('input',updateProviderAvailability);
+        updateProviderAvailability();
         form.append(field('输出上限（可留空）', connectionDraft.maxOutputTokens, value => { connectionDraft.maxOutputTokens = value; }, { type: 'number', placeholder: '留空 = 服务商默认', hint: '思考型模型被截断时可以调大，比如 32768。更大的额度可能更贵。' }).wrap);
         const headerBox = details(`自定义请求头${connectionDraft.headers?.length ? `（${connectionDraft.headers.length}）` : ''}`, 'connection-headers', 'dwm-disclosure dwm-inline-disclosure');
         headerBox.append(h('p', 'dwm-muted', '部分渠道（例如 opencode）要求额外的请求头。请求头和密钥一样只保存在这个浏览器，不进存档、问题报告和收发记录。已保存的值不会显示，留空即沿用。'));
@@ -1913,6 +1939,7 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         const dirty = h('span', 'dwm-muted');
         const updateDirty = () => {
             const changed = connectionDraft.apiKey || connectionDraft.endpoint !== (view.connection?.endpoint ?? '') || connectionDraft.model !== (view.connection?.model ?? '')
+                || connectionDraft.openrouterProvider !== (view.connection?.openrouterProvider ?? '')
                 || String(connectionDraft.maxOutputTokens ?? '') !== String(view.connection?.maxOutputTokens ?? '')
                 || connectionDraft.headers.some(header => header.value) || JSON.stringify(connectionDraft.headers.map(header => header.name)) !== savedHeaders;
             dirty.textContent = changed ? '有未保存的修改' : '';
@@ -1926,7 +1953,8 @@ export function mountPanel(container, controller, { exportProblem, statusSlot = 
         actions.append(button(creating ? '保存并使用' : '应用连接', () => call(async () => {
             const name = (editingName || profileNameDraft).trim();
             const headers = draftHeaders();
-            await controller.updateConnection({ mode: 'compatible', endpoint: connectionDraft.endpoint.trim(), model: connectionDraft.model.trim(), apiKey: connectionDraft.apiKey, maxOutputTokens: connectionDraft.maxOutputTokens, headers });
+            await controller.updateConnection({ mode: 'compatible', endpoint: connectionDraft.endpoint.trim(), model: connectionDraft.model.trim(), apiKey: connectionDraft.apiKey, maxOutputTokens: connectionDraft.maxOutputTokens, headers,
+                ...(isOpenRouterEndpoint(connectionDraft.endpoint) ? {openrouterProvider:connectionDraft.openrouterProvider} : {}) });
             for (const header of connectionDraft.headers) header.value = '';
             connectionChoice = null; profileNameDraft = name;
             if (name) await controller.saveConnectionProfile(name);

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { AgentClient, compatibleConnection, listModels } from '../src/agents/client.js';
+import { AgentClient, compatibleConnection, listModels, isOpenRouterEndpoint, normalizeOpenRouterProvider, listOpenRouterProviders } from '../src/agents/client.js';
 import { generateAuxiliary } from '../src/adapters/auxiliary-transport.js';
 
 const endpoint = 'https://openrouter.ai/api/v1';
@@ -9,6 +9,73 @@ const complete = () => json({ choices: [{ message: { content: '{"ids":[]}', reas
 const request = { purpose: 'select', system: 'select memories', input: '{}' };
 const event = value => `data: ${JSON.stringify(value)}\n\n`;
 const stream = body => new Response(body, { headers: { 'content-type': 'text/event-stream' } });
+
+test('OpenRouter origin and provider validation preserve exact routing tags', () => {
+    for (const value of [endpoint, 'https://OPENROUTER.AI:443/api/v1/']) assert.equal(isOpenRouterEndpoint(value), true);
+    for (const value of ['', undefined, 'http://openrouter.ai/api/v1', 'https://openrouter.ai.example/api/v1', 'https://openrouter.ai:444/api/v1']) assert.equal(isOpenRouterEndpoint(value), false);
+    for (const value of [undefined, null, '', '  ']) assert.equal(normalizeOpenRouterProvider(value), '');
+    assert.equal(normalizeOpenRouterProvider(' deepinfra/fp4/us/priority '), 'deepinfra/fp4/us/priority');
+    for (const value of [42, false, {}, [], 'Google Vertex', 'openai\n/fast', '../openai', 'openai?x=1', 'a'.repeat(201)]) assert.throws(() => normalizeOpenRouterProvider(value), /服务商标识/);
+});
+
+test('model provider discovery preserves tags, deduplicates, encodes model paths and keeps literal headers', async () => {
+    let wire;
+    const abort = new AbortController();
+    const providers = await listOpenRouterProviders({endpoint: `${endpoint}/?api-version=1#discard`, model: 'vendor/model:free?x#y', apiKey:'key',
+        headers:[{name:'X-Custom',value:'$literal'}], signal:abort.signal, fetchImpl:async (url, options) => {
+            wire = {url, ...options}; return json({data:{endpoints:[
+                {tag:'google-vertex/us-east5',provider_name:'Google Vertex'},
+                {tag:'deepinfra/fp4',provider_name:'DeepInfra'},
+                {tag:'deepinfra/fp4',provider_name:'Duplicate'},
+                {tag:'openai'}, {provider_name:'A display name is not a slug'}, {tag:'bad tag'}
+            ]}});
+        }});
+    assert.deepEqual(providers, [{id:'deepinfra/fp4',name:'DeepInfra'},{id:'google-vertex/us-east5',name:'Google Vertex'},{id:'openai',name:'openai'}]);
+    assert.equal(wire.url, `${endpoint}/models/vendor/model%3Afree%3Fx%23y/endpoints?api-version=1`);
+    assert.equal(wire.method, 'GET'); assert.equal(wire.signal, abort.signal);
+    assert.deepEqual(wire.headers, {Authorization:'Bearer key','X-Custom':'$literal'});
+    assert.deepEqual(await listOpenRouterProviders({endpoint,model:'vendor/model',fetchImpl:async()=>json({data:{endpoints:[]}})}), []);
+});
+
+test('provider discovery rejects invalid routes before sending and never invents a different request', async () => {
+    const fetchImpl = () => { assert.fail('Invalid discovery must not fetch'); };
+    await assert.rejects(listOpenRouterProviders({endpoint:'https://other.example/v1',model:'vendor/model',fetchImpl}), /OpenRouter/);
+    for (const model of ['', undefined, {}, 'model-only', 'vendor/', '/model', 'vendor/../other', '../model', 'vendor/..', 'vendor/model with spaces', 'v/\ud800']) {
+        await assert.rejects(listOpenRouterProviders({endpoint,model,fetchImpl}), /模型 ID/);
+    }
+    const abort = new AbortController(); abort.abort(new DOMException('stop','AbortError'));
+    await assert.rejects(listOpenRouterProviders({endpoint,model:'vendor/model',fetchImpl,signal:abort.signal}), error => error === abort.signal.reason);
+});
+
+test('provider discovery preserves cancellation and sanitized API errors', async () => {
+    for (const status of [401, 402, 403, 404, 429, 500]) {
+        await assert.rejects(listOpenRouterProviders({endpoint,model:'vendor/model',fetchImpl:async()=>json({error:{code:status,message:'private-server-secret'}},status)}), error => {
+            assert.equal(error.httpStatus,status);assert.doesNotMatch(error.message,/private-server-secret/);return true;
+        });
+    }
+    for (const body of [{}, {data:{endpoints:{}}}]) await assert.rejects(listOpenRouterProviders({endpoint,model:'vendor/model',fetchImpl:async()=>json(body)}), /服务商列表/);
+    await assert.rejects(listOpenRouterProviders({endpoint,model:'vendor/model',fetchImpl:async()=>{throw Error('private-server-secret');}}), error => /服务商列表/.test(error.message)&&!error.message.includes('private-server-secret'));
+    for (const fail of [false,true]) {
+        const abort = new AbortController(), reason = new DOMException('stop','AbortError');
+        await assert.rejects(listOpenRouterProviders({endpoint,model:'vendor/model',signal:abort.signal,fetchImpl:async()=>({ok:true,status:200,json:async()=>{
+            abort.abort(reason);if(fail)throw reason;return {data:{endpoints:[]}};
+        }})}), error => error === reason);
+    }
+});
+
+test('OpenRouter pins only the requested provider variant and leaves default routing unconfigured', async () => {
+    for (const pin of [undefined, '', ' deepinfra/fp4 ']) {
+        let body;
+        const generate = compatibleConnection({endpoint,model:'vendor/model',openrouterProvider:pin,fetchImpl:async (_url,options)=>{body=JSON.parse(options.body);return complete();}});
+        await generate(request);
+        assert.deepEqual(body.provider, pin?.trim() ? {only:['deepinfra/fp4']} : undefined);
+    }
+    assert.throws(()=>compatibleConnection({endpoint,model:'vendor/model',openrouterProvider:{}}),/服务商标识/);
+    let body;
+    const generate = compatibleConnection({endpoint:'https://other.example/v1',model:'vendor/model',openrouterProvider:{invalid:'ignored'},
+        fetchImpl:async (_url,options)=>{body=JSON.parse(options.body);return complete();}});
+    await generate(request);assert.equal(body.provider,undefined);
+});
 
 test('inherited SillyTavern OpenRouter keeps native provider routing and settings', async () => {
     const settings = {chat_completion_source:'openrouter',openrouter_model:'vendor/test-model',openrouter_providers:['test-provider'],openai_max_tokens:4096};

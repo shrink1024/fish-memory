@@ -1,5 +1,14 @@
 # Regeneration reuse progress
 
+## OpenRouter provider selection — 2026-11-23
+
+- User requested selecting an OpenRouter provider. The worktree was clean at the start.
+- Verified official provider-routing and model-endpoint documentation. Use the endpoint's `tag` as its routing identifier; use `provider.only` for an explicit choice and omit routing preferences for Automatic.
+- Reusing the existing connection form, local profiles, network timeout helpers and selection invalidation identity. Transport/discovery implementation and an integration review are delegated independently.
+- Implemented model-specific provider discovery, strict provider selection or Automatic, manual tag entry, and current/named connection persistence. Provider changes invalidate selection/preparation reuse; model/endpoint edits clear stale draft choices.
+- Review fixed native-mode application with no existing connection, stale dropdown options while editing targets, and manual field blur replacing the Save button. Added regressions for these and for credentials, stale discovery, deadline handling, persistence and rerolls.
+- Verification: 81 focused tests passed, then the full suite passed (1,023 passed / 2 environment-dependent skips / 0 failures). Syntax/entry check passed for 187 files; install build succeeded with 75 files; diff whitespace check passed. The public provider list for `openai/gpt-4o-mini` returned `azure` and `openai`; authenticated generation and live SillyTavern remain unverified.
+
 ## Requested bug review and fixes
 
 - User requested a bug check and fixes. Reviewed OpenRouter transport, connection UI/persistence, and regeneration cache/lifecycle with independent parallel reviews.

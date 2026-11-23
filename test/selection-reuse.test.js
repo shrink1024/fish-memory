@@ -171,6 +171,28 @@ test('input, effective memory, native model and settings invalidate selection re
  f.signature('native-model-b');await f.controller.generationBefore({type:'normal'});assert.equal(selects(f),4);
  await f.controller.updateSettings({selectionLimit:8});await f.controller.generationBefore({type:'normal'});assert.equal(selects(f),5);
 });
+
+test('changing only the OpenRouter provider invalidates selection and prepared context',async t=>{
+ const f=fixture();await f.start();const originalFetch=globalThis.fetch,requests=[];
+ t.after(()=>{globalThis.fetch=originalFetch;});
+ globalThis.fetch=async(url,options)=>{
+  requests.push({url,body:JSON.parse(options.body)});
+  return Response.json({choices:[{message:{content:'{"ids":[]}'},finish_reason:'stop'}]});
+ };
+ const connection={mode:'compatible',endpoint:'https://openrouter.ai/api/v1',model:'vendor/test-model',apiKey:'synthetic-provider-key'};
+ await f.controller.updateConnection({...connection,openrouterProvider:'provider-a'});
+ await f.controller.generationBefore({type:'normal'});
+ assert.equal(requests.length,1);assert.equal(f.plans.at(-1).selectionSource,'fresh');
+ await f.controller.updateConnection({...connection,openrouterProvider:'provider-a'});
+ await f.controller.generationBefore({type:'regenerate'});
+ assert.equal(requests.length,1);assert.equal(f.plans.at(-1).selectionSource,'reused');assert.equal(f.plans.at(-1).preparationSource,'reused');
+ await f.controller.updateConnection({...connection,openrouterProvider:'provider-b'});
+ await f.controller.generationBefore({type:'regenerate'});
+ assert.equal(requests.length,2);assert.equal(f.plans.at(-1).selectionSource,'fresh');assert.equal(f.plans.at(-1).preparationSource,'assembled');
+ assert.equal(f.plans.at(-1).selectionReason,'inputs-changed');
+ await f.controller.generationBefore({type:'regenerate'});
+ assert.equal(requests.length,2);assert.equal(f.plans.at(-1).preparationSource,'reused');
+});
 test('failed forced refresh and preview do not consume the one-shot option',async()=>{
  const f=fixture();await f.start();await f.controller.generationBefore({type:'normal'});
  f.controller.setNextSelectionRefresh(true);await f.controller.previewPlan();assert.equal(f.controller.view().selectionReuse.forceNext,true);

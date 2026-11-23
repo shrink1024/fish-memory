@@ -12,6 +12,13 @@ const memoryStore = () => {
         loadProfiles: () => structuredClone(data.profiles), saveProfiles: list => { data.profiles = structuredClone(list); } };
 };
 
+test('applying the native connection without a prior separate configuration is safe', async () => {
+    const store = memoryStore(), c = new Controller(host(), { connectionStore: store });
+    await c.updateConnection({ mode: 'raw' });
+    assert.equal(c.view().connectionMode, 'raw');
+    assert.equal(store.data.current, null);
+});
+
 test('FM-025: named connections are saved with their keys, switched and deleted', async () => {
     const store = memoryStore(), c = new Controller(host(), { connectionStore: store });
     await assert.rejects(c.saveConnectionProfile('甲'), /单独的兼容接口/, 'the ST connection is not a profile');
@@ -136,6 +143,85 @@ test('OpenRouter profiles persist without exposing keys in views or echoed diagn
     const id = trace.start({responseRaw:`provider echoed ${apiKey} and ${draftKey}`}); trace.finish(id);
     assert.doesNotMatch(JSON.stringify([restored.view(), restored.connectionDiagnostics(), trace.exportData()]), /sk-or-v1-synthetic/);
     assert.match(trace.snapshot().records[0].responseRaw, /REDACTED/);
+});
+
+test('OpenRouter provider pins survive reload and distinguish otherwise identical named profiles', async t => {
+    const previousFetch = globalThis.fetch, bodies = [];
+    t.after(()=>{globalThis.fetch=previousFetch;});
+    globalThis.fetch=async (_url,options)=>{bodies.push(JSON.parse(options.body));return new Response('{"choices":[{"message":{"content":"{\\"ids\\":[]}"},"finish_reason":"stop"}]}');};
+    const store = memoryStore(), c = new Controller(host(), {connectionStore:store});
+    const endpoint = 'https://openrouter.ai/api/v1', model = 'vendor/model', apiKey = 'synthetic-provider-key';
+    for (const [name, openrouterProvider] of [['Fast', 'deepinfra/fp4'], ['Regional', 'google-vertex/us-east5']]) {
+        await c.updateConnection({mode:'compatible',endpoint,model,apiKey,openrouterProvider});
+        await c.saveConnectionProfile(name);
+    }
+    assert.deepEqual(store.data.profiles.map(p=>[p.name,p.openrouterProvider]), [['Fast','deepinfra/fp4'],['Regional','google-vertex/us-east5']]);
+    assert.equal(store.data.current.openrouterProvider, 'google-vertex/us-east5');
+    assert.deepEqual(c.view().connectionProfiles.filter(p=>p.active).map(p=>p.name), ['Regional']);
+    await c.useConnectionProfile('Fast');
+    assert.equal(c.view().connection.openrouterProvider, 'deepinfra/fp4');
+    assert.deepEqual(c.view().connectionProfiles.filter(p=>p.active).map(p=>p.name), ['Fast']);
+    const restored = new Controller(host(), {connectionStore:store});
+    assert.equal(restored.view().connection.openrouterProvider, 'deepinfra/fp4');
+    assert.deepEqual(restored.view().connectionProfiles.filter(p=>p.active).map(p=>p.name), ['Fast']);
+    await restored.client.complete({purpose:'select',system:'Synthetic test',input:{}});
+    assert.deepEqual(bodies[0].provider, {only:['deepinfra/fp4']}, 'the reloaded live client uses the persisted pin');
+    await restored.useConnectionProfile('Regional');
+    await restored.client.complete({purpose:'select',system:'Synthetic test',input:{}});
+    assert.deepEqual(bodies[1].provider, {only:['google-vertex/us-east5']}, 'switching restores the profile pin');
+});
+
+test('OpenRouter retains an omitted pin for the same model but explicit Auto and changed targets clear it', async () => {
+    const store = memoryStore(), c = new Controller(host(), {connectionStore:store});
+    const endpoint = 'https://openrouter.ai/api/v1', model = 'vendor/model';
+    const pin = async () => c.updateConnection({mode:'compatible',endpoint,model,apiKey:'synthetic-provider-key',openrouterProvider:'azure'});
+    await pin();
+    await c.updateConnection({mode:'compatible',endpoint:endpoint+'/',model:' '+model+' ',maxOutputTokens:4096});
+    assert.equal(c.view().connection.openrouterProvider, 'azure');
+    assert.equal(store.data.current.openrouterProvider, 'azure');
+    await c.updateConnection({mode:'compatible',endpoint,model,openrouterProvider:''});
+    assert.equal(c.view().connection.openrouterProvider, undefined);
+    assert.equal(store.data.current.openrouterProvider, undefined);
+    await c.saveConnectionProfile('Automatic');
+    await pin(); await c.saveConnectionProfile('Pinned');
+    await c.useConnectionProfile('Automatic');
+    assert.equal(c.view().connection.openrouterProvider, undefined, 'an Auto profile clears the previous pinned connection');
+    assert.deepEqual(c.view().connectionProfiles.filter(p=>p.active).map(p=>p.name), ['Automatic']);
+    await pin();
+    await c.updateConnection({mode:'compatible',endpoint,model:'vendor/other-model'});
+    assert.equal(c.view().connection.openrouterProvider, undefined);
+    assert.equal(store.data.current.openrouterProvider, undefined);
+    await pin();
+    await c.updateConnection({mode:'compatible',endpoint:'https://another.example/v1',model,openrouterProvider:'azure'});
+    assert.equal(c.view().connection.openrouterProvider, undefined, 'a pin never follows the connection to another service');
+    assert.equal(store.data.current.openrouterProvider, undefined);
+    await c.updateConnection({mode:'compatible',endpoint,model});
+    assert.equal(c.view().connection.openrouterProvider, undefined, 'returning to OpenRouter does not restore a stale pin');
+});
+
+test('invalid stored OpenRouter pins never silently become automatic OpenRouter routing', async () => {
+    for (const openrouterProvider of [false, ['azure'], 'Google Vertex', 'a'.repeat(201)]) {
+        const store = memoryStore();
+        store.data.current = {mode:'compatible',endpoint:'https://openrouter.ai/api/v1',model:'vendor/model',apiKey:'synthetic-key',openrouterProvider};
+        store.data.profiles = [{name:'Invalid',...store.data.current},{name:'Valid',...store.data.current,openrouterProvider:'azure'}];
+        const saved = structuredClone(store.data.current);
+        const c = new Controller(host(), {connectionStore:store});
+        assert.equal(c.view().connectionMode, 'raw', 'invalid current configuration is rejected as a whole');
+        assert.equal(c.view().connection.endpoint, '');
+        assert.deepEqual(c.view().connectionProfiles.map(p=>[p.name,p.openrouterProvider,p.active]), [['Valid','azure',false]]);
+        await assert.rejects(c.useConnectionProfile('Invalid'), /没有找到/);
+        assert.deepEqual(store.data.current, saved, 'loading does not rewrite an invalid pin to Auto');
+    }
+});
+
+test('invalid provider edits leave the working pinned connection and persisted configuration intact', async () => {
+    const store = memoryStore(), c = new Controller(host(), {connectionStore:store});
+    const endpoint = 'https://openrouter.ai/api/v1', model = 'vendor/model';
+    await c.updateConnection({mode:'compatible',endpoint,model,apiKey:'synthetic-key',openrouterProvider:'azure'});
+    const saved = structuredClone(store.data.current);
+    await assert.rejects(c.updateConnection({mode:'compatible',endpoint,model,openrouterProvider:['openai']}), /服务商标识/);
+    assert.equal(c.view().connection.openrouterProvider, 'azure');
+    assert.deepEqual(store.data.current, saved);
 });
 
 test('FM-025: the connection picker switches profiles and saves a new one by name', async t => {

@@ -1,5 +1,14 @@
 # Regeneration reuse findings
 
+## OpenRouter provider selection — 2026-11-23
+
+- Model endpoint discovery returns `tag` for routing and `provider_name` for display. Preserve full tags, including provider variants/regions, and send `provider: {only: [tag]}` for an explicit selection; Automatic omits provider preferences. References: [routing](https://openrouter.ai/docs/guides/routing/provider-selection), [model endpoints](https://openrouter.ai/docs/api/api-reference/endpoints/list-all-endpoints-for-a-model).
+- Current and named connections share optional `openrouterProvider`; no chat-save schema changes. Including it in `sameConnection` distinguishes profiles and invalidates selection/preparation reuse when only the provider changes.
+- Discovery results are scoped to endpoint and model, guarded against older completions, and bounded by the existing 15-second timeout helper. Changing model/endpoint clears the draft pin immediately; manual or saved pins absent from the list stay visible until explicitly cleared.
+- Independent review caught native-mode application without an existing connection dereferencing a null config, and manual field blur replacing the Save button before its click. Both are fixed with regressions.
+- The new helper successfully read the public `openai/gpt-4o-mini` provider list (`azure`, `openai`). Generation routing is checked with mocked requests; live authenticated generation and live SillyTavern remain unverified.
+- Final verification: 1,023 passed / 2 environment-dependent skips / 0 failures; syntax/entry checks (187 files), install build (75 files), and diff whitespace check passed.
+
 ## Requested bug review — fixed findings
 
 Assumed use: one browser running Fish Memory, with asynchronous host updates and optional concurrent maintenance.

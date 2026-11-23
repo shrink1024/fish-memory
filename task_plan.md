@@ -1,5 +1,9 @@
 # Regeneration reuse implementation plan
 
+## Follow-up — OpenRouter provider selection (2026-11-23)
+
+Complete: model-scoped provider discovery, Automatic or one explicit provider, manual tag fallback, current/named connection persistence, provider-aware connection identity, and OpenRouter-only request restrictions. Tests cover UI target changes, profile reload/switching, request payloads, timeout/cancellation, stale discovery and reroll invalidation. Final suite: 1,023 passed, 2 environment-dependent skips, no failures. Syntax/entry checks (187 files), install build (75 files), and diff whitespace check passed. Public provider discovery succeeded; authenticated generation and live SillyTavern remain unverified.
+
 ## Follow-up — Requested bug review
 
 Complete. Reproduced and fixed connection validation/UI issues, URL joining with query/fragment components, model-list timeout/cancellation, and stale preparation across final connection/history-window awaits. Added regression tests, including scope/input/settings/refresh/pause changes before installation. Final suite: 1,008 passed, 2 environment-dependent skips, 0 failures. Syntax/entry checks (187 files), install build (75 files), and diff whitespace check passed. Live authenticated provider and SillyTavern validation remain unavailable.

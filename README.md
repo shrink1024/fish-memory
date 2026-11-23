@@ -44,9 +44,11 @@
 
 在“设置 → 辅助模型 → 当前连接”选择“＋ 新建 OpenRouter 接口…”，接口地址会填为 `https://openrouter.ai/api/v1`。填写自己的 OpenRouter API 密钥，点击“连接并获取模型”，选择模型（也可手动填写完整的 `供应商/模型名`），再点“保存并使用”。配置名称可用于保存多套连接；只选择预填项不会改变正在使用的连接。
 
+选好模型后，点击“获取服务提供商”，可保持“自动（OpenRouter 路由）”，或指定该模型的一个提供商。指定后只向该提供商请求，不可用时会报错，不会自动换商。列表获取失败时，可展开“手动填写提供商标识”，填入 OpenRouter 的提供商标识（含区域或版本后缀）。选择随当前连接和命名配置保存在本浏览器；修改模型或接口地址会恢复自动，需要再次选择并保存。切换提供商后，下次发送会重新核验选材。
+
 模型列表是公开资料，获取成功不代表密钥或余额已通过生成校验；获取超过 15 秒会停止，可重试或手动填写模型 ID。保存后下一次扫描、选材或整理才会发起模型调用。支持流式响应、思考强度和可选输出上限；输出上限留空沿用服务商默认值。密钥只保存在当前浏览器，不进入聊天存档或诊断导出。若酒馆已配置 OpenRouter，也可以继续选择“沿用酒馆连接”。
 
-请求参数依据 OpenRouter 的 [Chat Completions API](https://openrouter.ai/docs/api/api-reference/chat/create-a-chat-completion) 和 [统一思考参数](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens)。本次验证包含协议模拟测试和公开模型列表请求；未执行带密钥的真实生成或实时酒馆验收。
+请求参数依据 OpenRouter 的 [Chat Completions API](https://openrouter.ai/docs/api/api-reference/chat/create-a-chat-completion)、[统一思考参数](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens) 和 [提供商路由](https://openrouter.ai/docs/guides/routing/provider-selection)。本次验证包含协议模拟测试、公开模型列表和模型提供商列表请求；未通过真实密钥执行生成或实时酒馆验收。
 
 ## 调用、资料与效果检查
 

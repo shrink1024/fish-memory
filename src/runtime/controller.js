@@ -22,7 +22,7 @@ import { clone, invariant, uid, isPrefix, SerialQueue } from '../core/util.js';
 import { planWindow } from '../core/window.js';
 import { maintenanceFocus, triggeredIds, applyGate } from '../core/focus.js';
 import { applyMaintenance, compactionMeasure } from '../core/operations.js';
-import { AgentClient, compatibleConnection, listModels, untilAborted, serializeAgentInput, requestMessages, REASONING_EFFORTS, blockedResponse } from '../agents/client.js';
+import { AgentClient, compatibleConnection, listModels, listOpenRouterProviders, isOpenRouterEndpoint, normalizeOpenRouterProvider, untilAborted, serializeAgentInput, requestMessages, REASONING_EFFORTS, blockedResponse } from '../agents/client.js';
 import { classifyEntries, classifyOrDefer, scanBudget, alignStrategy, maintain, select, compact, mergeSourceUpdates } from '../agents/tasks.js';
 import { prescan, scriptOnly, DEFERRED } from '../agents/prescan.js';
 import { discoverRules, compileRules, applyRules, evaluateRules } from '../rules/index.js';
@@ -52,7 +52,8 @@ const keepTier = used => ({...(used?.tier ? { tier: used.tier, enabled: used.tie
 
 const PROFILE_MAX = 20, PROFILE_NAME_MAX = 40;
 const sameConnection = (a, b) => Boolean(a && b) && a.endpoint === b.endpoint && a.model === b.model
-    && a.apiKey === b.apiKey && (a.maxOutputTokens ?? null) === (b.maxOutputTokens ?? null) && headerIdentity(a.headers) === headerIdentity(b.headers);
+    && a.apiKey === b.apiKey && (a.maxOutputTokens ?? null) === (b.maxOutputTokens ?? null) && headerIdentity(a.headers) === headerIdentity(b.headers)
+    && (a.openrouterProvider ?? '') === (b.openrouterProvider ?? '');
 // Stored profiles come from this browser; drop anything malformed rather than fail to start.
 function cleanProfiles(value) {
     if (!Array.isArray(value)) return [];
@@ -61,9 +62,9 @@ function cleanProfiles(value) {
         const name = typeof item?.name === 'string' ? item.name.trim() : '';
         if (!name || name.length > PROFILE_NAME_MAX || seen.has(name) || typeof item.endpoint !== 'string' || !item.endpoint || typeof item.model !== 'string' || !item.model) continue;
         const tokens = Number(item.maxOutputTokens);
-        let headers; try { headers = resolveHeaders(item.headers ?? []); } catch { continue; }
+        let headers, provider; try { headers = resolveHeaders(item.headers ?? []); provider = isOpenRouterEndpoint(item.endpoint) ? normalizeOpenRouterProvider(item.openrouterProvider) : ''; } catch { continue; }
         seen.add(name);
-        profiles.push({ name, headers, endpoint: item.endpoint, model: item.model, apiKey: typeof item.apiKey === 'string' ? item.apiKey : '',
+        profiles.push({ name, headers, endpoint: item.endpoint, model: item.model, apiKey: typeof item.apiKey === 'string' ? item.apiKey : '', ...(provider ? {openrouterProvider:provider} : {}),
             maxOutputTokens: Number.isInteger(tokens) && tokens > 0 ? tokens : undefined });
     }
     return profiles.slice(0, PROFILE_MAX);
@@ -110,6 +111,8 @@ export class Controller {
     #connectionConfig = null;
     #connectionProfiles = [];
     #modelList = null;
+    #providerList = null;
+    #providerFetchSerial = 0;
     #persistedConnection = null;
     #pendingProfiles = null;
     #saveFailures = new Map();
@@ -173,9 +176,13 @@ export class Controller {
             capacity: () => this.#lazyCapacity(), diagnostic: error => { this.diagnostics.lazyError = error.kind ?? error.name ?? 'unknown'; },
         }, lazyClock);
     }
-    #applyConnection(mode, { endpoint, model, apiKey = '', maxOutputTokens, headers = [] } = {}) {
+    #applyConnection(mode, { endpoint, model, apiKey = '', maxOutputTokens, headers = [], openrouterProvider } = {}) {
         const config = { headers: resolveHeaders(headers), endpoint: String(endpoint ?? '').trim().replace(/\/$/, ''), model: String(model ?? '').trim(), apiKey: String(apiKey ?? ''), maxOutputTokens: maxOutputTokens === '' || maxOutputTokens == null ? undefined : Number(maxOutputTokens) };
         invariant(['raw', 'tavern'].includes(mode) || config.model, '请先选择或填写辅助模型 ID');
+        if (mode === 'compatible' && isOpenRouterEndpoint(config.endpoint)) {
+            const provider = normalizeOpenRouterProvider(openrouterProvider);
+            if (provider) config.openrouterProvider = provider;
+        }
         registerDiagnosticSecrets([config.apiKey, ...config.headers.map(item => item.value)]);
         const client = this.#client(['raw', 'tavern'].includes(mode) ? request => this.host.rawGenerate(request) : compatibleConnection(config));
         this.#connectionConfig = ['raw', 'tavern'].includes(mode) ? null : config;
@@ -963,10 +970,10 @@ export class Controller {
             authorAlwaysIds: this.store?.state ? Object.values(this.store.state.data.entries).filter(entry => evaluateRules(this.compiledRules, entry).always).map(entry => entry.id) : [],
             gateIds: this.store?.state ? Object.values(this.store.state.data.entries).filter(entry => evaluateRules(this.compiledRules, entry).gate).map(entry => entry.id) : [],
             sourceBook: this.store?.state?.bookName ?? '', connectionMode: this.connectionMode,
-            connection: { mode: this.connectionMode, endpoint: this.#connectionConfig?.endpoint ?? '', model: this.#connectionConfig?.model ?? '', maxOutputTokens: this.#connectionConfig?.maxOutputTokens, hasApiKey: Boolean(this.#connectionConfig?.apiKey), headers: (this.#connectionConfig?.headers ?? []).map(({name}) => ({name})) },
+            connection: { mode: this.connectionMode, endpoint: this.#connectionConfig?.endpoint ?? '', model: this.#connectionConfig?.model ?? '', maxOutputTokens: this.#connectionConfig?.maxOutputTokens, hasApiKey: Boolean(this.#connectionConfig?.apiKey), headers: (this.#connectionConfig?.headers ?? []).map(({name}) => ({name})), ...(this.#connectionConfig?.openrouterProvider ? {openrouterProvider:this.#connectionConfig.openrouterProvider} : {}) },
             connectionProfiles: this.#connectionProfiles.map(profile => ({ name: profile.name, endpoint: profile.endpoint, model: profile.model,
-                maxOutputTokens: profile.maxOutputTokens, hasApiKey: Boolean(profile.apiKey), active: sameConnection(profile, this.#connectionConfig) })),
-            modelList: clone(this.#modelList), task: clone(this.#streamTask),
+                maxOutputTokens: profile.maxOutputTokens, hasApiKey: Boolean(profile.apiKey), active: sameConnection(profile, this.#connectionConfig), ...(profile.openrouterProvider ? {openrouterProvider:profile.openrouterProvider} : {}) })),
+            modelList: clone(this.#modelList), providerList: clone(this.#providerList), task: clone(this.#streamTask),
             connectionPersist: { state: this.#saveFailures.size ? 'failed' : 'saved',
                 lastSaved: this.#persistedConnection?.model ?? '沿用酒馆连接', failures: [...this.#saveFailures.values()],
                 pendingName: this.#pendingProfiles?.find(p => sameConnection(p, this.#connectionConfig))?.name ?? null },
@@ -1193,14 +1200,34 @@ export class Controller {
             throw error;
         } finally { deadline.dispose(); }
     }
-    async updateConnection({ mode = 'raw', endpoint, model, apiKey, maxOutputTokens, headers }) {
+    async fetchProviders({ endpoint, model, apiKey, headers } = {}) {
+        const normalized = String(endpoint ?? '').trim().replace(/\/$/, ''), modelId = String(model ?? '').trim();
+        invariant(isOpenRouterEndpoint(normalized) && modelId, '请先填写 OpenRouter 接口地址并选择模型');
+        const serial = ++this.#providerFetchSerial;
+        const key = apiKey || (normalized === this.#connectionConfig?.endpoint ? this.#connectionConfig.apiKey : '');
+        const resolved = resolveHeaders(headers, normalized === this.#connectionConfig?.endpoint ? this.#connectionConfig.headers : []);
+        registerDiagnosticSecrets([key, ...resolved.map(item => item.value)]);
+        const deadline = timeoutSignal(15000);
+        try {
+            const providers = await untilAborted(listOpenRouterProviders({endpoint:normalized,model:modelId,apiKey:key,headers:resolved,signal:deadline.signal}), deadline.signal);
+            if (serial !== this.#providerFetchSerial) return {executed:false,reason:'已忽略较早的服务提供商列表'};
+            this.#providerList = {endpoint:normalized,model:modelId,providers}; this.#notify();
+            return {executed:true,message:`已获取 ${providers.length} 个服务提供商；选择后保存连接才生效`};
+        } catch (error) {
+            if (deadline.signal?.aborted) throw new Error('获取服务提供商列表已超过 15 秒，请重试或手动填写提供商标识。');
+            throw error;
+        } finally { deadline.dispose(); }
+    }
+    async updateConnection({ mode = 'raw', endpoint, model, apiKey, maxOutputTokens, headers, openrouterProvider }) {
         invariant(!this.view().activity, '请先停止或等待当前任务完成，再应用连接；当前任务继续运行。');
         // Blank means retain the session key only for the same endpoint. Never
         // forward an existing credential when changing to a different server.
         const normalizedEndpoint = endpoint?.trim().replace(/\/$/, '');
         const retainedKey = normalizedEndpoint && normalizedEndpoint === this.#connectionConfig?.endpoint ? this.#connectionConfig.apiKey : '';
-        const resolved = resolveHeaders(headers, normalizedEndpoint === this.#connectionConfig?.endpoint ? this.#connectionConfig.headers : []);
-        this.#commitConnection(mode, { endpoint: normalizedEndpoint, model, apiKey: apiKey || retainedKey, maxOutputTokens, headers: resolved });
+        const resolved = resolveHeaders(headers, normalizedEndpoint === this.#connectionConfig?.endpoint ? this.#connectionConfig?.headers : []);
+        const provider = openrouterProvider === undefined && normalizedEndpoint === this.#connectionConfig?.endpoint && model?.trim() === this.#connectionConfig?.model
+            ? this.#connectionConfig?.openrouterProvider : openrouterProvider;
+        this.#commitConnection(mode, { endpoint: normalizedEndpoint, model, apiKey: apiKey || retainedKey, maxOutputTokens, headers: resolved, openrouterProvider:provider });
     }
     #commitConnection(mode, input) {
         const config = this.#applyConnection(mode, input);

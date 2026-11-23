@@ -336,6 +336,18 @@ export const REASONING_EFFORTS = Object.freeze(['inherit', 'auto', 'min', 'low',
 const WIRE_EFFORT = { min: 'low', low: 'low', medium: 'medium', high: 'high', max: 'high' };
 const OPENROUTER_EFFORT = { min: 'minimal', low: 'low', medium: 'medium', high: 'high', max: 'max' };
 
+export function isOpenRouterEndpoint(endpoint) {
+    try { return new URL(endpoint).origin === 'https://openrouter.ai'; }
+    catch { return false; }
+}
+export function normalizeOpenRouterProvider(value) {
+    if (value === undefined || value === null) return '';
+    invariant(typeof value === 'string', 'OpenRouter 服务商标识必须是字符串');
+    const provider = value.trim();
+    invariant(provider.length <= 200 && (!provider || /^[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/i.test(provider)), 'OpenRouter 服务商标识无效，请使用接口返回的标识');
+    return provider;
+}
+
 function connectionUrl(endpoint, path) {
     const url = new URL(endpoint);
     invariant(['https:', 'http:'].includes(url.protocol), '模型连接必须使用 HTTP(S)');
@@ -369,10 +381,51 @@ export async function listModels({ endpoint, apiKey = '', headers = [], fetchImp
     return ids.sort((a, b) => a.localeCompare(b)).slice(0, 1000);
 }
 
+/** Use routing tags supplied by the selected model; display names are not slugs. */
+export async function listOpenRouterProviders({ endpoint, model, apiKey = '', headers = [], fetchImpl = globalThis.fetch, signal } = {}) {
+    invariant(isOpenRouterEndpoint(endpoint), '服务商列表仅支持 OpenRouter 官方 HTTPS 接口');
+    invariant(typeof model === 'string' && model.trim().length <= 300, '请先填写 OpenRouter 模型 ID（作者/模型）');
+    const parts = model.trim().split('/');
+    invariant(parts.length === 2 && parts.every(part => part && part !== '.' && part !== '..' && !/[\s\u0000-\u001f\u007f]/.test(part)), '请先填写 OpenRouter 模型 ID（作者/模型）');
+    let route;
+    try { route = parts.map(encodeURIComponent).join('/'); }
+    catch { throw new Error('OpenRouter 模型 ID 无效'); }
+    const url = connectionUrl(endpoint, `models/${route}/endpoints`);
+    const options = { method: 'GET', headers: requestHeaders(apiKey, headers), signal };
+    throwIfAborted(signal);
+    let response;
+    try { response = await fetchImpl(url.href, options); }
+    catch {
+        throwIfAborted(signal);
+        throw new Error('无法获取 OpenRouter 服务商列表，请检查连接后重试。');
+    }
+    throwIfAborted(signal);
+    if ([401, 402, 403, 429].includes(response.status)) throw modelApiError(null, response.status);
+    let payload;
+    try { payload = await response.json(); }
+    catch {
+        throwIfAborted(signal);
+        if (!response.ok) throw modelApiError(null, response.status);
+        throw new Error('OpenRouter 未返回有效的服务商列表，请稍后重试。');
+    }
+    throwIfAborted(signal);
+    if (!response.ok || payload?.error) throw modelApiError(payload, response.ok ? undefined : response.status);
+    invariant(Array.isArray(payload?.data?.endpoints), 'OpenRouter 未返回有效的服务商列表，请稍后重试。');
+    const providers = new Map();
+    for (const item of payload.data.endpoints) {
+        let id;
+        try { id = normalizeOpenRouterProvider(item?.tag); } catch { continue; }
+        if (!id || providers.has(id)) continue;
+        providers.set(id, { id, name: typeof item.provider_name === 'string' && item.provider_name.trim() ? item.provider_name.trim() : id });
+    }
+    return [...providers.values()].sort((a, b) => a.id.localeCompare(b.id));
+}
+
 /** Optional separate connection; credentials are supplied at runtime, never in save data. */
-export function compatibleConnection({ endpoint, model, apiKey = '', headers = [], fetchImpl = fetch, tokenParameter = 'auto', maxOutputTokens }) {
+export function compatibleConnection({ endpoint, model, apiKey = '', headers = [], fetchImpl = fetch, tokenParameter = 'auto', maxOutputTokens, openrouterProvider }) {
     const url = connectionUrl(endpoint, 'chat/completions');
-    const openrouter = url.origin === 'https://openrouter.ai';
+    const openrouter = isOpenRouterEndpoint(endpoint);
+    const provider = openrouter ? normalizeOpenRouterProvider(openrouterProvider) : '';
     invariant(['auto', 'max_tokens', 'max_completion_tokens'].includes(tokenParameter), '不支持的辅助输出长度参数');
     const openaiReasoning = /(?:^|\/)(?:gpt-[56](?:[.\-]|$)|o[134](?:-|$))/i.test(model);
     const lengthParameter = tokenParameter === 'auto' ? openrouter || openaiReasoning ? 'max_completion_tokens' : 'max_tokens' : tokenParameter;
@@ -387,6 +440,7 @@ export function compatibleConnection({ endpoint, model, apiKey = '', headers = [
         const send = effort => fetchImpl(url.href, {
             method: 'POST', headers: requestHeaders(apiKey, headers, true),
             body: JSON.stringify({ model, messages: requestMessages({ system, input, head, tail, recovery }), stream,
+                ...(provider ? { provider: { only: [provider] } } : {}),
                 ...(omitLength ? {} : { [lengthParameter]: explicitLength ? Number(maxOutputTokens) : responseLength }),
                 ...(effort ? openrouter ? { reasoning: { effort } } : { reasoning_effort: effort } : {}) }), signal,
         });
