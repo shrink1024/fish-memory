@@ -5,9 +5,10 @@ import { Controller } from '../src/runtime/controller.js';
 const msg = (key, content, role = 'user') => ({ key, content, role, hidden: false, hiddenBy: null });
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 async function until(predicate) {
-    for (let i = 0; i < 20; i++) {
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline) {
         if (predicate()) return;
-        await new Promise(resolve => setImmediate(resolve));
+        await new Promise(resolve => setTimeout(resolve, 1));
     }
     assert.fail('Expected asynchronous stage was not reached');
 }

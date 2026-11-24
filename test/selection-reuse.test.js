@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createEntry} from '../src/core/state.js';
+import {createEntry,makeSourceEntry} from '../src/core/state.js';
 import {Controller} from '../src/runtime/controller.js';
 const clone=structuredClone;
 function fixture(settings={}){
@@ -15,6 +15,30 @@ function fixture(settings={}){
  return {controller,state,calls,plans,host,signature:v=>{signature=v},ids:v=>{selected=v},maintenance:v=>{maintenance=v},fail:v=>{fail=v},gate:p=>{gate=p},start:async()=>{await controller.start();await controller.initialize();calls.length=0;}};
 }
 const selects=f=>f.calls.filter(r=>r.purpose==='select').length;
+async function waitForSelection(f) {
+ const deadline=Date.now()+2000;
+ while(!selects(f)&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,1));
+ assert.ok(selects(f),'Selection must begin before changing its inputs');
+}
+
+test('preparation explains reuse, failure and bypass without retaining private inputs',async()=>{
+ const f=fixture();await f.start();f.signature('private-connection-signature');
+ await f.controller.generationBefore({type:'normal'});
+ assert.equal(f.controller.diagnostics.lastPreparation.selectionReason,'no-cache');
+ await f.controller.generationBefore({type:'regenerate'});
+ let preparation=f.controller.view().diagnostics.lastPreparation;
+ assert.equal(preparation.outcome,'success');assert.equal(preparation.selectionSource,'reused');assert.equal(preparation.selectionReason,'exact');
+ assert.ok(preparation.timingsMs.total>=preparation.timingsMs.sources);assert.equal(preparation.timingsMs.auxiliary,undefined);
+ assert.doesNotMatch(JSON.stringify(preparation),/private-connection-signature|相同请求/);
+ f.controller.setNextSelectionRefresh(true);f.fail(true);
+ await f.controller.generationBefore({type:'regenerate'});
+ preparation=f.controller.diagnostics.lastPreparation;
+ assert.equal(preparation.outcome,'failed');assert.equal(preparation.selectionReason,'forced');
+ assert.notEqual(preparation.requestId,f.controller.diagnostics.lastPlan.requestId);
+ assert.doesNotMatch(JSON.stringify(f.calls),/lastPreparation|timingsMs|selectionReason/);
+ f.fail(false);await f.controller.updateSettings({enabled:false});await f.controller.generationBefore({type:'normal'});
+ assert.equal(f.controller.diagnostics.lastPreparation.outcome,'native');
+});
 test('same turn reuses selection; forcing refresh is one-shot and never generates narration',async()=>{
  const f=fixture();await f.start();await f.controller.generationBefore({type:'normal'});await f.controller.generationBefore({type:'regenerate'});
  assert.equal(selects(f),1);assert.equal(f.plans.at(-1).selectionSource,'reused');
@@ -31,12 +55,143 @@ test('draft-to-stored player message normalizes only the same turn, not a later 
  f.state.messages.push({key:'reply-1',role:'assistant',content:'已回复'});f.state.userInput='相同请求';
  await f.controller.generationBefore({type:'normal'});assert.equal(selects(f),2);
 });
+
+test('unchanged rerolls reuse isolated payloads with fresh request identities',async()=>{
+ const f=fixture();await f.start();
+ f.controller.store.state.data.entries.a=createEntry({id:'a',kind:'fact',title:'A',text:'Current fact'});f.ids(['a']);
+ await f.controller.generationBefore({type:'normal'});
+ const original=clone(f.plans.at(-1)),ids=new Set([original.requestId]);
+ const content=p=>({entries:p.entries,selectedIds:p.selectedIds,mandatoryIds:p.mandatoryIds,details:p.details,summary:p.summary,inventory:p.inventory});
+ f.plans.at(-1).entries[0].segments[0].text='Host mutation';
+ for(let i=0;i<3;i++){
+  await f.controller.generationBefore({type:'regenerate'});const p=f.plans.at(-1);ids.add(p.requestId);
+  assert.equal(p.preparationSource,'reused');assert.deepEqual(content(p),content(original));
+ }
+ assert.equal(ids.size,4);assert.equal(selects(f),1);
+ f.controller.setNextSelectionRefresh(true);await f.controller.generationBefore({type:'regenerate'});
+ assert.deepEqual(content(f.plans.at(-1)),content(original));assert.equal(f.plans.at(-1).preparationSource,'assembled');
+});
+
+test('inventory catch-up state outside memory data invalidates only the prepared payload',async()=>{
+ const f=fixture();await f.start();f.controller.store.state.data.inventory=[{name:'key',description:'brass'}];
+ await f.controller.generationBefore({type:'normal'});assert.match(f.plans.at(-1).inventory,/brass/);
+ f.controller.store.state.inventoryDisabledAt=0;
+ await f.controller.generationBefore({type:'regenerate'});
+ assert.equal(selects(f),1);assert.equal(f.plans.at(-1).inventory,'');assert.equal(f.plans.at(-1).preparationSource,'assembled');
+});
+
+test('failed host installation never publishes staged selection or prepared payload',async()=>{
+ const f=fixture();await f.start();const install=f.host.setPlan;
+ f.host.setPlan=()=>{throw Error('host rejected plan');};await f.controller.generationBefore({type:'normal'});
+ assert.equal(f.controller.diagnostics.lastPreparation.outcome,'failed');
+ f.host.setPlan=install;await f.controller.generationBefore({type:'regenerate'});
+ assert.equal(selects(f),2);assert.equal(f.plans.at(-1).preparationSource,'assembled');
+});
+
+test('source comparison cache detects in-place edits and late native switches',async()=>{
+ for(const change of ['content','disable']){
+  const f=fixture();await f.start();const raw=[{uid:1,comment:'Source',content:'Original',constant:true,disable:false}];
+  const entry=makeSourceEntry('b',raw[0]);f.controller.store.state.base.entries[entry.id]=clone(entry);f.controller.store.state.data.entries[entry.id]=clone(entry);
+  f.host.loadWorldbook=async()=>clone(raw);
+  await f.controller.generationBefore({type:'normal'});assert.equal(f.plans.length,1);
+  let reads=0;f.host.loadWorldbook=async()=>{if(++reads===2)raw[0][change]=change==='content'?'Changed':true;return clone(raw);};
+  assert.deepEqual(await f.controller.generationBefore({type:'regenerate'}),{cancel:true});
+  assert.equal(f.plans.length,1);assert.equal(reads,2);assert.equal(f.controller.diagnostics.lastPreparation.outcome,'failed');
+ }
+});
+
+test('text edits under stable message IDs during selection cannot install stale context',async()=>{
+ const f=fixture();await f.start();f.state.messages=[{key:'earlier',role:'user',content:'Before'}];
+ let release;f.gate(new Promise(resolve=>{release=resolve;}));const running=f.controller.generationBefore({type:'normal'});
+ await waitForSelection(f);
+ f.state.messages[0].content='After';release();
+ assert.deepEqual(await running,{cancel:true});assert.equal(f.plans.length,0);
+});
+
+for(const changed of ['settings','force','native','regex'])test(`${changed} changes during selection reject late preparation`,async()=>{
+ const f=fixture();await f.start();let release;
+ f.gate(new Promise(resolve=>{release=resolve;}));const running=f.controller.generationBefore({type:'normal'});
+ await waitForSelection(f);
+ if(changed==='settings')await f.controller.updateSettings({selectionLimit:7});
+ if(changed==='force')f.controller.setNextSelectionRefresh(true);
+ if(changed==='native')f.signature('new-native-model');
+ if(changed==='regex')f.host.promptRegexSignature=()=> 'new-regex';
+ release();assert.deepEqual(await running,{cancel:true});assert.equal(f.plans.length,0);
+});
+
+test('changing chat clears preparation and a late result cannot restore it',async()=>{
+ const f=fixture();await f.start();let release;
+ f.gate(new Promise(resolve=>{release=resolve;}));const running=f.controller.generationBefore({type:'normal'});
+ await waitForSelection(f);
+ f.state.chatId='other';await f.controller.chatChanged();release();await running;
+ assert.equal(f.controller.diagnostics.lastPreparation,null);assert.equal(f.controller.diagnostics.lastPlan,null);
+});
+
+test('scope changes during the final connection check cannot install an old memory plan',async()=>{
+ const f=fixture();await f.start();
+ let release,reached;const gate=new Promise(resolve=>{release=resolve;}),checking=new Promise(resolve=>{reached=resolve;});
+ let signatures=0;f.host.selectionContextSignature=async()=>{if(++signatures===2){reached();await gate;}return 'same-connection';};
+ const running=f.controller.generationBefore({type:'normal'});
+ await checking;
+ await f.controller.setContext({owner:'card',activeScopeId:'new-scope',deferPost:true});
+ release();
+ assert.deepEqual(await running,{cancel:true});
+ assert.equal(f.plans.length,0);
+});
+
+for(const change of ['scope','input','force','settings','disabled'])test(`${change} changes while applying the history window cannot install an old memory plan`,async()=>{
+ const f=fixture();await f.start();
+ f.state.messages=[{key:'old',role:'assistant',content:'Earlier reply',hidden:true,hiddenBy:'dynamic-world-memory'}];
+ let release,reached;const gate=new Promise(resolve=>{release=resolve;}),applying=new Promise(resolve=>{reached=resolve;});
+ f.host.applyWindow=async()=>{reached();await gate;};
+ const running=f.controller.generationBefore({type:'normal'});
+ await applying;
+ if(change==='scope')await f.controller.setContext({owner:'card',activeScopeId:'new-scope',deferPost:true});
+ if(change==='input')f.state.messages[0].content='Edited during window update';
+ if(change==='force')f.controller.setNextSelectionRefresh(true);
+ let updating;
+ if(change==='settings'||change==='disabled'){
+  updating=f.controller.updateSettings(change==='disabled'?{enabled:false}:{selectionLimit:7});
+  const changed=()=>change==='disabled'?!f.controller.settings.enabled:f.controller.settings.selectionLimit===7;
+  const deadline=Date.now()+2000;
+  while(!changed()&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,1));
+  assert.ok(changed());
+ }
+ release();
+ await updating;
+ assert.deepEqual(await running,change==='disabled'?undefined:{cancel:true});
+ assert.equal(f.plans.length,0);
+ if(change==='force')assert.equal(f.controller.view().selectionReuse.forceNext,true);
+ if(change==='disabled')assert.equal(f.controller.diagnostics.lastPreparation.outcome,'native');
+});
 test('input, effective memory, native model and settings invalidate selection reuse',async()=>{
  const f=fixture();await f.start();await f.controller.generationBefore({type:'normal'});
  f.state.userInput='改过的输入';await f.controller.generationBefore({type:'normal'});assert.equal(selects(f),2);
  f.controller.store.state.data.summary='新的事实';await f.controller.generationBefore({type:'normal'});assert.equal(selects(f),3);
  f.signature('native-model-b');await f.controller.generationBefore({type:'normal'});assert.equal(selects(f),4);
  await f.controller.updateSettings({selectionLimit:8});await f.controller.generationBefore({type:'normal'});assert.equal(selects(f),5);
+});
+
+test('changing only the OpenRouter provider invalidates selection and prepared context',async t=>{
+ const f=fixture();await f.start();const originalFetch=globalThis.fetch,requests=[];
+ t.after(()=>{globalThis.fetch=originalFetch;});
+ globalThis.fetch=async(url,options)=>{
+  requests.push({url,body:JSON.parse(options.body)});
+  return Response.json({choices:[{message:{content:'{"ids":[]}'},finish_reason:'stop'}]});
+ };
+ const connection={mode:'compatible',endpoint:'https://openrouter.ai/api/v1',model:'vendor/test-model',apiKey:'synthetic-provider-key'};
+ await f.controller.updateConnection({...connection,openrouterProvider:'provider-a'});
+ await f.controller.generationBefore({type:'normal'});
+ assert.equal(requests.length,1);assert.equal(f.plans.at(-1).selectionSource,'fresh');
+ await f.controller.updateConnection({...connection,openrouterProvider:'provider-a'});
+ await f.controller.generationBefore({type:'regenerate'});
+ assert.equal(requests.length,1);assert.equal(f.plans.at(-1).selectionSource,'reused');assert.equal(f.plans.at(-1).preparationSource,'reused');
+ await f.controller.updateConnection({...connection,openrouterProvider:'provider-b'});
+ await f.controller.generationBefore({type:'regenerate'});
+ assert.equal(requests.length,2);assert.equal(f.plans.at(-1).selectionSource,'fresh');assert.equal(f.plans.at(-1).preparationSource,'assembled');
+ assert.equal(f.plans.at(-1).selectionReason,'inputs-changed');
+ await f.controller.generationBefore({type:'regenerate'});
+ assert.equal(requests.length,2);assert.equal(f.plans.at(-1).preparationSource,'reused');
 });
 test('failed forced refresh and preview do not consume the one-shot option',async()=>{
  const f=fixture();await f.start();await f.controller.generationBefore({type:'normal'});
@@ -47,7 +202,7 @@ test('failed forced refresh and preview do not consume the one-shot option',asyn
 test('a late cancelled selection cannot populate the cache',async()=>{
  const f=fixture();await f.start();let release;f.gate(new Promise(r=>{release=r}));
  const running=f.controller.generationBefore({type:'normal'});
- for(let i=0;i<30&&!selects(f);i++)await new Promise(r=>setImmediate(r));
+ await waitForSelection(f);
  f.controller.cancel();release();await running;f.gate(null);
  await f.controller.generationBefore({type:'normal'});assert.equal(selects(f),2);assert.equal(f.plans.at(-1).selectionSource,'fresh');
 });
@@ -69,6 +224,7 @@ test('automatic maintenance of already-read history preserves the selected turn,
  await f.controller.maintain({automatic:true});assert.equal(f.controller.store.state.processed.length,4);
  assert.equal(f.controller.store.state.journal.at(-1).automatic,true);
  await f.controller.generationBefore({type:'regenerate'});assert.equal(selects(f),1);assert.equal(f.plans.at(-1).selectionSource,'reused');
+ assert.equal(f.plans.at(-1).preparationSource,'assembled');assert.match(f.plans.at(-1).summary,/旧剧情已整理/);
  await f.controller.manual({type:'inventory-edit',scopeId:'global',items:[{name:'手动钥匙',description:'玩家确认'}],expectedSaveId:f.controller.store.state.id,expectedRevision:f.controller.store.state.revision});
  await f.controller.generationBefore({type:'regenerate'});assert.equal(selects(f),2);
 });
@@ -83,10 +239,23 @@ test('automatic maintenance of newly exposed history cannot reuse a selection th
  await f.controller.generationBefore({type:'regenerate'});assert.equal(selects(f),2);
 });
 
-test('switching an existing candidate invalidates reuse even if a later projection has the same prefix',async()=>{
+test('a swipe without a confirmed latest-reply identity still invalidates reuse',async()=>{
  const f=fixture();await f.start();await f.controller.generationBefore({type:'normal'});
  f.controller.messageSwiped();await f.controller.whenIdle();
  await f.controller.generationBefore({type:'regenerate'});assert.equal(selects(f),2);
+});
+
+test('latest-reply browsing retains a candidate, earlier branch changes invalidate it',async()=>{
+ const f=fixture();await f.start();await f.controller.generationBefore({type:'normal'});
+ f.state.messages=[{key:'player',role:'user',content:f.state.userInput},{key:'candidate-b',role:'assistant',content:'Alternative'}];f.state.userInput='';
+ f.controller.messageSwiped({index:1});await f.controller.whenIdle();
+ f.host.pendingReplacement=()=>true;f.host.generationSnapshot=()=>({...clone(f.state),messages:clone(f.state.messages.slice(0,-1))});
+ await f.controller.generationBefore({type:'regenerate'});assert.equal(selects(f),1);
+ assert.equal(f.plans.at(-1).selectionSource,'reused');
+ f.state.messages[0].content='Changed player input';f.controller.messageSwiped({index:1});await f.controller.whenIdle();
+ await f.controller.generationBefore({type:'regenerate'});assert.equal(selects(f),2);
+ f.controller.messageSwiped({index:0});await f.controller.whenIdle();
+ await f.controller.generationBefore({type:'regenerate'});assert.equal(selects(f),3);
 });
 
 const reroll = (f,type='regenerate',other={}) => f.controller.generationBefore({type,playerReroll:true,...other});

@@ -39,6 +39,13 @@ test('memory status uses actual controller view fields and never exposes another
     await assert.rejects(f.exporter.export(), /载入|切换|存档/);
 });
 
+test('problem export includes only the current chat preparation attempt',async()=>{
+    const f=fixture();f.controller.diagnostics.lastPreparation={chatId:f.current.memoryChatId,outcome:'failed',selectionReason:'forced',timingsMs:{total:12}};
+    assert.equal((await f.exporter.export()).memory.lastPreparation.outcome,'failed');
+    f.controller.diagnostics.lastPreparation.chatId='another-chat';
+    assert.equal((await f.exporter.export()).memory.lastPreparation,null);
+});
+
 test('worldbook diagnosis remains exportable before a memory store can be created', async () => {
     const f = fixture(); f.controller.store = null;
     f.view.readiness = { chat: true, book: false, single: true, template: true };
